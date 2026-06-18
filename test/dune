@@ -1,0 +1,4 @@
+(test
+ (name test_inn)
+ (package inn)
+ (libraries inn alcotest eta eta_eio eta_http eio_main unix))

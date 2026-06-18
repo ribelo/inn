@@ -1,0 +1,5 @@
+(executable
+ (name main)
+ (public_name inn)
+ (package inn)
+ (libraries inn cmdliner eta eta_eio eta_http eta_http_eio eio_main yojson unix))
