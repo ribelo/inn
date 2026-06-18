@@ -1,4 +1,15 @@
 (library
  (name inn)
  (public_name inn)
- (libraries eta eta_eio eta_http eta_http_eio eta_sql eio eio.unix yojson unix))
+ (libraries
+  eta
+  eta_eio
+  eta_http
+  eta_http_eio
+  eta_http_service
+  eta_http_service_eio
+  eta_sql
+  eio
+  eio.unix
+  yojson
+  unix))

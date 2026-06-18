@@ -68,6 +68,9 @@
                 eta_eio \
                 eta_http \
                 eta_http_eio \
+                eta_http_service \
+                eta_http_service_eio \
+                eta_router \
                 eta_sql \
                 eta_sql_driver \
                 eta_sql_dsl \

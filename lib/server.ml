@@ -1,19 +1,18 @@
 module H = Eta_http
 module S = Eta_http.Server
+module Service = Eta_http_service
+module Serve = Eta_http_service_eio.Serve
 
 let max_body_bytes = 32 * 1024 * 1024
 
 let daemon_instance_id = Atomic.make None
 let set_instance_id value = Atomic.set daemon_instance_id (Some value)
 
-let json_headers =
-  H.Core.Header.unsafe_of_list [ ("content-type", "application/json; charset=utf-8") ]
-
 let text_headers =
   H.Core.Header.unsafe_of_list [ ("content-type", "text/plain; charset=utf-8") ]
 
 let json_response ?(status = 200) json =
-  S.Response.text ~status ~headers:json_headers (Yojson.Safe.to_string json ^ "\n")
+  Service.Json.response ~status ~newline:true json
 
 let text_response ?(status = 200) text =
   S.Response.text ~status ~headers:text_headers text
@@ -203,61 +202,16 @@ let store_accepted effect =
       Eta.Effect.pure
         (error_response 500 "store_error" (store_error_message error))
 
-let split_once char text =
-  match String.index_opt text char with
-  | None -> (text, None)
-  | Some index ->
-      let left = String.sub text 0 index in
-      let right =
-        String.sub text (index + 1) (String.length text - index - 1)
-      in
-      (left, Some right)
-
-let hex_value = function
-  | '0' .. '9' as c -> Some (Char.code c - Char.code '0')
-  | 'a' .. 'f' as c -> Some (10 + Char.code c - Char.code 'a')
-  | 'A' .. 'F' as c -> Some (10 + Char.code c - Char.code 'A')
-  | _ -> None
-
-let percent_decode text =
-  let len = String.length text in
-  let buffer = Buffer.create len in
-  let rec loop index =
-    if index >= len then Ok (Buffer.contents buffer)
-    else
-      match text.[index] with
-      | '+' ->
-          Buffer.add_char buffer ' ';
-          loop (index + 1)
-      | '%' when index + 2 < len -> (
-          match (hex_value text.[index + 1], hex_value text.[index + 2]) with
-          | Some hi, Some lo ->
-              Buffer.add_char buffer (Char.chr ((hi lsl 4) + lo));
-              loop (index + 3)
-          | _ -> Error "invalid percent-encoding in query string")
-      | '%' -> Error "truncated percent-encoding in query string"
-      | char ->
-          Buffer.add_char buffer char;
-          loop (index + 1)
-  in
-  loop 0
-
-let query_params request =
-  match request.S.Request.query with
-  | None -> Ok []
-  | Some query ->
-      let rec loop acc = function
-        | [] -> Ok (List.rev acc)
-        | part :: rest ->
-            let raw_key, raw_value = split_once '=' part in
-            let value = Option.value raw_value ~default:"" in
-            (match (percent_decode raw_key, percent_decode value) with
-            | Ok key, Ok value -> loop ((key, value) :: acc) rest
-            | Error message, _ | _, Error message -> Error message)
-      in
-      loop [] (String.split_on_char '&' query)
-
 let param name params = List.assoc_opt name params
+
+let with_query req f =
+  let open Eta.Syntax in
+  let* result = Eta.Effect.result (Service.Extractors.Query.all req) in
+  match result with
+  | Ok params -> f params
+  | Error { S.Error.kind = Bad_request { message }; _ } ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Error error -> Eta.Effect.fail error
 
 let attr_prefix = "attr."
 
@@ -294,108 +248,63 @@ let valid_ai_agg = function
 let json_list name encode values =
   `Assoc [ (name, `List (List.map encode values)) ]
 
-let path_segments path =
-  path
-  |> String.split_on_char '/'
-  |> List.filter (fun segment -> not (String.equal segment ""))
+let ingest req decode ingest =
+  let open Eta.Syntax in
+  let* body = Service.Extractors.body_text ~max_bytes:max_body_bytes req in
+  match decode body with
+  | Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_otlp" message)
+  | Ok values -> store_accepted (ingest values)
 
-let canonical_path path =
-  if String.equal path "/api" then "/"
-  else if String.starts_with ~prefix:"/api/" path then
-    String.sub path 4 (String.length path - 4)
-  else path
+let services store _req =
+  store_json (Store.list_services store) (fun services ->
+      json_list "services" (fun service -> `String service) services)
 
-let require_method request method_ =
-  if String.equal request.S.Request.method_ method_ then Ok () else Error ()
+let traces store req =
+  with_query req @@ fun params ->
+  match parse_limit params with
+  | Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Ok limit ->
+      store_json
+        (Store.list_trace_summaries ?service:(param "service" params) ~limit
+           store)
+        (json_list "traces" Model.trace_summary_to_json)
 
-let read_body request =
-  H.Server.Body.read_all ~max_bytes:max_body_bytes request.S.Request.body
-  |> Eta.Effect.map Bytes.to_string
+let trace store trace_id _req =
+  let open Eta.Syntax in
+  let* result = Eta.Effect.result (Store.get_trace store trace_id) in
+  match result with
+  | Error error ->
+      Eta.Effect.pure
+        (error_response 500 "store_error" (store_error_message error))
+  | Ok None ->
+      Eta.Effect.pure
+        (error_response 404 "trace_not_found" "trace was not found")
+  | Ok (Some trace) -> Eta.Effect.pure (json_response (Model.trace_to_json trace))
 
-let ingest request decode ingest =
-  match require_method request "POST" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () ->
-      let open Eta.Syntax in
-      let* body = read_body request in
-      (match decode body with
-      | Error message ->
-          Eta.Effect.pure (error_response 400 "invalid_otlp" message)
-      | Ok values -> store_accepted (ingest values))
+let span store span_id _req =
+  let open Eta.Syntax in
+  let* result = Eta.Effect.result (Store.get_span store span_id) in
+  match result with
+  | Error error ->
+      Eta.Effect.pure
+        (error_response 500 "store_error" (store_error_message error))
+  | Ok None ->
+      Eta.Effect.pure (error_response 404 "span_not_found" "span was not found")
+  | Ok (Some span) -> Eta.Effect.pure (json_response (Model.span_to_json span))
 
-let services store request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () ->
-      store_json (Store.list_services store) (fun services ->
-          json_list "services" (fun service -> `String service) services)
+let trace_spans store trace_id _req =
+  store_json (Store.list_trace_spans store trace_id)
+    (json_list "spans" Model.span_to_json)
 
-let traces store request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () -> (
-      match query_params request with
-      | Error message -> Eta.Effect.pure (error_response 400 "invalid_query" message)
-      | Ok params -> (
-          match parse_limit params with
-          | Error message ->
-              Eta.Effect.pure (error_response 400 "invalid_query" message)
-          | Ok limit ->
-              store_json
-                (Store.list_trace_summaries ?service:(param "service" params)
-                   ~limit store)
-                (json_list "traces" Model.trace_summary_to_json)))
+let trace_logs store trace_id _req =
+  store_json (Store.list_trace_logs store trace_id)
+    (json_list "logs" Model.log_to_json)
 
-let trace store trace_id request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () ->
-      let open Eta.Syntax in
-      let* result = Eta.Effect.result (Store.get_trace store trace_id) in
-      (match result with
-      | Error error ->
-          Eta.Effect.pure
-            (error_response 500 "store_error" (store_error_message error))
-      | Ok None ->
-          Eta.Effect.pure
-            (error_response 404 "trace_not_found" "trace was not found")
-      | Ok (Some trace) ->
-          Eta.Effect.pure (json_response (Model.trace_to_json trace)))
-
-let span store span_id request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () ->
-      let open Eta.Syntax in
-      let* result = Eta.Effect.result (Store.get_span store span_id) in
-      (match result with
-      | Error error ->
-          Eta.Effect.pure
-            (error_response 500 "store_error" (store_error_message error))
-      | Ok None ->
-          Eta.Effect.pure (error_response 404 "span_not_found" "span was not found")
-      | Ok (Some span) -> Eta.Effect.pure (json_response (Model.span_to_json span)))
-
-let trace_spans store trace_id request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () ->
-      store_json (Store.list_trace_spans store trace_id)
-        (json_list "spans" Model.span_to_json)
-
-let trace_logs store trace_id request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () ->
-      store_json (Store.list_trace_logs store trace_id)
-        (json_list "logs" Model.log_to_json)
-
-let span_logs store span_id request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () ->
-      store_json (Store.list_span_logs store span_id)
-        (json_list "logs" Model.log_to_json)
+let span_logs store span_id _req =
+  store_json (Store.list_span_logs store span_id)
+    (json_list "logs" Model.log_to_json)
 
 let has_prefix prefix text = String.starts_with ~prefix text
 
@@ -576,107 +485,88 @@ let select_ai_spans store params =
       in
       Ok (limit, Store.search_spans filter store)
 
-let ai_calls store request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () -> (
-      match query_params request with
-      | Error message -> Eta.Effect.pure (error_response 400 "invalid_query" message)
-      | Ok params -> (
-          match select_ai_spans store params with
-          | Error message ->
-              Eta.Effect.pure (error_response 400 "invalid_query" message)
-          | Ok (limit, effect) ->
-              let open Eta.Syntax in
-              let* result = Eta.Effect.result effect in
-              (match result with
-              | Error error ->
-                  Eta.Effect.pure
-                    (error_response 500 "store_error" (store_error_message error))
-              | Ok spans ->
-                  let calls =
-                    spans
-                    |> List.filter is_ai_span
-                    |> List.filter (ai_call_matches params)
-                    |> List.sort (fun (left : Model.span) (right : Model.span) ->
-                           compare right.Model.start_time_ms left.Model.start_time_ms)
-                    |> fun spans ->
-                    let rec take acc count = function
-                      | _ when count <= 0 -> List.rev acc
-                      | [] -> List.rev acc
-                      | item :: rest -> take (item :: acc) (count - 1) rest
-                    in
-                    take [] limit spans
-                  in
-	                  Eta.Effect.pure
-	                    (json_response
-	                       (json_list "calls" ai_call_to_json calls)))))
-
-let ai_call store span_id request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () ->
+let ai_calls store req =
+  with_query req @@ fun params ->
+  match select_ai_spans store params with
+  | Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Ok (limit, effect) ->
       let open Eta.Syntax in
-      let* span_result = Eta.Effect.result (Store.get_span store span_id) in
-      (match span_result with
+      let* result = Eta.Effect.result effect in
+      (match result with
       | Error error ->
           Eta.Effect.pure
             (error_response 500 "store_error" (store_error_message error))
-      | Ok None ->
-          Eta.Effect.pure
-            (error_response 404 "ai_call_not_found" "AI call was not found")
-      | Ok (Some span) when not (is_ai_span span) ->
-          Eta.Effect.pure
-            (error_response 404 "ai_call_not_found" "AI call was not found")
-      | Ok (Some span) ->
-          let* logs_result =
-            Eta.Effect.result (Store.list_span_logs store span.span_id)
+      | Ok spans ->
+          let calls =
+            spans
+            |> List.filter is_ai_span
+            |> List.filter (ai_call_matches params)
+            |> List.sort (fun (left : Model.span) (right : Model.span) ->
+                   compare right.Model.start_time_ms left.Model.start_time_ms)
+            |> fun spans ->
+            let rec take acc count = function
+              | _ when count <= 0 -> List.rev acc
+              | [] -> List.rev acc
+              | item :: rest -> take (item :: acc) (count - 1) rest
+            in
+            take [] limit spans
           in
-          (match logs_result with
-          | Error error ->
-              Eta.Effect.pure
-                (error_response 500 "store_error" (store_error_message error))
-          | Ok logs ->
-              Eta.Effect.pure
-                (json_response
-                   (`Assoc
-                     [
-                       ("call", ai_call_to_json span);
-                       ("span", Model.span_to_json span);
-                       ("logs", `List (List.map Model.log_to_json logs));
-                     ]))))
+          Eta.Effect.pure (json_response (json_list "calls" ai_call_to_json calls)))
 
-let ai_stats store request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () -> (
-      match query_params request with
-      | Error message -> Eta.Effect.pure (error_response 400 "invalid_query" message)
-      | Ok params -> (
-          match
-            ( param "groupBy" params,
-              param "agg" params,
-              parse_limit ~default:20 params )
-          with
-          | None, _, _ ->
-              Eta.Effect.pure
-                (error_response 400 "invalid_query" "groupBy is required")
-          | _, None, _ ->
-              Eta.Effect.pure (error_response 400 "invalid_query" "agg is required")
-          | _, _, Error message ->
-              Eta.Effect.pure (error_response 400 "invalid_query" message)
-          | Some _group_by, Some agg, Ok _limit when not (valid_ai_agg agg) ->
-              Eta.Effect.pure
-                (error_response 400 "invalid_query"
-                   "agg must be count, avg_duration, p95_duration, total_input_tokens, or total_output_tokens")
-          | Some group_by, Some agg, Ok limit -> (
-              match select_ai_spans store params with
-              | Error message ->
-                  Eta.Effect.pure (error_response 400 "invalid_query" message)
-              | Ok (_, effect) ->
-                  let open Eta.Syntax in
-                  let* result = Eta.Effect.result effect in
-                  (match result with
+let ai_call store span_id _req =
+  let open Eta.Syntax in
+  let* span_result = Eta.Effect.result (Store.get_span store span_id) in
+  match span_result with
+  | Error error ->
+      Eta.Effect.pure
+        (error_response 500 "store_error" (store_error_message error))
+  | Ok None ->
+      Eta.Effect.pure
+        (error_response 404 "ai_call_not_found" "AI call was not found")
+  | Ok (Some span) when not (is_ai_span span) ->
+      Eta.Effect.pure
+        (error_response 404 "ai_call_not_found" "AI call was not found")
+  | Ok (Some span) ->
+      let* logs_result = Eta.Effect.result (Store.list_span_logs store span.span_id) in
+      (match logs_result with
+      | Error error ->
+          Eta.Effect.pure
+            (error_response 500 "store_error" (store_error_message error))
+      | Ok logs ->
+          Eta.Effect.pure
+            (json_response
+               (`Assoc
+                 [
+                   ("call", ai_call_to_json span);
+                   ("span", Model.span_to_json span);
+                   ("logs", `List (List.map Model.log_to_json logs));
+                 ])))
+
+let ai_stats store req =
+  with_query req @@ fun params ->
+  match
+    (param "groupBy" params, param "agg" params, parse_limit ~default:20 params)
+  with
+  | None, _, _ ->
+      Eta.Effect.pure
+        (error_response 400 "invalid_query" "groupBy is required")
+  | _, None, _ ->
+      Eta.Effect.pure (error_response 400 "invalid_query" "agg is required")
+  | _, _, Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Some _group_by, Some agg, Ok _limit when not (valid_ai_agg agg) ->
+      Eta.Effect.pure
+        (error_response 400 "invalid_query"
+           "agg must be count, avg_duration, p95_duration, total_input_tokens, or total_output_tokens")
+  | Some group_by, Some agg, Ok limit -> (
+      match select_ai_spans store params with
+      | Error message ->
+          Eta.Effect.pure (error_response 400 "invalid_query" message)
+      | Ok (_, effect) ->
+          let open Eta.Syntax in
+          let* result = Eta.Effect.result effect in
+          (match result with
                   | Error error ->
                       Eta.Effect.pure
                         (error_response 500 "store_error" (store_error_message error))
@@ -763,275 +653,271 @@ let ai_stats store request =
                         | [] -> List.rev acc
                         | item :: rest -> take (item :: acc) (count - 1) rest
                       in
-	                      Eta.Effect.pure
-	                        (json_response
-	                           (`Assoc [ ("stats", `List (take [] limit rows)) ]))))))
+                      Eta.Effect.pure
+                        (json_response
+                           (`Assoc [ ("stats", `List (take [] limit rows)) ]))))
 
-let search_spans store request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () -> (
-      match query_params request with
-      | Error message -> Eta.Effect.pure (error_response 400 "invalid_query" message)
-      | Ok params -> (
-          match parse_limit params with
-          | Error message ->
-              Eta.Effect.pure (error_response 400 "invalid_query" message)
-          | Ok limit ->
-              let filter =
-                {
-                  Store.service = param "service" params;
-                  trace_id = param "traceId" params;
-                  operation = param "operation" params;
-                  parent_operation = param "parentOperation" params;
-                  status = param "status" params;
-                  attrs = attr_filters params;
-                  limit;
-                }
-              in
-              store_json (Store.search_spans filter store)
-                (json_list "spans" Model.span_to_json)))
+let search_spans store req =
+  with_query req @@ fun params ->
+  match parse_limit params with
+  | Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Ok limit ->
+      let filter =
+        {
+          Store.service = param "service" params;
+          trace_id = param "traceId" params;
+          operation = param "operation" params;
+          parent_operation = param "parentOperation" params;
+          status = param "status" params;
+          attrs = attr_filters params;
+          limit;
+        }
+      in
+      store_json (Store.search_spans filter store)
+        (json_list "spans" Model.span_to_json)
 
-let search_traces store request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () -> (
-      match query_params request with
-      | Error message -> Eta.Effect.pure (error_response 400 "invalid_query" message)
-      | Ok params -> (
-          match parse_limit params with
-          | Error message ->
-              Eta.Effect.pure (error_response 400 "invalid_query" message)
-          | Ok limit ->
-              let filter =
-                {
-                  Store.service = param "service" params;
-                  operation = param "operation" params;
-                  status = param "status" params;
-                  attrs = attr_filters params;
-                  limit;
-                }
-              in
-              store_json (Store.search_traces filter store)
-                (json_list "traces" Model.trace_summary_to_json)))
+let search_traces store req =
+  with_query req @@ fun params ->
+  match parse_limit params with
+  | Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Ok limit ->
+      let filter =
+        {
+          Store.service = param "service" params;
+          operation = param "operation" params;
+          status = param "status" params;
+          attrs = attr_filters params;
+          limit;
+        }
+      in
+      store_json (Store.search_traces filter store)
+        (json_list "traces" Model.trace_summary_to_json)
 
-let trace_stats store request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () -> (
-      match query_params request with
-      | Error message -> Eta.Effect.pure (error_response 400 "invalid_query" message)
-      | Ok params -> (
-          match (param "groupBy" params, param "agg" params, parse_limit ~default:20 params) with
-          | None, _, _ ->
-              Eta.Effect.pure
-                (error_response 400 "invalid_query" "groupBy is required")
-          | _, None, _ ->
-              Eta.Effect.pure (error_response 400 "invalid_query" "agg is required")
-          | _, _, Error message ->
-              Eta.Effect.pure (error_response 400 "invalid_query" message)
-          | Some group_by, Some agg, Ok limit when valid_trace_agg agg ->
-              let filter =
-                {
-                  Store.group_by;
-                  agg;
-                  service = param "service" params;
-                  operation = param "operation" params;
-                  status = param "status" params;
-                  attrs = attr_filters params;
-                  limit;
-                }
-              in
-              store_json (Store.trace_stats filter store)
-                (json_list "stats" Model.stat_item_to_json)
-          | _, Some _, Ok _ ->
-              Eta.Effect.pure
-                (error_response 400 "invalid_query"
-                   "agg must be count, avg_duration, p95_duration, or error_rate")))
+let trace_stats store req =
+  with_query req @@ fun params ->
+  match (param "groupBy" params, param "agg" params, parse_limit ~default:20 params) with
+  | None, _, _ ->
+      Eta.Effect.pure
+        (error_response 400 "invalid_query" "groupBy is required")
+  | _, None, _ ->
+      Eta.Effect.pure (error_response 400 "invalid_query" "agg is required")
+  | _, _, Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Some group_by, Some agg, Ok limit when valid_trace_agg agg ->
+      let filter =
+        {
+          Store.group_by;
+          agg;
+          service = param "service" params;
+          operation = param "operation" params;
+          status = param "status" params;
+          attrs = attr_filters params;
+          limit;
+        }
+      in
+      store_json (Store.trace_stats filter store)
+        (json_list "stats" Model.stat_item_to_json)
+  | _, Some _, Ok _ ->
+      Eta.Effect.pure
+        (error_response 400 "invalid_query"
+           "agg must be count, avg_duration, p95_duration, or error_rate")
 
-let logs store request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () -> (
-      match query_params request with
-      | Error message -> Eta.Effect.pure (error_response 400 "invalid_query" message)
-      | Ok params -> (
-          match parse_limit params with
-          | Error message ->
-              Eta.Effect.pure (error_response 400 "invalid_query" message)
-          | Ok limit ->
-              let filter =
-                {
-                  Store.service = param "service" params;
-                  severity = param "severity" params;
-                  contains = param "contains" params;
-                  limit;
-                }
-              in
-              store_json (Store.list_logs filter store)
-                (json_list "logs" Model.log_to_json)))
+let logs store req =
+  with_query req @@ fun params ->
+  match parse_limit params with
+  | Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Ok limit ->
+      let filter =
+        {
+          Store.service = param "service" params;
+          severity = param "severity" params;
+          contains = param "contains" params;
+          limit;
+        }
+      in
+      store_json (Store.list_logs filter store)
+        (json_list "logs" Model.log_to_json)
 
-let search_logs store request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () -> (
-      match query_params request with
-      | Error message -> Eta.Effect.pure (error_response 400 "invalid_query" message)
-      | Ok params -> (
-          match parse_limit params with
-          | Error message ->
-              Eta.Effect.pure (error_response 400 "invalid_query" message)
-          | Ok limit ->
-              let body =
-                match param "body" params with
-                | Some _ as value -> value
-                | None -> param "contains" params
-              in
-              let filter =
-                {
-                  Store.service = param "service" params;
-                  trace_id = param "traceId" params;
-                  span_id = param "spanId" params;
-                  severity = param "severity" params;
-                  body;
-                  attrs = attr_filters params;
-                  limit;
-                }
-              in
-              store_json (Store.search_logs filter store)
-                (json_list "logs" Model.log_to_json)))
+let search_logs store req =
+  with_query req @@ fun params ->
+  match parse_limit params with
+  | Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Ok limit ->
+      let body =
+        match param "body" params with
+        | Some _ as value -> value
+        | None -> param "contains" params
+      in
+      let filter =
+        {
+          Store.service = param "service" params;
+          trace_id = param "traceId" params;
+          span_id = param "spanId" params;
+          severity = param "severity" params;
+          body;
+          attrs = attr_filters params;
+          limit;
+        }
+      in
+      store_json (Store.search_logs filter store)
+        (json_list "logs" Model.log_to_json)
 
-let log_stats store request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () -> (
-      match query_params request with
-      | Error message -> Eta.Effect.pure (error_response 400 "invalid_query" message)
-      | Ok params -> (
-          match (param "groupBy" params, param "agg" params, parse_limit ~default:20 params) with
-          | None, _, _ ->
-              Eta.Effect.pure
-                (error_response 400 "invalid_query" "groupBy is required")
-          | _, Some agg, _ when not (String.equal agg "count") ->
-              Eta.Effect.pure
-                (error_response 400 "invalid_query" "agg must be count")
-          | _, _, Error message ->
-              Eta.Effect.pure (error_response 400 "invalid_query" message)
-          | Some group_by, _, Ok limit ->
-              let body =
-                match param "body" params with
-                | Some _ as value -> value
-                | None -> param "contains" params
-              in
-              let filter =
-                {
-                  Store.group_by;
-                  service = param "service" params;
-                  trace_id = param "traceId" params;
-                  span_id = param "spanId" params;
-                  severity = param "severity" params;
-                  body;
-                  attrs = attr_filters params;
-                  limit;
-                }
-              in
-              store_json (Store.log_stats filter store)
-                (json_list "stats" Model.stat_item_to_json)))
+let log_stats store req =
+  with_query req @@ fun params ->
+  match (param "groupBy" params, param "agg" params, parse_limit ~default:20 params) with
+  | None, _, _ ->
+      Eta.Effect.pure
+        (error_response 400 "invalid_query" "groupBy is required")
+  | _, Some agg, _ when not (String.equal agg "count") ->
+      Eta.Effect.pure
+        (error_response 400 "invalid_query" "agg must be count")
+  | _, _, Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Some group_by, _, Ok limit ->
+      let body =
+        match param "body" params with
+        | Some _ as value -> value
+        | None -> param "contains" params
+      in
+      let filter =
+        {
+          Store.group_by;
+          service = param "service" params;
+          trace_id = param "traceId" params;
+          span_id = param "spanId" params;
+          severity = param "severity" params;
+          body;
+          attrs = attr_filters params;
+          limit;
+        }
+      in
+      store_json (Store.log_stats filter store)
+        (json_list "stats" Model.stat_item_to_json)
 
-let facets store request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () -> (
-      match query_params request with
-      | Error message -> Eta.Effect.pure (error_response 400 "invalid_query" message)
-      | Ok params -> (
-          match (param "type" params, param "field" params, parse_limit ~default:20 params) with
-          | None, _, _ ->
-              Eta.Effect.pure
-                (error_response 400 "invalid_query" "type is required")
-          | _, None, _ ->
-              Eta.Effect.pure
-                (error_response 400 "invalid_query" "field is required")
-          | _, _, Error message ->
-              Eta.Effect.pure (error_response 400 "invalid_query" message)
-          | Some kind, Some field, Ok limit
-            when String.equal kind "traces" || String.equal kind "logs" ->
-              let filter =
-                {
-                  Store.kind;
-                  field;
-                  key = param "key" params;
-                  service = param "service" params;
-                  limit;
-                }
-              in
-              store_json (Store.facets filter store)
-                (json_list "facets" Model.facet_item_to_json)
-          | Some _, Some _, Ok _ ->
-              Eta.Effect.pure
-                (error_response 400 "invalid_query" "type must be traces or logs")))
+let facets store req =
+  with_query req @@ fun params ->
+  match (param "type" params, param "field" params, parse_limit ~default:20 params) with
+  | None, _, _ ->
+      Eta.Effect.pure
+        (error_response 400 "invalid_query" "type is required")
+  | _, None, _ ->
+      Eta.Effect.pure (error_response 400 "invalid_query" "field is required")
+  | _, _, Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Some kind, Some field, Ok limit
+    when String.equal kind "traces" || String.equal kind "logs" ->
+      let filter =
+        {
+          Store.kind;
+          field;
+          key = param "key" params;
+          service = param "service" params;
+          limit;
+        }
+      in
+      store_json (Store.facets filter store)
+        (json_list "facets" Model.facet_item_to_json)
+  | Some _, Some _, Ok _ ->
+      Eta.Effect.pure
+        (error_response 400 "invalid_query" "type must be traces or logs")
 
-let metrics store request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () -> (
-      match query_params request with
-      | Error message -> Eta.Effect.pure (error_response 400 "invalid_query" message)
-      | Ok params -> (
-          match parse_limit params with
-          | Error message ->
-              Eta.Effect.pure (error_response 400 "invalid_query" message)
-          | Ok limit ->
-              let filter =
-                {
-                  Store.service = param "service" params;
-                  name = param "name" params;
-                  limit;
-                }
-              in
-              store_json (Store.list_metric_points filter store)
-                (json_list "metrics" Model.metric_point_to_json)))
+let metrics store req =
+  with_query req @@ fun params ->
+  match parse_limit params with
+  | Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Ok limit ->
+      let filter =
+        {
+          Store.service = param "service" params;
+          name = param "name" params;
+          limit;
+        }
+      in
+      store_json (Store.list_metric_points filter store)
+        (json_list "metrics" Model.metric_point_to_json)
 
-let stats store request =
-  match require_method request "GET" with
-  | Error () -> Eta.Effect.pure (method_not_allowed ())
-  | Ok () -> store_json (Store.stats store) Model.stats_to_json
+let stats store _req = store_json (Store.stats store) Model.stats_to_json
 
-let handler config store request =
-  let path = canonical_path request.S.Request.path in
-  match (request.S.Request.method_, path_segments path) with
-  | "GET", [] -> Eta.Effect.pure (root_text config)
-  | "GET", [ "health" ] | "GET", [ "healthz" ] ->
-      Eta.Effect.pure (health config)
-  | "GET", [ "instructions" ] -> Eta.Effect.pure (instructions config)
-  | "GET", [ "endpoints" ] -> Eta.Effect.pure (endpoints config)
-  | "GET", [ "openapi.json" ] -> Eta.Effect.pure (openapi config)
-  | "POST", [ "v1"; "traces" ] ->
-      ingest request Otlp.decode_traces_json (Store.ingest_traces store)
-  | "POST", [ "v1"; "logs" ] ->
-      ingest request Otlp.decode_logs_json (Store.ingest_logs store)
-  | "POST", [ "v1"; "metrics" ] ->
-      ingest request Otlp.decode_metrics_json (Store.ingest_metrics store)
-  | _, [ "services" ] -> services store request
-  | _, [ "traces" ] -> traces store request
-  | _, [ "traces"; "search" ] -> search_traces store request
-  | _, [ "traces"; "stats" ] -> trace_stats store request
-  | _, [ "traces"; trace_id; "spans" ] -> trace_spans store trace_id request
-  | _, [ "traces"; trace_id; "logs" ] -> trace_logs store trace_id request
-  | _, [ "traces"; trace_id ] -> trace store trace_id request
-  | _, [ "spans"; "search" ] -> search_spans store request
-  | _, [ "spans"; span_id ] -> span store span_id request
-  | _, [ "spans"; span_id; "logs" ] -> span_logs store span_id request
-  | _, [ "logs" ] -> logs store request
-  | _, [ "logs"; "search" ] -> search_logs store request
-  | _, [ "logs"; "stats" ] -> log_stats store request
-  | _, [ "ai"; "calls" ] -> ai_calls store request
-  | _, [ "ai"; "calls"; span_id ] -> ai_call store span_id request
-  | _, [ "ai"; "stats" ] -> ai_stats store request
-  | _, [ "facets" ] -> facets store request
-  | _, [ "metrics" ] -> metrics store request
-  | _, [ "stats" ] -> stats store request
-  | _ -> Eta.Effect.pure (not_found ())
+let add_response_header name value response =
+  let headers = H.Core.Header.unsafe_add name value (S.Response.headers response) in
+  S.Response.make ~headers ~status:(S.Response.status response)
+    ~body:(S.Response.body response)
+    ~trailers:(S.Response.trailers response)
+    ()
+
+let method_not_allowed_handler ~allowed _request =
+  method_not_allowed ()
+  |> add_response_header "allow" (String.concat ", " allowed)
+  |> Eta.Effect.pure
+
+let not_found_handler _request = Eta.Effect.pure (not_found ())
+
+let with_route_param name f req =
+  let open Eta.Syntax in
+  let* value = Service.Extractors.Param.string name req in
+  f value req
+
+let add_route router ~methods path route =
+  Service.Router.add_exn router ~methods path route;
+  let aliases =
+    if String.equal path "/" then [ "/api"; "/api/" ] else [ "/api" ^ path ]
+  in
+  List.iter
+    (fun alias -> Service.Router.add_exn router ~methods alias route)
+    aliases
+
+let handler config store =
+  let router = Service.Router.create () in
+  add_route router ~methods:[ "GET" ] "/" (fun _req ->
+      Eta.Effect.pure (root_text config));
+  add_route router ~methods:[ "GET" ] "/health" (fun _req ->
+      Eta.Effect.pure (health config));
+  add_route router ~methods:[ "GET" ] "/healthz" (fun _req ->
+      Eta.Effect.pure (health config));
+  add_route router ~methods:[ "GET" ] "/instructions" (fun _req ->
+      Eta.Effect.pure (instructions config));
+  add_route router ~methods:[ "GET" ] "/endpoints" (fun _req ->
+      Eta.Effect.pure (endpoints config));
+  add_route router ~methods:[ "GET" ] "/openapi.json" (fun _req ->
+      Eta.Effect.pure (openapi config));
+  add_route router ~methods:[ "POST" ] "/v1/traces" (fun req ->
+      ingest req Otlp.decode_traces_json (Store.ingest_traces store));
+  add_route router ~methods:[ "POST" ] "/v1/logs" (fun req ->
+      ingest req Otlp.decode_logs_json (Store.ingest_logs store));
+  add_route router ~methods:[ "POST" ] "/v1/metrics" (fun req ->
+      ingest req Otlp.decode_metrics_json (Store.ingest_metrics store));
+  add_route router ~methods:[ "GET" ] "/services" (services store);
+  add_route router ~methods:[ "GET" ] "/traces" (traces store);
+  add_route router ~methods:[ "GET" ] "/traces/search" (search_traces store);
+  add_route router ~methods:[ "GET" ] "/traces/stats" (trace_stats store);
+  add_route router ~methods:[ "GET" ] "/traces/{traceId}/spans"
+    (with_route_param "traceId" (trace_spans store));
+  add_route router ~methods:[ "GET" ] "/traces/{traceId}/logs"
+    (with_route_param "traceId" (trace_logs store));
+  add_route router ~methods:[ "GET" ] "/traces/{traceId}"
+    (with_route_param "traceId" (trace store));
+  add_route router ~methods:[ "GET" ] "/spans/search" (search_spans store);
+  add_route router ~methods:[ "GET" ] "/spans/{spanId}"
+    (with_route_param "spanId" (span store));
+  add_route router ~methods:[ "GET" ] "/spans/{spanId}/logs"
+    (with_route_param "spanId" (span_logs store));
+  add_route router ~methods:[ "GET" ] "/logs" (logs store);
+  add_route router ~methods:[ "GET" ] "/logs/search" (search_logs store);
+  add_route router ~methods:[ "GET" ] "/logs/stats" (log_stats store);
+  add_route router ~methods:[ "GET" ] "/ai/calls" (ai_calls store);
+  add_route router ~methods:[ "GET" ] "/ai/calls/{spanId}"
+    (with_route_param "spanId" (ai_call store));
+  add_route router ~methods:[ "GET" ] "/ai/stats" (ai_stats store);
+  add_route router ~methods:[ "GET" ] "/facets" (facets store);
+  add_route router ~methods:[ "GET" ] "/metrics" (metrics store);
+  add_route router ~methods:[ "GET" ] "/stats" (stats store);
+  Service.Router.compile ~not_found:not_found_handler
+    ~method_not_allowed:method_not_allowed_handler router
 
 let run_store_effect ~sw ~clock effect =
   let rt = Eta_eio.Runtime.create ~sw ~clock () in
@@ -1039,17 +925,6 @@ let run_store_effect ~sw ~clock effect =
   | Eta.Exit.Ok value -> value
   | Eta.Exit.Error cause ->
       failwith (Format.asprintf "%a" (Eta.Cause.pp Store.pp_error) cause)
-
-let listen_addr host port =
-  let ip =
-    match host with
-    | "localhost" | "127.0.0.1" -> Eio.Net.Ipaddr.V4.loopback
-    | "::1" -> Eio.Net.Ipaddr.V6.loopback
-    | "0.0.0.0" -> Eio.Net.Ipaddr.V4.any
-    | "::" -> Eio.Net.Ipaddr.V6.any
-    | host -> Eio_unix.Net.Ipaddr.of_unix (Unix.inet_addr_of_string host)
-  in
-  `Tcp (ip, port)
 
 let unix_addr host port =
   let ip =
@@ -1082,8 +957,8 @@ let run ~sw ~env config =
     ~finally:(fun () ->
       run_store_effect ~sw ~clock (Store.close store))
     (fun () ->
-      let addr = listen_addr config.Config.host config.port in
+      let addr = Serve.tcp_addr ~host:config.Config.host ~port:config.port in
       prerr_endline
         (Printf.sprintf "inn server listening on http://%s:%d" config.host
            config.port);
-      Eta_http_eio.Server.run_h1 ~sw ~net ~clock ~addr (handler config store))
+      Serve.h1 ~sw ~net ~clock ~addr (handler config store))
