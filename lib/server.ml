@@ -184,18 +184,18 @@ let root_text config =
 
 let store_error_message error = Format.asprintf "%a" Store.pp_error error
 
-let store_json effect encode =
+let store_json eff encode =
   let open Eta.Syntax in
-  let* result = Eta.Effect.result effect in
+  let* result = Eta.Effect.result eff in
   match result with
   | Ok value -> Eta.Effect.pure (json_response (encode value))
   | Error error ->
       Eta.Effect.pure
         (error_response 500 "store_error" (store_error_message error))
 
-let store_accepted effect =
+let store_accepted eff =
   let open Eta.Syntax in
-  let* result = Eta.Effect.result effect in
+  let* result = Eta.Effect.result eff in
   match result with
   | Ok accepted -> Eta.Effect.pure (accepted_response accepted)
   | Error error ->
@@ -490,9 +490,9 @@ let ai_calls store req =
   match select_ai_spans store params with
   | Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Ok (limit, effect) ->
+  | Ok (limit, eff) ->
       let open Eta.Syntax in
-      let* result = Eta.Effect.result effect in
+      let* result = Eta.Effect.result eff in
       (match result with
       | Error error ->
           Eta.Effect.pure
@@ -563,9 +563,9 @@ let ai_stats store req =
       match select_ai_spans store params with
       | Error message ->
           Eta.Effect.pure (error_response 400 "invalid_query" message)
-      | Ok (_, effect) ->
+      | Ok (_, eff) ->
           let open Eta.Syntax in
-          let* result = Eta.Effect.result effect in
+          let* result = Eta.Effect.result eff in
           (match result with
                   | Error error ->
                       Eta.Effect.pure
@@ -919,9 +919,9 @@ let handler config store =
   Service.Router.compile ~not_found:not_found_handler
     ~method_not_allowed:method_not_allowed_handler router
 
-let run_store_effect ~sw ~clock effect =
+let run_store_effect ~sw ~clock eff =
   let rt = Eta_eio.Runtime.create ~sw ~clock () in
-  match Eta.Runtime.run rt effect with
+  match Eta.Runtime.run rt eff with
   | Eta.Exit.Ok value -> value
   | Eta.Exit.Error cause ->
       failwith (Format.asprintf "%a" (Eta.Cause.pp Store.pp_error) cause)

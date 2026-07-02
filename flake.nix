@@ -2,9 +2,35 @@
   description = "Inn OxCaml local OpenTelemetry collector and query service";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.eta = {
+    url = "git+file:///home/ribelo/projects/ribelo/ocaml/Eta";
+    inputs.nixpkgs.follows = "nixpkgs";
+    inputs.opam-nix.follows = "opam-nix";
+    inputs.opam-repository.follows = "opam-repository";
+    inputs.oxcaml.follows = "oxcaml";
+  };
+  inputs.opam-nix = {
+    url = "github:tweag/opam-nix";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+  inputs.opam-repository = {
+    url = "github:ocaml/opam-repository";
+    flake = false;
+  };
+  inputs.oxcaml = {
+    url = "github:oxcaml/oxcaml/5.2.0minus-31";
+    flake = false;
+  };
 
   outputs =
-    { nixpkgs, ... }:
+    {
+      nixpkgs,
+      eta,
+      opam-nix,
+      opam-repository,
+      oxcaml,
+      ...
+    }:
     let
       systems = [
         "aarch64-darwin"
@@ -16,6 +42,76 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
+      packages = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          cleanLocalSource =
+            src:
+            pkgs.lib.cleanSourceWith {
+              inherit src;
+              filter =
+                path: _type:
+                let
+                  base = baseNameOf path;
+                in
+                !(
+                  base == ".git"
+                  || base == "_build"
+                  || base == "_opam"
+                  || base == ".opam"
+                  || base == ".opam-oxcaml"
+                  || base == ".reference"
+                  || base == ".scratch"
+                  || base == ".motel-data"
+                  || base == ".nema"
+                  || base == ".pi"
+                  || base == ".hill-climbing"
+                  || base == "node_modules"
+                );
+            };
+          innSrc = cleanLocalSource ./.;
+          etaSrc = cleanLocalSource eta;
+          opamLib = opam-nix.lib.${system};
+          etaRepo = opamLib.makeOpamRepo etaSrc;
+          patchedOxcaml = pkgs.runCommand "oxcaml-source-patched" { } ''
+            cp -R ${oxcaml} "$out"
+            chmod -R u+w "$out"
+            ${pkgs.perl}/bin/perl -0pi -e 's|new: old: \{\n        buildInputs = \[|new: old: rec {\n        version = "20231231";\n        src = pkgs.fetchFromGitLab {\n          domain = "gitlab.inria.fr";\n          owner = "fpottier";\n          repo = "menhir";\n          rev = version;\n          sha256 = "sha256-veB0ORHp6jdRwCyDDAfc7a7ov8sOeHUmiELdOFf/QYk=";\n        };\n        patches = [ ];\n        buildInputs = [|' "$out/default.nix"
+          '';
+          oxcamlCompiler = pkgs.callPackage "${patchedOxcaml}/default.nix" {
+            src = patchedOxcaml;
+            ocamltest = false;
+            warnError = false;
+          };
+          oxcamlSystemOverlay = final: prev: {
+            ocaml-system = prev.ocaml-system.overrideAttrs (_old: {
+              nativeBuildInputs = [ oxcamlCompiler ];
+            });
+          };
+          scope = opamLib.buildOpamProject
+            {
+              inherit pkgs;
+              overlays = [ oxcamlSystemOverlay ];
+              repos = [
+                etaRepo
+                opam-repository
+              ];
+              resolveArgs.env.sys-ocaml-version = "5.2.0";
+            }
+            "inn"
+            innSrc
+            {
+              ocaml-system = "*";
+            };
+          inn = scope.inn;
+        in
+        {
+          default = inn;
+          inherit inn;
+        }
+      );
+
       devShells = forAllSystems (
         system:
         let
@@ -26,12 +122,14 @@
             [ pkgs.sqlite ]
           );
           oxCamlSetup = pkgs.writeShellApplication {
-            name = "inn-oxcaml-init";
+            name = "inn-opam-install";
             runtimeInputs = [
               pkgs.autoconf
+              pkgs.coreutils
               pkgs.git
               pkgs.gnumake
               pkgs.m4
+              pkgs.nix
               pkgs.opam
               pkgs.patch
               pkgs.pkg-config
@@ -46,41 +144,31 @@
               export OPAMROOT="''${OPAMROOT:-${oxCamlOpamRoot}}"
               export OPAMYES=1
               export PKG_CONFIG_PATH="${nativePkgConfigPath}:''${PKG_CONFIG_PATH:-}"
-              eta_pin="''${ETA_OPAM_PIN:-git+https://github.com/ribelo/eta.git#master}"
-
-              if [ ! -d "$OPAMROOT" ]; then
-                opam init --bare --disable-sandboxing --no-setup --yes
-              fi
 
               if ! opam switch list --short | grep -Fxq "$switch_name"; then
-                opam switch create "$switch_name" \
-                  --repos ox=git+https://github.com/oxcaml/opam-repository.git,default \
-                  --assume-depexts \
-                  --yes
+                echo "Missing OPAM switch '$switch_name'." >&2
+                echo "Run: shared-ocaml-switch-init" >&2
+                exit 1
               fi
 
               export OPAMSWITCH="$switch_name"
               eval "$(opam env --switch "$switch_name" --set-switch)"
 
-              for pkg in \
-                eta \
-                eta_blocking \
-                eta_eio \
-                eta_http \
-                eta_http_eio \
-                eta_http_service \
-                eta_http_service_eio \
-                eta_router \
-                eta_sql \
-                eta_sql_driver \
-                eta_sql_dsl \
-                eta_stream; do
-                opam pin add "$pkg" "$eta_pin" --yes
-              done
-              opam install . --deps-only --with-test --assume-depexts --yes
+              eta_path="''${ETA_PATH:-$repo_root/../ocaml/Eta}"
+              if command -v eta-opam-install-ox >/dev/null 2>&1; then
+                eta-opam-install-ox
+              elif [ -d "$eta_path" ]; then
+                nix develop "$eta_path" -c eta-opam-install-ox
+              else
+                echo "Missing Eta checkout at $eta_path" >&2
+                exit 1
+              fi
 
-              echo "OxCaml switch is ready: $switch_name"
-              echo "Enter it with: nix develop .#oxcaml"
+              opam pin add --kind=git inn "git+file://$repo_root#master" --no-action --yes
+              opam install inn --with-test --assume-depexts --yes
+
+              echo "Inn is installed into OPAM switch: $switch_name"
+              echo "Enter it with: nix develop"
             '';
           };
 
@@ -93,31 +181,12 @@
             fi
             if [ -t 1 ]; then
               echo "Inn OxCaml shell (${oxCamlSwitch})"
-              echo "Run 'inn-oxcaml-init' once to create the ${oxCamlSwitch} opam switch."
+              echo "Run 'shared-ocaml-switch-init' before 'inn-opam-install'."
             fi
           '';
         in
         {
           default = pkgs.mkShell {
-            packages = [
-              pkgs.autoconf
-              pkgs.cacert
-              pkgs.git
-              pkgs.gnumake
-              pkgs.m4
-              pkgs.opam
-              pkgs.patch
-              pkgs.pkg-config
-              pkgs.sqlite
-              pkgs.unzip
-              pkgs.which
-              oxCamlSetup
-            ];
-
-            inherit shellHook;
-          };
-
-          oxcaml = pkgs.mkShell {
             packages = [
               pkgs.autoconf
               pkgs.cacert
