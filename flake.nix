@@ -165,7 +165,7 @@
               fi
 
               opam pin add --kind=git inn "git+file://$repo_root#master" --no-action --yes
-              opam install inn --with-test --assume-depexts --yes
+              opam install inn --assume-depexts --yes
 
               echo "Inn is installed into OPAM switch: $switch_name"
               echo "Enter it with: nix develop"
