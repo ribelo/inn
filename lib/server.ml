@@ -186,7 +186,7 @@ let store_error_message error = Format.asprintf "%a" Store.pp_error error
 
 let store_json eff encode =
   let open Eta.Syntax in
-  let* result = Eta.Effect.result eff in
+  let* result = Eta.Effect.fold ~ok:(fun value -> Ok value) ~error:(fun error -> Error error) eff in
   match result with
   | Ok value -> Eta.Effect.pure (json_response (encode value))
   | Error error ->
@@ -195,7 +195,7 @@ let store_json eff encode =
 
 let store_accepted eff =
   let open Eta.Syntax in
-  let* result = Eta.Effect.result eff in
+  let* result = Eta.Effect.fold ~ok:(fun value -> Ok value) ~error:(fun error -> Error error) eff in
   match result with
   | Ok accepted -> Eta.Effect.pure (accepted_response accepted)
   | Error error ->
@@ -206,7 +206,10 @@ let param name params = List.assoc_opt name params
 
 let with_query req f =
   let open Eta.Syntax in
-  let* result = Eta.Effect.result (Service.Extractors.Query.all req) in
+  let* result = Eta.Effect.fold
+      ~ok:(fun value -> Ok value)
+      ~error:(fun error -> Error error)
+      (Service.Extractors.Query.all req) in
   match result with
   | Ok params -> f params
   | Error { S.Error.kind = Bad_request { message }; _ } ->
@@ -273,7 +276,10 @@ let traces store req =
 
 let trace store trace_id _req =
   let open Eta.Syntax in
-  let* result = Eta.Effect.result (Store.get_trace store trace_id) in
+  let* result = Eta.Effect.fold
+      ~ok:(fun value -> Ok value)
+      ~error:(fun error -> Error error)
+      (Store.get_trace store trace_id) in
   match result with
   | Error error ->
       Eta.Effect.pure
@@ -285,7 +291,10 @@ let trace store trace_id _req =
 
 let span store span_id _req =
   let open Eta.Syntax in
-  let* result = Eta.Effect.result (Store.get_span store span_id) in
+  let* result = Eta.Effect.fold
+      ~ok:(fun value -> Ok value)
+      ~error:(fun error -> Error error)
+      (Store.get_span store span_id) in
   match result with
   | Error error ->
       Eta.Effect.pure
@@ -492,7 +501,7 @@ let ai_calls store req =
       Eta.Effect.pure (error_response 400 "invalid_query" message)
   | Ok (limit, eff) ->
       let open Eta.Syntax in
-      let* result = Eta.Effect.result eff in
+      let* result = Eta.Effect.fold ~ok:(fun value -> Ok value) ~error:(fun error -> Error error) eff in
       (match result with
       | Error error ->
           Eta.Effect.pure
@@ -516,7 +525,10 @@ let ai_calls store req =
 
 let ai_call store span_id _req =
   let open Eta.Syntax in
-  let* span_result = Eta.Effect.result (Store.get_span store span_id) in
+  let* span_result = Eta.Effect.fold
+      ~ok:(fun value -> Ok value)
+      ~error:(fun error -> Error error)
+      (Store.get_span store span_id) in
   match span_result with
   | Error error ->
       Eta.Effect.pure
@@ -528,7 +540,10 @@ let ai_call store span_id _req =
       Eta.Effect.pure
         (error_response 404 "ai_call_not_found" "AI call was not found")
   | Ok (Some span) ->
-      let* logs_result = Eta.Effect.result (Store.list_span_logs store span.span_id) in
+      let* logs_result = Eta.Effect.fold
+          ~ok:(fun value -> Ok value)
+          ~error:(fun error -> Error error)
+          (Store.list_span_logs store span.span_id) in
       (match logs_result with
       | Error error ->
           Eta.Effect.pure
@@ -565,7 +580,7 @@ let ai_stats store req =
           Eta.Effect.pure (error_response 400 "invalid_query" message)
       | Ok (_, eff) ->
           let open Eta.Syntax in
-          let* result = Eta.Effect.result eff in
+          let* result = Eta.Effect.fold ~ok:(fun value -> Ok value) ~error:(fun error -> Error error) eff in
           (match result with
                   | Error error ->
                       Eta.Effect.pure
