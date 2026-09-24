@@ -4,7 +4,10 @@ type t = {
   host : string;
   port : int;
   base_url : string;
-  retention_hours : int;
+  traces_retention_hours : int;
+  logs_retention_hours : int;
+  metrics_retention_hours : int;
+  prune_interval_seconds : int;
   max_db_size_mb : int;
 }
 

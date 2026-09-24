@@ -4,11 +4,19 @@ type t = {
   host : string;
   port : int;
   base_url : string;
-  retention_hours : int;
+  traces_retention_hours : int;
+  logs_retention_hours : int;
+  metrics_retention_hours : int;
+  prune_interval_seconds : int;
   max_db_size_mb : int;
 }
 
 let default_port = 27687
+let default_traces_retention_hours = 48
+let default_logs_retention_hours = 24
+let default_metrics_retention_hours = 48
+let default_prune_interval_seconds = 300
+let default_max_db_size_mb = 1024
 
 let getenv key =
   match Sys.getenv_opt key with
@@ -25,12 +33,23 @@ let parse_positive_int ~name value =
   | Some n when n > 0 -> Ok n
   | _ -> Error (Printf.sprintf "%s must be a positive integer, got %S" name value)
 
+let positive_int_env env ~name ~default =
+  parse_positive_int ~name
+    (Option.value (clean_env env name) ~default:(string_of_int default))
+
 let default_home () =
   match Sys.getenv_opt "HOME" with
   | Some value when String.trim value <> "" -> value
   | _ -> "."
 
 let concat a b = Filename.concat a b
+
+let legacy_retention_error =
+  "INN_RETENTION_HOURS is no longer supported: use \
+   INN_TRACES_RETENTION_HOURS, INN_LOGS_RETENTION_HOURS, and \
+   INN_METRICS_RETENTION_HOURS instead"
+
+let ( let* ) = Result.bind
 
 let resolve ?(env = getenv) ?home () =
   let home = Option.value home ~default:(default_home ()) in
@@ -50,40 +69,49 @@ let resolve ?(env = getenv) ?home () =
     | None -> concat state_dir "telemetry.sqlite"
   in
   let host = Option.value (clean_env env "INN_HOST") ~default:"127.0.0.1" in
-  let port_value =
-    Option.value (clean_env env "INN_PORT") ~default:(string_of_int default_port)
-  in
-  let base_url_from_port port =
-    Printf.sprintf "http://%s:%d" host port
-  in
-  match parse_positive_int ~name:"INN_PORT" port_value with
-  | Error _ as error -> error
-  | Ok port -> (
+  match clean_env env "INN_RETENTION_HOURS" with
+  | Some _ -> Error legacy_retention_error
+  | None ->
+      let* port =
+        positive_int_env env ~name:"INN_PORT" ~default:default_port
+      in
+      let* traces_retention_hours =
+        positive_int_env env ~name:"INN_TRACES_RETENTION_HOURS"
+          ~default:default_traces_retention_hours
+      in
+      let* logs_retention_hours =
+        positive_int_env env ~name:"INN_LOGS_RETENTION_HOURS"
+          ~default:default_logs_retention_hours
+      in
+      let* metrics_retention_hours =
+        positive_int_env env ~name:"INN_METRICS_RETENTION_HOURS"
+          ~default:default_metrics_retention_hours
+      in
+      let* prune_interval_seconds =
+        positive_int_env env ~name:"INN_PRUNE_INTERVAL_SECONDS"
+          ~default:default_prune_interval_seconds
+      in
+      let* max_db_size_mb =
+        positive_int_env env ~name:"INN_MAX_DB_SIZE_MB"
+          ~default:default_max_db_size_mb
+      in
       let base_url =
-        Option.value (clean_env env "INN_BASE_URL") ~default:(base_url_from_port port)
+        Option.value (clean_env env "INN_BASE_URL")
+          ~default:(Printf.sprintf "http://%s:%d" host port)
       in
-      let retention_value =
-        Option.value (clean_env env "INN_RETENTION_HOURS") ~default:"168"
-      in
-      match parse_positive_int ~name:"INN_RETENTION_HOURS" retention_value with
-      | Error _ as error -> error
-      | Ok retention_hours -> (
-          let max_db_value =
-            Option.value (clean_env env "INN_MAX_DB_SIZE_MB") ~default:"1024"
-          in
-          match parse_positive_int ~name:"INN_MAX_DB_SIZE_MB" max_db_value with
-          | Error _ as error -> error
-          | Ok max_db_size_mb ->
-              Ok
-                {
-                  state_dir;
-                  db_path;
-                  host;
-                  port;
-                  base_url;
-                  retention_hours;
-                  max_db_size_mb;
-                }))
+      Ok
+        {
+          state_dir;
+          db_path;
+          host;
+          port;
+          base_url;
+          traces_retention_hours;
+          logs_retention_hours;
+          metrics_retention_hours;
+          prune_interval_seconds;
+          max_db_size_mb;
+        }
 
 let resolve_exn () =
   match resolve () with

@@ -10,6 +10,8 @@ type error =
 type t = {
   config : Config.t;
   pool : Q.Pool.t;
+  now_ms : unit -> int;
+  mutable last_prune : Model.prune_report option;
 }
 
 type ingest_counts = {
@@ -95,7 +97,13 @@ type metric_filter = {
   limit : int;
 }
 
-let schema_version = "1"
+(* Bump this constant, and the fingerprint recorded in the schema test, with
+   every change to the statements in [schemas]. [open_] recreates any database
+   whose stored version differs, so a schema change without a bump would be
+   silently skipped on an existing database (schm-hnis). *)
+let schema_version = 2
+
+let schema_version_text = string_of_int schema_version
 
 module Meta = struct
   module T = Q.Table.Make (struct
@@ -235,6 +243,19 @@ module Metric_attributes = struct
   let value = column "value" Q.text
 end
 
+(* SQLite keeps its schema in [sqlite_master]; the typed builders can read it
+   like any other table, which keeps the schema-version check free of raw SQL. *)
+module Sqlite_master = struct
+  module T = Q.Table.Make (struct
+    let name = "sqlite_master"
+  end)
+
+  include T
+
+  let type_ = column "type" Q.text
+  let name = column "name" Q.text
+end
+
 let pp_error ppf = function
   | `Eta_sql error -> Q.pp_error ppf error
   | `Pool_shutdown -> Format.pp_print_string ppf "pool shutdown"
@@ -250,13 +271,13 @@ let rec mkdir_p path =
     mkdir_p (Filename.dirname path);
     Unix.mkdir path 0o700)
 
-let now_ms () = int_of_float (Unix.gettimeofday () *. 1000.)
+let wall_now_ms () = int_of_float (Unix.gettimeofday () *. 1000.)
 
 let id_counter = Atomic.make 0
 
 let fresh_id prefix =
   let seq = Atomic.fetch_and_add id_counter 1 in
-  Printf.sprintf "%s-%d-%d-%d" prefix (Unix.getpid ()) (now_ms ()) seq
+  Printf.sprintf "%s-%d-%d-%d" prefix (Unix.getpid ()) (wall_now_ms ()) seq
 
 let span_row_id (span : Model.span) = span.trace_id ^ ":" ^ span.span_id
 let attr_row_id owner_id index key = owner_id ^ ":" ^ string_of_int index ^ ":" ^ key
@@ -429,6 +450,8 @@ let schemas =
       [ Logs.span_id ];
     create_index ~if_not_exists:true ~name:"idx_logs_severity" Logs.table
       [ Logs.severity_text ];
+    create_index ~if_not_exists:true ~name:"idx_logs_ingested" Logs.table
+      [ Logs.ingested_at_ms ];
     create_table ~if_not_exists:true Log_attributes.table
       [
         column ~primary_key:true Log_attributes.id;
@@ -457,6 +480,8 @@ let schemas =
       Trace_summaries.table [ Trace_summaries.service_name ];
     create_index ~if_not_exists:true ~name:"idx_trace_summaries_started"
       Trace_summaries.table [ Trace_summaries.started_at_ms ];
+    create_index ~if_not_exists:true ~name:"idx_trace_summaries_updated"
+      Trace_summaries.table [ Trace_summaries.updated_at_ms ];
     create_table ~if_not_exists:true Metric_points.table
       [
         column ~primary_key:true Metric_points.id;
@@ -480,6 +505,8 @@ let schemas =
       Metric_points.table [ Metric_points.timestamp_ms ];
     create_index ~if_not_exists:true ~name:"idx_metric_points_name"
       Metric_points.table [ Metric_points.name ];
+    create_index ~if_not_exists:true ~name:"idx_metric_points_ingested"
+      Metric_points.table [ Metric_points.ingested_at_ms ];
     create_table ~if_not_exists:true Metric_attributes.table
       [
         column ~primary_key:true Metric_attributes.id;
@@ -494,6 +521,18 @@ let schemas =
       Metric_attributes.table [ Metric_attributes.owner_id ];
   ]
 
+(* The compiled statements are what actually runs, so the fingerprint covers
+   them rather than the declarations. The schema test records this value next
+   to [schema_version]: a schema edit without a version bump fails it
+   (schm-hnis). *)
+let schema_statements =
+  List.map
+    (fun schema -> Q.Compiled.schema_sql (Q.Eta_schema.compile schema))
+    schemas
+
+let schema_fingerprint =
+  Digest.to_hex (Digest.string (String.concat "\n" schema_statements))
+
 let init_schema runner =
   let open Eta.Syntax in
   let* () = effect_iter schemas (q_schema_pool runner) in
@@ -501,7 +540,7 @@ let init_schema runner =
     Q.Insert.(
       into Meta.table
       |> value Meta.key "schema_version"
-      |> value Meta.value schema_version
+      |> value Meta.value schema_version_text
       |> on_conflict_update [ Meta.key ] ~set:[ Meta.value ]
       |> compile)
   in
@@ -519,21 +558,205 @@ let sqlite_config path =
     cache_size = Some (-20_000);
   }
 
-let open_ config =
+(* Eta SQL has no typed pragma API. Eta_sql.mli documents [Pool.Raw] as the
+   escape hatch for "migrations, pragmas, diagnostics, and backend-specific
+   SQL", so every pragma Inn runs goes through these two helpers, and no other
+   raw SQL exists in the store. *)
+let sqlite_pragma_int runner pragma =
   let open Eta.Syntax in
-  let* () = Eta.Effect.sync (fun () -> mkdir_p (Filename.dirname config.Config.db_path)) in
+  let* rows =
+    Q.Pool.Raw.query runner ("PRAGMA " ^ pragma) []
+    |> Eta.Effect.map_error widen_pool_error
+  in
+  let column_value row =
+    match Q.Row.fields row with
+    | name :: _ -> Q.Row.int name row
+    | [] -> None
+  in
+  match List.filter_map column_value rows with
+  | value :: _ -> Eta.Effect.pure value
+  | [] ->
+      Eta.Effect.fail
+        (`Invalid_store
+          (Printf.sprintf "PRAGMA %s did not return an integer value" pragma))
+
+let sqlite_pragma runner pragma =
+  let open Eta.Syntax in
+  (* [PRAGMA incremental_vacuum] steps once per freed page, so the pragma is
+     folded rather than executed; [Raw.execute] rejects a row-returning
+     statement. *)
+  let* () =
+    Q.Pool.Raw.fold runner ("PRAGMA " ^ pragma) [] ~init:()
+      ~f:(fun () _ -> ())
+    |> Eta.Effect.map_error widen_pool_error
+  in
+  Eta.Effect.unit
+
+(* Live data is the pages in use, not the file size: SQLite never shrinks the
+   file on delete alone, so the file size is a poor size-cap input (ret-zjzs). *)
+let live_bytes runner =
+  let open Eta.Syntax in
+  let* page_count = sqlite_pragma_int runner "page_count" in
+  let* freelist_count = sqlite_pragma_int runner "freelist_count" in
+  let* page_size = sqlite_pragma_int runner "page_size" in
+  Eta.Effect.pure ((page_count - freelist_count) * page_size)
+
+(* Schema state of the file at the configured database path. The check reads
+   the file before any schema statement runs, so a database that is not Inn's
+   is never modified or deleted (schm-xkk2). *)
+type database_state =
+  | Database_absent
+  | Database_fresh
+  | Database_current
+  | Database_stale of string
+  | Database_foreign
+
+(* Inspecting and preparing a file uses a local, non-WAL connection: [PRAGMA
+   journal_mode = WAL] writes the database header, which would both touch a
+   foreign file and lock in the default [auto_vacuum] before Inn can set it.
+   The remaining settings are per-connection and do not modify the file. *)
+let local_sqlite_config ?(mode = Sqlite.Read_write) path =
+  { (sqlite_config path) with mode; journal_mode = None }
+
+let with_local_pool ?mode path f =
+  Eta.Effect.with_resource
+    ~acquire:
+      (Q.Pool.create ~default_timeout:(Eta.Duration.ms 5000) ~max_size:1
+         (local_sqlite_config ?mode path)
+      |> Eta.Effect.map_error widen_pool_error)
+    ~release:(fun pool ->
+      Q.Pool.shutdown pool |> Eta.Effect.map_error widen_pool_error)
+    f
+
+let sqlite_magic = "SQLite format 3\000"
+
+(* A zero-length file is a valid empty SQLite database; anything else must
+   carry the SQLite header. Refusing a file that is not SQLite before opening a
+   connection keeps a misconfigured path from being touched at all
+   (schm-xkk2). *)
+let file_is_sqlite path =
+  let channel = open_in_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_in channel)
+    (fun () ->
+      let length = in_channel_length channel in
+      if length = 0 then true
+      else if length < String.length sqlite_magic then false
+      else String.equal (really_input_string channel 16) sqlite_magic)
+
+let read_database_state path =
+  if not (Sys.file_exists path) then Eta.Effect.pure Database_absent
+  else if not (file_is_sqlite path) then
+    Eta.Effect.fail
+      (`Invalid_store
+        (Printf.sprintf "refusing to open %s: it is not an SQLite database" path))
+  else
+    let open Eta.Syntax in
+    let* result =
+      with_local_pool path (fun pool ->
+          let open Eta.Syntax in
+          let* tables =
+            q_select pool
+              Q.Select.(
+                from Sqlite_master.table Q.Projection.(one Sqlite_master.name)
+                |> where Q.Expr.(eq Sqlite_master.type_ "table"))
+          in
+          let tables =
+            List.filter
+              (fun name -> not (String.starts_with ~prefix:"sqlite_" name))
+              tables
+          in
+          if not (List.mem "inn_meta" tables) then
+            Eta.Effect.pure
+              (if tables = [] then Database_fresh else Database_foreign)
+          else
+            let* versions =
+              q_select pool
+                Q.Select.(
+                  from Meta.table Q.Projection.(one Meta.value)
+                  |> where Q.Expr.(eq Meta.key "schema_version")
+                  |> limit 1)
+            in
+            match versions with
+            | [ stored ] when String.equal stored schema_version_text ->
+                Eta.Effect.pure Database_current
+            | [ stored ] -> Eta.Effect.pure (Database_stale stored)
+            | [] -> Eta.Effect.pure (Database_stale "none")
+            | _ ->
+                Eta.Effect.fail
+                  (`Invalid_store
+                    "inn_meta holds more than one schema_version row"))
+      |> Eta.Effect.fold ~ok:(fun state -> Ok state) ~error:(fun error ->
+             Error error)
+    in
+    match result with
+    | Ok state -> Eta.Effect.pure state
+    | Error error ->
+        Eta.Effect.fail
+          (`Invalid_store
+            (Printf.sprintf "cannot read %s as an SQLite database: %s" path
+               (Format.asprintf "%a" pp_error error)))
+
+let remove_if_exists path =
+  if Sys.file_exists path then
+    try Sys.remove path with Sys_error _ -> ()
+
+let remove_database_files path =
+  List.iter remove_if_exists [ path; path ^ "-wal"; path ^ "-shm" ]
+
+let default_report line = prerr_endline ("inn: " ^ line)
+
+let open_ ?(now_ms = wall_now_ms) ?(report = default_report) config =
+  let open Eta.Syntax in
+  let path = config.Config.db_path in
+  let* () =
+    Eta.Effect.sync (fun () -> mkdir_p (Filename.dirname path))
+  in
+  let* state = read_database_state path in
+  let* () =
+    match state with
+    | Database_current -> Eta.Effect.unit
+    | Database_foreign ->
+        Eta.Effect.fail
+          (`Invalid_store
+            (Printf.sprintf
+               "refusing to recreate %s: it has tables but no inn_meta table, so it is not an Inn database"
+               path))
+    | Database_stale stored ->
+        let* () =
+          Eta.Effect.sync (fun () ->
+              report
+                (Printf.sprintf
+                   "schema version %s at %s does not match version %d; deleting the old database and creating a fresh one"
+                   stored path schema_version))
+        in
+        Eta.Effect.sync (fun () -> remove_database_files path)
+    | Database_absent | Database_fresh ->
+        Eta.Effect.sync (fun () -> remove_database_files path)
+  in
+  let* () =
+    (* [auto_vacuum] must be set while the database is still empty, and before
+       any other connection switches it to WAL, or SQLite ignores it. *)
+    match state with
+    | Database_current -> Eta.Effect.unit
+    | _ ->
+        with_local_pool ~mode:Sqlite.Read_write_create path (fun pool ->
+            sqlite_pragma pool "auto_vacuum = INCREMENTAL")
+  in
   let* pool =
     Q.Pool.create ~default_timeout:(Eta.Duration.ms 5000) ~max_size:4
-    (sqlite_config config.db_path)
+      (sqlite_config path)
     |> Eta.Effect.map_error widen_pool_error
   in
   let* () = init_schema pool |> Eta.Effect.map_error widen_pool_error in
-  Eta.Effect.pure { config; pool }
+  Eta.Effect.pure { config; pool; now_ms; last_prune = None }
 
 let close t = Q.Pool.shutdown t.pool |> Eta.Effect.map_error widen_pool_error
 
-let with_db config f =
-  Eta.Effect.with_resource ~acquire:(open_ config) ~release:close f
+let with_db ?now_ms ?report config f =
+  Eta.Effect.with_resource
+    ~acquire:(open_ ?now_ms ?report config)
+    ~release:close f
 
 let span_projection =
   Q.Projection.(
@@ -890,7 +1113,7 @@ let insert_metric_attrs runner owner_id attrs =
   in
   Eta.Effect.unit
 
-let refresh_trace_summary runner trace_id =
+let refresh_trace_summary ~now_ms runner trace_id =
   let open Eta.Syntax in
   let* spans = select_spans_for_trace_pool runner trace_id in
   match spans with
@@ -935,7 +1158,7 @@ let refresh_trace_summary runner trace_id =
                (float_of_int (ended_at_ms - started_at_ms))
           |> value Trace_summaries.span_count (List.length spans)
           |> value Trace_summaries.error_count error_count
-          |> value Trace_summaries.updated_at_ms (now_ms ())
+          |> value Trace_summaries.updated_at_ms now_ms
           |> on_conflict_do_nothing [ Trace_summaries.trace_id ]
           |> compile)
       in
@@ -949,7 +1172,7 @@ let refresh_trace_summary runner trace_id =
           |> set Trace_summaries.duration_ms (float_of_int (ended_at_ms - started_at_ms))
           |> set Trace_summaries.span_count (List.length spans)
           |> set Trace_summaries.error_count error_count
-          |> set Trace_summaries.updated_at_ms (now_ms ())
+          |> set Trace_summaries.updated_at_ms now_ms
           |> where Q.Expr.(eq Trace_summaries.trace_id trace_id)
           |> compile)
       in
@@ -957,162 +1180,290 @@ let refresh_trace_summary runner trace_id =
       let* _ = q_exec_pool runner update in
       Eta.Effect.unit
 
-let delete_attrs_by_owner_ids runner table owner_id_column ids =
-  if ids = [] then Eta.Effect.unit
-  else
-    let open Eta.Syntax in
-    let query =
+(* Retention deletes owner rows in bounded batches. Every batch is a
+   subquery delete limited to [prune_batch_size] rows, so no statement ever
+   binds a list that grows with the backlog (ret-xbij), and attribute rows are
+   removed through the same bounded subquery, so no deleted span, log, or
+   metric point leaves an orphaned index row (ret-hy7e). *)
+
+let prune_batch_size = 1000
+let size_pressure_batch_size = 100
+
+type prune_counts = {
+  traces : int;
+  spans : int;
+  logs : int;
+  metric_points : int;
+}
+
+let zero_prune_counts = { traces = 0; spans = 0; logs = 0; metric_points = 0 }
+
+let expired_log_ids_select ~batch cutoff =
+  Q.Select.(
+    from Logs.table Q.Projection.(one Logs.id)
+    |> where Q.Expr.(lt Logs.ingested_at_ms cutoff)
+    |> order_by Logs.ingested_at_ms
+    |> limit batch
+    |> compile)
+
+let oldest_log_ids_select ~batch =
+  Q.Select.(
+    from Logs.table Q.Projection.(one Logs.id)
+    |> order_by Logs.ingested_at_ms
+    |> limit batch
+    |> compile)
+
+let delete_log_batch runner ~batch cutoff =
+  let ids =
+    match cutoff with
+    | Some cutoff -> expired_log_ids_select ~batch cutoff
+    | None -> oldest_log_ids_select ~batch
+  in
+  let open Eta.Syntax in
+  let* _ =
+    q_exec_pool runner
       Q.Delete.(
-        from table |> where Q.Expr.(in_values owner_id_column ids) |> compile)
-    in
-    let* _ = q_exec_pool runner query in
-    Eta.Effect.unit
+        from Log_attributes.table
+        |> where Q.Expr.(in_select Log_attributes.owner_id ids)
+        |> compile)
+  in
+  q_exec_pool runner
+    Q.Delete.(from Logs.table |> where Q.Expr.(in_select Logs.id ids) |> compile)
 
-let delete_trace_ids runner trace_ids =
-  if trace_ids = [] then Eta.Effect.pure 0
-  else
+let expired_metric_ids_select ~batch cutoff =
+  Q.Select.(
+    from Metric_points.table Q.Projection.(one Metric_points.id)
+    |> where Q.Expr.(lt Metric_points.ingested_at_ms cutoff)
+    |> order_by Metric_points.ingested_at_ms
+    |> limit batch
+    |> compile)
+
+let oldest_metric_ids_select ~batch =
+  Q.Select.(
+    from Metric_points.table Q.Projection.(one Metric_points.id)
+    |> order_by Metric_points.ingested_at_ms
+    |> limit batch
+    |> compile)
+
+let delete_metric_batch runner ~batch cutoff =
+  let ids =
+    match cutoff with
+    | Some cutoff -> expired_metric_ids_select ~batch cutoff
+    | None -> oldest_metric_ids_select ~batch
+  in
+  let open Eta.Syntax in
+  let* _ =
+    q_exec_pool runner
+      Q.Delete.(
+        from Metric_attributes.table
+        |> where Q.Expr.(in_select Metric_attributes.owner_id ids)
+        |> compile)
+  in
+  q_exec_pool runner
+    Q.Delete.(
+      from Metric_points.table
+      |> where Q.Expr.(in_select Metric_points.id ids)
+      |> compile)
+
+(* Trace expiry uses the summary's last-update time, so a trace is deleted only
+   when none of its spans was received inside the trace TTL (ret-4hhb). *)
+
+let expired_trace_ids_select ~batch cutoff =
+  Q.Select.(
+    from Trace_summaries.table Q.Projection.(one Trace_summaries.trace_id)
+    |> where Q.Expr.(lt Trace_summaries.updated_at_ms cutoff)
+    |> order_by Trace_summaries.updated_at_ms
+    |> limit batch
+    |> compile)
+
+let oldest_trace_ids_select ~batch =
+  Q.Select.(
+    from Trace_summaries.table Q.Projection.(one Trace_summaries.trace_id)
+    |> order_by Trace_summaries.updated_at_ms
+    |> limit batch
+    |> compile)
+
+let trace_span_ids_select trace_ids =
+  Q.Select.(
+    from Spans.table Q.Projection.(one Spans.id)
+    |> where Q.Expr.(in_select Spans.trace_id trace_ids)
+    |> compile)
+
+let delete_trace_batch runner ~batch cutoff =
+  let trace_ids =
+    match cutoff with
+    | Some cutoff -> expired_trace_ids_select ~batch cutoff
+    | None -> oldest_trace_ids_select ~batch
+  in
+  let open Eta.Syntax in
+  let* _ =
+    q_exec_pool runner
+      Q.Delete.(
+        from Span_attributes.table
+        |> where
+             Q.Expr.(
+               in_select Span_attributes.owner_id
+                 (trace_span_ids_select trace_ids))
+        |> compile)
+  in
+  let* spans =
+    q_exec_pool runner
+      Q.Delete.(
+        from Spans.table
+        |> where Q.Expr.(in_select Spans.trace_id trace_ids)
+        |> compile)
+  in
+  let* traces =
+    q_exec_pool runner
+      Q.Delete.(
+        from Trace_summaries.table
+        |> where Q.Expr.(in_select Trace_summaries.trace_id trace_ids)
+        |> compile)
+  in
+  Eta.Effect.pure (traces, spans)
+
+let in_batch t delete =
+  Q.Pool.with_transaction t.pool delete |> Eta.Effect.map_error widen_pool_error
+
+let delete_log_batches t ?cutoff () =
+  let rec loop deleted =
     let open Eta.Syntax in
-    let* span_ids =
-      q_select_pool runner
-        Q.Select.(
-          from Spans.table Q.Projection.(one Spans.id)
-          |> where Q.Expr.(in_values Spans.trace_id trace_ids))
+    let* count =
+      in_batch t (fun tx -> delete_log_batch tx ~batch:prune_batch_size cutoff)
     in
-    let* () =
-      delete_attrs_by_owner_ids runner Span_attributes.table
-        Span_attributes.owner_id span_ids
-    in
-    let* _ =
-      q_exec_pool runner
-        Q.Delete.(
-          from Spans.table
-          |> where Q.Expr.(in_values Spans.trace_id trace_ids)
-          |> compile)
-    in
-    let* _ =
-      q_exec_pool runner
-        Q.Delete.(
-          from Trace_summaries.table
-          |> where Q.Expr.(in_values Trace_summaries.trace_id trace_ids)
-          |> compile)
-    in
-    Eta.Effect.pure (List.length trace_ids)
-
-let delete_old_traces runner cutoff =
-  let open Eta.Syntax in
-  let* old_trace_ids =
-    q_select_pool runner
-      Q.Select.(
-        from Trace_summaries.table Q.Projection.(one Trace_summaries.trace_id)
-        |> where Q.Expr.(lt Trace_summaries.ended_at_ms cutoff))
+    if count <= 0 then Eta.Effect.pure deleted else loop (deleted + count)
   in
-  let* _ = delete_trace_ids runner old_trace_ids in
-  Eta.Effect.unit
+  loop 0
 
-let delete_log_ids runner ids =
-  if ids = [] then Eta.Effect.pure 0
-  else
+let delete_metric_batches t ?cutoff () =
+  let rec loop deleted =
     let open Eta.Syntax in
-    let* () =
-      delete_attrs_by_owner_ids runner Log_attributes.table Log_attributes.owner_id ids
+    let* count =
+      in_batch t (fun tx ->
+          delete_metric_batch tx ~batch:prune_batch_size cutoff)
     in
-    let* _ =
-      q_exec_pool runner
-        Q.Delete.(
-          from Logs.table |> where Q.Expr.(in_values Logs.id ids) |> compile)
-    in
-    Eta.Effect.pure (List.length ids)
-
-let delete_old_logs runner cutoff =
-  let open Eta.Syntax in
-  let* ids =
-    q_select_pool runner
-      Q.Select.(
-        from Logs.table Q.Projection.(one Logs.id)
-        |> where Q.Expr.(lt Logs.timestamp_ms cutoff))
+    if count <= 0 then Eta.Effect.pure deleted else loop (deleted + count)
   in
-  let* _ = delete_log_ids runner ids in
-  Eta.Effect.unit
+  loop 0
 
-let delete_metric_ids runner ids =
-  if ids = [] then Eta.Effect.pure 0
-  else
+let delete_trace_batches t ?cutoff () =
+  let rec loop traces spans =
     let open Eta.Syntax in
-    let* () =
-      delete_attrs_by_owner_ids runner Metric_attributes.table
-        Metric_attributes.owner_id ids
+    let* batch =
+      in_batch t (fun tx -> delete_trace_batch tx ~batch:prune_batch_size cutoff)
     in
-    let* _ =
-      q_exec_pool runner
-        Q.Delete.(
-          from Metric_points.table
-          |> where Q.Expr.(in_values Metric_points.id ids)
-          |> compile)
-    in
-    Eta.Effect.pure (List.length ids)
+    let batch_traces, batch_spans = batch in
+    if batch_traces <= 0 then Eta.Effect.pure (traces, spans)
+    else loop (traces + batch_traces) (spans + batch_spans)
+  in
+  loop 0 0
 
-let delete_old_metrics runner cutoff =
+let prune_time_retention t now_ms =
+  let hour_ms = 60 * 60 * 1000 in
   let open Eta.Syntax in
-  let* ids =
-    q_select_pool runner
-      Q.Select.(
-        from Metric_points.table Q.Projection.(one Metric_points.id)
-        |> where Q.Expr.(lt Metric_points.timestamp_ms cutoff))
+  let* logs =
+    delete_log_batches t
+      ~cutoff:(now_ms - (t.config.Config.logs_retention_hours * hour_ms))
+      ()
   in
-  let* _ = delete_metric_ids runner ids in
-  Eta.Effect.unit
+  let* metric_points =
+    delete_metric_batches t
+      ~cutoff:(now_ms - (t.config.Config.metrics_retention_hours * hour_ms))
+      ()
+  in
+  let* traces, spans =
+    delete_trace_batches t
+      ~cutoff:(now_ms - (t.config.Config.traces_retention_hours * hour_ms))
+      ()
+  in
+  Eta.Effect.pure { traces; spans; logs; metric_points }
 
-let file_size path =
-  match Unix.stat path with
-  | stats -> stats.Unix.st_size
-  | exception Unix.Unix_error _ -> 0
-
-let delete_size_pressure_batch runner =
+(* The size cap acts on live data, not on the file size, and stops as soon as
+   live data is under the cap (ret-zjzs, ret-bizv). *)
+let prune_size_retention t =
+  let max_bytes = t.config.Config.max_db_size_mb * 1024 * 1024 in
+  let batch = size_pressure_batch_size in
   let open Eta.Syntax in
-  let* trace_ids =
-    q_select_pool runner
-      Q.Select.(
-        from Trace_summaries.table Q.Projection.(one Trace_summaries.trace_id)
-        |> order_by Trace_summaries.started_at_ms
-        |> limit 100)
-  in
-  let* log_ids =
-    q_select_pool runner
-      Q.Select.(
-        from Logs.table Q.Projection.(one Logs.id)
-        |> order_by Logs.timestamp_ms
-        |> limit 500)
-  in
-  let* metric_ids =
-    q_select_pool runner
-      Q.Select.(
-        from Metric_points.table Q.Projection.(one Metric_points.id)
-        |> order_by Metric_points.timestamp_ms
-        |> limit 500)
-  in
-  let* trace_count = delete_trace_ids runner trace_ids in
-  let* log_count = delete_log_ids runner log_ids in
-  let* metric_count = delete_metric_ids runner metric_ids in
-  Eta.Effect.pure (trace_count + log_count + metric_count)
-
-let run_size_retention runner config =
-  let max_bytes = config.Config.max_db_size_mb * 1024 * 1024 in
-  if file_size config.db_path <= max_bytes then Eta.Effect.unit
+  let* live = live_bytes t.pool in
+  if live <= max_bytes then Eta.Effect.pure None
   else
-    let open Eta.Syntax in
-    let* _ = delete_size_pressure_batch runner in
-    Eta.Effect.unit
+    let rec loop counts =
+      let* live = live_bytes t.pool in
+      if live <= max_bytes then Eta.Effect.pure counts
+      else
+        let* logs = in_batch t (fun tx -> delete_log_batch tx ~batch None) in
+        let counts = { counts with logs = counts.logs + logs } in
+        let* live = live_bytes t.pool in
+        if live <= max_bytes then Eta.Effect.pure counts
+        else
+          let* metric_points =
+            in_batch t (fun tx -> delete_metric_batch tx ~batch None)
+          in
+          let counts =
+            { counts with metric_points = counts.metric_points + metric_points }
+          in
+          let* live = live_bytes t.pool in
+          if live <= max_bytes then Eta.Effect.pure counts
+          else
+            let* traces, spans =
+              in_batch t (fun tx -> delete_trace_batch tx ~batch None)
+            in
+            let counts =
+              {
+                counts with
+                traces = counts.traces + traces;
+                spans = counts.spans + spans;
+              }
+            in
+            if logs + metric_points + traces = 0 then Eta.Effect.pure counts
+            else loop counts
+    in
+    let* counts = loop zero_prune_counts in
+    Eta.Effect.pure (Some counts)
 
-let run_retention runner config =
-  let cutoff = now_ms () - (config.Config.retention_hours * 60 * 60 * 1000) in
+let add_prune_counts left right =
+  {
+    traces = left.traces + right.traces;
+    spans = left.spans + right.spans;
+    logs = left.logs + right.logs;
+    metric_points = left.metric_points + right.metric_points;
+  }
+
+let prune ?now_ms t =
+  let now = match now_ms with Some value -> value | None -> t.now_ms () in
   let open Eta.Syntax in
-  let* () = delete_old_traces runner cutoff in
-  let* () = delete_old_logs runner cutoff in
-  let* () = delete_old_metrics runner cutoff in
-  run_size_retention runner config
+  let* time_counts = prune_time_retention t now in
+  let* size_counts = prune_size_retention t in
+  let counts =
+    match size_counts with
+    | None -> time_counts
+    | Some size_counts -> add_prune_counts time_counts size_counts
+  in
+  let deleted =
+    counts.traces + counts.spans + counts.logs + counts.metric_points
+  in
+  let* () =
+    if deleted > 0 then sqlite_pragma t.pool "incremental_vacuum"
+    else Eta.Effect.unit
+  in
+  let report =
+    {
+      Model.pruned_at_ms = now;
+      traces = counts.traces;
+      spans = counts.spans;
+      logs = counts.logs;
+      metric_points = counts.metric_points;
+      size_cap_triggered = Option.is_some size_counts;
+    }
+  in
+  t.last_prune <- Some report;
+  Eta.Effect.pure report
+
+let last_prune t = t.last_prune
 
 let ingest_traces t spans =
   let open Eta.Syntax in
+  let now_ms = t.now_ms () in
   let touched = Hashtbl.create 16 in
   let insert_span runner (span : Model.span) =
     let id = span_row_id span in
@@ -1135,7 +1486,7 @@ let ingest_traces t spans =
         |> value Spans.attributes_json (Model.attrs_json_string span.attributes)
         |> value Spans.resource_json (Model.attrs_json_string span.resource)
         |> value Spans.events_json (events_json span.events)
-        |> value Spans.ingested_at_ms (now_ms ())
+        |> value Spans.ingested_at_ms now_ms
         |> on_conflict_do_nothing [ Spans.id ]
         |> compile)
     in
@@ -1157,7 +1508,7 @@ let ingest_traces t spans =
         |> set Spans.attributes_json (Model.attrs_json_string span.attributes)
         |> set Spans.resource_json (Model.attrs_json_string span.resource)
         |> set Spans.events_json (events_json span.events)
-        |> set Spans.ingested_at_ms (now_ms ())
+        |> set Spans.ingested_at_ms now_ms
         |> where Q.Expr.(eq Spans.id id)
         |> compile)
     in
@@ -1171,14 +1522,14 @@ let ingest_traces t spans =
     Q.Pool.with_transaction t.pool (fun tx ->
         let* () = effect_iter spans (insert_span tx) in
         let trace_ids = List.of_seq (Hashtbl.to_seq_keys touched) in
-        let* () = effect_iter trace_ids (refresh_trace_summary tx) in
-        run_retention tx t.config)
+        effect_iter trace_ids (refresh_trace_summary ~now_ms tx))
     |> Eta.Effect.map_error widen_pool_error
   in
   Eta.Effect.pure (List.length spans)
 
 let ingest_logs t logs =
   let open Eta.Syntax in
+  let now_ms = t.now_ms () in
   let insert_log runner (log : Model.log_record) =
     let id = fresh_id "log" in
     let query =
@@ -1195,7 +1546,7 @@ let ingest_logs t logs =
         |> value Logs.body log.body
         |> value Logs.attributes_json (Model.attrs_json_string log.attributes)
         |> value Logs.resource_json (Model.attrs_json_string log.resource)
-        |> value Logs.ingested_at_ms (now_ms ())
+        |> value Logs.ingested_at_ms now_ms
         |> compile)
     in
     let* _ = q_exec_pool runner query in
@@ -1203,14 +1554,14 @@ let ingest_logs t logs =
   in
   let* () =
     Q.Pool.with_transaction t.pool (fun tx ->
-        let* () = effect_iter logs (insert_log tx) in
-        run_retention tx t.config)
+        effect_iter logs (insert_log tx))
     |> Eta.Effect.map_error widen_pool_error
   in
   Eta.Effect.pure (List.length logs)
 
 let ingest_metrics t points =
   let open Eta.Syntax in
+  let now_ms = t.now_ms () in
   let insert_point runner (point : Model.metric_point) =
     let id = fresh_id "metric" in
     let query =
@@ -1230,7 +1581,7 @@ let ingest_metrics t points =
              (Model.attrs_json_string point.attributes)
         |> value Metric_points.resource_json (Model.attrs_json_string point.resource)
         |> value Metric_points.raw_json (Yojson.Safe.to_string point.raw_json)
-        |> value Metric_points.ingested_at_ms (now_ms ())
+        |> value Metric_points.ingested_at_ms now_ms
         |> compile)
     in
     let* _ = q_exec_pool runner query in
@@ -1238,8 +1589,7 @@ let ingest_metrics t points =
   in
   let* () =
     Q.Pool.with_transaction t.pool (fun tx ->
-        let* () = effect_iter points (insert_point tx) in
-        run_retention tx t.config)
+        effect_iter points (insert_point tx))
     |> Eta.Effect.map_error widen_pool_error
   in
   Eta.Effect.pure (List.length points)
@@ -1764,6 +2114,7 @@ let stats t =
   let* metric_points = count_rows t.pool Metric_points.table in
   let* traces = count_rows t.pool Trace_summaries.table in
   let* services = list_services_runner t.pool in
+  let* live_bytes = live_bytes t.pool in
   Eta.Effect.pure
     {
       Model.spans;
@@ -1771,4 +2122,14 @@ let stats t =
       metric_points;
       traces;
       services = List.length services;
+      retention =
+        {
+          Model.traces_ttl_hours = t.config.Config.traces_retention_hours;
+          logs_ttl_hours = t.config.logs_retention_hours;
+          metrics_ttl_hours = t.config.metrics_retention_hours;
+          prune_interval_seconds = t.config.prune_interval_seconds;
+          max_db_size_mb = t.config.max_db_size_mb;
+          live_bytes;
+          last_prune = t.last_prune;
+        };
     }

@@ -20,16 +20,33 @@ Environment overrides:
 - `INN_HOST`
 - `INN_PORT`
 - `INN_BASE_URL`
-- `INN_RETENTION_HOURS`
-- `INN_MAX_DB_SIZE_MB`
+- `INN_TRACES_RETENTION_HOURS` (default 48)
+- `INN_LOGS_RETENTION_HOURS` (default 24)
+- `INN_METRICS_RETENTION_HOURS` (default 48)
+- `INN_PRUNE_INTERVAL_SECONDS` (default 300)
+- `INN_MAX_DB_SIZE_MB` (default 1024)
 
 The caller's current working directory is never used to select the database,
 daemon identity, lock path, or query target.
 
-Retention is applied after ingest. `INN_RETENTION_HOURS` removes old telemetry
-by signal timestamp. `INN_MAX_DB_SIZE_MB` is a size-pressure target: when the
-database file is over the target, Inn deletes oldest trace/log/metric batches so
-SQLite can reuse pages for future writes.
+Each signal has its own time-to-live, measured from the time Inn received the
+data, not from the client's timestamp. A background pruner runs once at server
+startup and then every `INN_PRUNE_INTERVAL_SECONDS`, independent of ingest, and
+deletes expired rows in bounded batches. Ingest never runs pruning, so ingest
+latency stays stable.
+
+`INN_MAX_DB_SIZE_MB` caps live data, not file size: when the pages in use exceed
+the cap, the pruner deletes the oldest telemetry, signal by signal, only until
+live data is under the cap, and then returns free pages to the filesystem with
+an incremental vacuum. The old single `INN_RETENTION_HOURS` setting is
+rejected at startup with a message naming the per-signal settings.
+
+Inn stores an integer schema version in the database. At startup, a database
+whose version differs from the one Inn expects, or a file that is not an Inn
+database at all, is never silently reused: a mismatched Inn database is deleted
+and recreated with a warning, and a foreign file is left untouched and reported
+as an error. Telemetry in a replaced database is lost, which is acceptable for
+a short-lived debugging cache.
 
 ## Build
 
@@ -178,6 +195,9 @@ AI call search/stats/detail, instructions, and OpenAPI.
 ## Eta SQL
 
 The store uses Eta SQL typed builders for schema, writes, reads, and
-transactions. Raw SQL is not used in the application storage path. Known Eta SQL
-API gaps found while building Inn are recorded in
-[.spec/ETA_SQL_DOGFOODING.md](.spec/ETA_SQL_DOGFOODING.md).
+transactions. Raw SQL is not used in the application storage path. The one
+exception is SQLite pragmas, which have no typed API: `page_count`,
+`freelist_count`, `page_size`, `auto_vacuum`, and `incremental_vacuum` all run
+through one store helper that uses `Eta_sql.Pool.Raw`, the escape hatch
+`Eta_sql.mli` documents for pragmas. Known Eta SQL API gaps found while building
+Inn are recorded in [.spec/ETA_SQL_DOGFOODING.md](.spec/ETA_SQL_DOGFOODING.md).

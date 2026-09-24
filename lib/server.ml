@@ -963,17 +963,81 @@ let check_bind_available config =
       Unix.bind fd (unix_addr config.host config.port);
       Unix.listen fd 1)
 
+let prune_interval config =
+  Eta.Duration.seconds config.Config.prune_interval_seconds
+
+let report_prune (report : Model.prune_report) =
+  let deleted =
+    report.traces + report.spans + report.logs + report.metric_points
+  in
+  if deleted > 0 then
+    prerr_endline
+      (Printf.sprintf
+         "inn pruner: deleted %d traces, %d spans, %d logs, and %d metric points%s"
+         report.traces report.spans report.logs report.metric_points
+         (if report.size_cap_triggered then " (size cap)" else ""))
+
+let report_prune_failure error =
+  prerr_endline (Format.asprintf "inn pruner: %a" Store.pp_error error)
+
+(* One prune pass at startup, then one pass per interval. The pruner never
+   fails the server: a failed pass is reported and retried on the next interval
+   (ret-sj15, ret-sbgj). *)
+let pruner_loop ~config store =
+  let open Eta.Syntax in
+  let rec loop () =
+    let* outcome =
+      Store.prune store
+      |> Eta.Effect.fold ~ok:(fun report -> Ok report) ~error:(fun error ->
+             Error error)
+    in
+    let* () =
+      match outcome with
+      | Ok report -> Eta.Effect.sync (fun () -> report_prune report)
+      | Error error -> Eta.Effect.sync (fun () -> report_prune_failure error)
+    in
+    let* () = Eta.Effect.sleep (prune_interval config) in
+    loop ()
+  in
+  loop ()
+
+let start_pruner ~sw ~clock ~config store =
+  Eio.Fiber.fork ~sw (fun () ->
+      let rt = Eta_eio.Runtime.create ~sw ~clock () in
+      match Eta.Runtime.run rt (pruner_loop ~config store) with
+      | Eta.Exit.Ok () -> ()
+      | Eta.Exit.Error cause ->
+          if not (Eta.Cause.is_interrupt_only cause) then
+            prerr_endline
+              (Format.asprintf "inn pruner stopped: %a"
+                 (Eta.Cause.pp Store.pp_error) cause))
+
+(* Shutdown runs on a cancelled switch, so the close effect is expected to be
+   interrupted; only a real failure is reported. *)
+let close_store ~sw ~clock store =
+  let rt = Eta_eio.Runtime.create ~sw ~clock () in
+  match Eta.Runtime.run rt (Store.close store) with
+  | Eta.Exit.Ok () -> ()
+  | Eta.Exit.Error cause ->
+      if not (Eta.Cause.is_interrupt_only cause) then
+        prerr_endline
+          (Format.asprintf "inn: closing the store failed: %a"
+             (Eta.Cause.pp Store.pp_error) cause)
+
 let run ~sw ~env config =
   check_bind_available config;
   let net = Eio.Stdenv.net env in
   let clock = Eio.Stdenv.clock env in
   let store = run_store_effect ~sw ~clock (Store.open_ config) in
   Fun.protect
-    ~finally:(fun () ->
-      run_store_effect ~sw ~clock (Store.close store))
+    ~finally:(fun () -> close_store ~sw ~clock store)
     (fun () ->
-      let addr = Serve.tcp_addr ~host:config.Config.host ~port:config.port in
-      prerr_endline
-        (Printf.sprintf "inn server listening on http://%s:%d" config.host
-           config.port);
-      Serve.h1 ~sw ~net ~clock ~addr (handler config store))
+      (* The pruner runs under its own switch, so it is cancelled and awaited
+         before the store it uses is closed. *)
+      Eio.Switch.run (fun pruner_sw ->
+          start_pruner ~sw:pruner_sw ~clock ~config store;
+          let addr = Serve.tcp_addr ~host:config.Config.host ~port:config.port in
+          prerr_endline
+            (Printf.sprintf "inn server listening on http://%s:%d" config.host
+               config.port);
+          Serve.h1 ~sw ~net ~clock ~addr (handler config store)))

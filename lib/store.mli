@@ -83,9 +83,38 @@ type error =
 
 val pp_error : Format.formatter -> error -> unit
 
-val open_ : Config.t -> (t, error) Eta.Effect.t
+val schema_version : int
+(** The schema version written to and expected from the database. Bump it with
+    every schema statement change; [schema_fingerprint] and the schema test
+    guard that. *)
+
+val schema_fingerprint : string
+(** Fingerprint of the compiled schema statements for [schema_version]. *)
+
+val open_ :
+  ?now_ms:(unit -> int) ->
+  ?report:(string -> unit) ->
+  Config.t ->
+  (t, error) Eta.Effect.t
+(** Open the store, recreating a database whose schema version differs from
+    [schema_version]. [now_ms] is the ingestion clock (the wall clock by
+    default) and [report] receives schema diagnostics (stderr by default). *)
+
 val close : t -> (unit, error) Eta.Effect.t
-val with_db : Config.t -> (t -> ('a, error) Eta.Effect.t) -> ('a, error) Eta.Effect.t
+
+val with_db :
+  ?now_ms:(unit -> int) ->
+  ?report:(string -> unit) ->
+  Config.t ->
+  (t -> ('a, error) Eta.Effect.t) ->
+  ('a, error) Eta.Effect.t
+
+val prune : ?now_ms:int -> t -> (Model.prune_report, error) Eta.Effect.t
+(** Delete expired telemetry and, when live data is over the size cap, the
+    oldest telemetry until it is under the cap. [now_ms] is the current
+    ingestion-clock time. *)
+
+val last_prune : t -> Model.prune_report option
 
 val ingest_traces : t -> Model.span list -> (int, error) Eta.Effect.t
 val ingest_logs : t -> Model.log_record list -> (int, error) Eta.Effect.t

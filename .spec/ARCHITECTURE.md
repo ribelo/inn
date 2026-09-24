@@ -32,8 +32,15 @@ Environment:
 - `INN_HOST`: overrides the host.
 - `INN_PORT`: overrides the port.
 - `INN_BASE_URL`: overrides CLI/query base URL.
-- `INN_RETENTION_HOURS`: controls time-based retention.
-- `INN_MAX_DB_SIZE_MB`: controls size-based retention.
+- `INN_TRACES_RETENTION_HOURS`: trace TTL in hours (default 48).
+- `INN_LOGS_RETENTION_HOURS`: log TTL in hours (default 24).
+- `INN_METRICS_RETENTION_HOURS`: metric point TTL in hours (default 48).
+- `INN_PRUNE_INTERVAL_SECONDS`: seconds between background prune passes
+  (default 300).
+- `INN_MAX_DB_SIZE_MB`: caps live data, not file size.
+
+`INN_RETENTION_HOURS` is retired and makes configuration resolution fail with a
+message that names the per-signal settings.
 
 Managed daemon runtime files live in the state directory:
 
@@ -142,18 +149,33 @@ plus attribute side tables for indexed filtering:
 - `metric_attributes`
 - `inn_meta`
 
-The server applies migrations and retention. CLI query commands do not run
-migrations as a side effect.
+The server opens the store, applies the schema, and runs retention. CLI query
+commands do not open the database or run schema statements as a side effect.
 
-The store is implemented through Eta SQL's typed schema/query builders. Raw SQL
-is reserved for future cases where a missing Eta SQL capability has been
-documented first.
+The store is implemented through Eta SQL's typed schema/query builders. The one
+documented exception is SQLite pragmas, which have no typed API: `page_count`,
+`freelist_count`, `page_size`, `auto_vacuum`, and `incremental_vacuum` run
+through one store helper built on `Eta_sql.Pool.Raw`. No other raw SQL is used.
 
-Retention has two triggers:
+The store owns one integer schema version, stored in `inn_meta`. Opening the
+store reads the file before any schema statement runs: a missing or empty
+database is created, a database with the expected version is opened as-is, a
+database with a different version is deleted (including `-wal` and `-shm`) and
+recreated after one warning that names both versions and the path, and a file
+that has tables but no Inn metadata table is refused with an error instead of
+being deleted. Every schema change bumps the version; a test compares a
+fingerprint of the compiled schema statements with a recorded value so a
+missing bump fails the suite.
 
-- time retention deletes rows older than `INN_RETENTION_HOURS`;
-- size-pressure retention deletes oldest trace/log/metric batches when the
-  database file is over `INN_MAX_DB_SIZE_MB`, letting SQLite reuse freed pages.
+Retention is per signal, measured from ingestion time, and runs in a background
+pruner fiber that starts with the server: one pass at startup, then one pass per
+`INN_PRUNE_INTERVAL_SECONDS`. Ingest never prunes. Each pass deletes expired
+rows in bounded batches (whole traces, keyed on the trace summary's last-update
+time), and then, while live bytes — `(page count - freelist count) * page
+size` — are over `INN_MAX_DB_SIZE_MB`, the oldest telemetry signal by signal
+until live data is under the cap. A pass that deleted rows ends with an
+incremental vacuum. New databases are created with `auto_vacuum=INCREMENTAL`.
+The store exposes the last prune report through the stats retention section.
 
 ## Error Policy
 

@@ -69,12 +69,32 @@ type trace = {
   logs : log_record list;
 }
 
+type prune_report = {
+  pruned_at_ms : int;
+  traces : int;
+  spans : int;
+  logs : int;
+  metric_points : int;
+  size_cap_triggered : bool;
+}
+
+type retention_stats = {
+  traces_ttl_hours : int;
+  logs_ttl_hours : int;
+  metrics_ttl_hours : int;
+  prune_interval_seconds : int;
+  max_db_size_mb : int;
+  live_bytes : int;
+  last_prune : prune_report option;
+}
+
 type stats = {
   spans : int;
   logs : int;
   metric_points : int;
   traces : int;
   services : int;
+  retention : retention_stats;
 }
 
 type stat_item = {
@@ -182,6 +202,32 @@ let trace_to_json (trace : trace) =
       ("logs", `List (List.map log_to_json trace.logs));
     ]
 
+let prune_report_to_json (report : prune_report) =
+  `Assoc
+    [
+      ("prunedAtMs", `Int report.pruned_at_ms);
+      ("traces", `Int report.traces);
+      ("spans", `Int report.spans);
+      ("logs", `Int report.logs);
+      ("metricPoints", `Int report.metric_points);
+      ("sizeCapTriggered", `Bool report.size_cap_triggered);
+    ]
+
+let retention_stats_to_json (retention : retention_stats) =
+  `Assoc
+    [
+      ("tracesTtlHours", `Int retention.traces_ttl_hours);
+      ("logsTtlHours", `Int retention.logs_ttl_hours);
+      ("metricsTtlHours", `Int retention.metrics_ttl_hours);
+      ("pruneIntervalSeconds", `Int retention.prune_interval_seconds);
+      ("maxDbSizeMb", `Int retention.max_db_size_mb);
+      ("liveBytes", `Int retention.live_bytes);
+      ( "lastPrune",
+        match retention.last_prune with
+        | None -> `Null
+        | Some report -> prune_report_to_json report );
+    ]
+
 let stats_to_json (stats : stats) =
   `Assoc
     [
@@ -190,6 +236,7 @@ let stats_to_json (stats : stats) =
       ("metricPoints", `Int stats.metric_points);
       ("traces", `Int stats.traces);
       ("services", `Int stats.services);
+      ("retention", retention_stats_to_json stats.retention);
     ]
 
 let stat_item_to_json (item : stat_item) =

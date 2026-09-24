@@ -9,26 +9,31 @@ let getenv key =
   | Some value when String.trim value <> "" -> Some value
   | _ -> None
 
-let env_with_overrides ~state_dir ~db_path ~host ~port ~base_url ~retention_hours
-    ~max_db_size_mb key =
-  match (key, state_dir, db_path, host, port, base_url, retention_hours, max_db_size_mb) with
-  | "INN_STATE_DIR", Some value, _, _, _, _, _, _ -> Some value
-  | "INN_DB_PATH", _, Some value, _, _, _, _, _ -> Some value
-  | "INN_HOST", _, _, Some value, _, _, _, _ -> Some value
-  | "INN_PORT", _, _, _, Some value, _, _, _ -> Some (string_of_int value)
-  | "INN_BASE_URL", _, _, _, _, Some value, _, _ -> Some value
-  | "INN_RETENTION_HOURS", _, _, _, _, _, Some value, _ ->
-      Some (string_of_int value)
-  | "INN_MAX_DB_SIZE_MB", _, _, _, _, _, _, Some value ->
-      Some (string_of_int value)
+let env_with_overrides overrides key =
+  match List.assoc_opt key overrides with
+  | Some (Some value) -> Some value
   | _ -> getenv key
 
-let config state_dir db_path host port base_url retention_hours max_db_size_mb =
-  let env =
-    env_with_overrides ~state_dir ~db_path ~host ~port ~base_url
-      ~retention_hours ~max_db_size_mb
+let config state_dir db_path host port base_url retention_hours
+    traces_retention_hours logs_retention_hours metrics_retention_hours
+    prune_interval_seconds max_db_size_mb =
+  let int_override = Option.map string_of_int in
+  let overrides =
+    [
+      ("INN_STATE_DIR", state_dir);
+      ("INN_DB_PATH", db_path);
+      ("INN_HOST", host);
+      ("INN_PORT", int_override port);
+      ("INN_BASE_URL", base_url);
+      ("INN_RETENTION_HOURS", int_override retention_hours);
+      ("INN_TRACES_RETENTION_HOURS", int_override traces_retention_hours);
+      ("INN_LOGS_RETENTION_HOURS", int_override logs_retention_hours);
+      ("INN_METRICS_RETENTION_HOURS", int_override metrics_retention_hours);
+      ("INN_PRUNE_INTERVAL_SECONDS", int_override prune_interval_seconds);
+      ("INN_MAX_DB_SIZE_MB", int_override max_db_size_mb);
+    ]
   in
-  match Inn.Config.resolve ~env () with
+  match Inn.Config.resolve ~env:(env_with_overrides overrides) () with
   | Ok config -> config
   | Error message -> failwith message
 
@@ -68,19 +73,48 @@ let retention_hours_t =
     value
     & opt (some int) None
     & info [ "retention-hours" ] ~docv:"HOURS"
-        ~doc:"Time-based telemetry retention window.")
+        ~doc:"Deprecated: rejected at startup; use the per-signal retention flags.")
+
+let traces_retention_hours_t =
+  Arg.(
+    value
+    & opt (some int) None
+    & info [ "traces-retention-hours" ] ~docv:"HOURS"
+        ~doc:"Trace time-to-live in hours (default 48).")
+
+let logs_retention_hours_t =
+  Arg.(
+    value
+    & opt (some int) None
+    & info [ "logs-retention-hours" ] ~docv:"HOURS"
+        ~doc:"Log time-to-live in hours (default 24).")
+
+let metrics_retention_hours_t =
+  Arg.(
+    value
+    & opt (some int) None
+    & info [ "metrics-retention-hours" ] ~docv:"HOURS"
+        ~doc:"Metric point time-to-live in hours (default 48).")
+
+let prune_interval_seconds_t =
+  Arg.(
+    value
+    & opt (some int) None
+    & info [ "prune-interval-seconds" ] ~docv:"SECONDS"
+        ~doc:"Seconds between background prune passes (default 300).")
 
 let max_db_size_mb_t =
   Arg.(
     value
     & opt (some int) None
     & info [ "max-db-size-mb" ] ~docv:"MB"
-        ~doc:"Target maximum database size.")
+        ~doc:"Target maximum live database size.")
 
 let config_t =
   Term.(
     const config $ state_dir_t $ db_path_t $ host_t $ port_t $ base_url_t
-    $ retention_hours_t $ max_db_size_mb_t)
+    $ retention_hours_t $ traces_retention_hours_t $ logs_retention_hours_t
+    $ metrics_retention_hours_t $ prune_interval_seconds_t $ max_db_size_mb_t)
 
 let trim_trailing_slash url =
   let rec loop len =

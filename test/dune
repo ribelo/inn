@@ -1,7 +1,7 @@
 (test
  (name test_inn)
  (package inn)
- (libraries inn alcotest eta eta_eio eta_http eio_main unix))
+ (libraries inn alcotest eta eta_eio eta_http eta_http_eio eio_main unix))
 
 (test
  (name test_mcp)
