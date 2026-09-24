@@ -57,6 +57,8 @@ status codes OTLP defines for retryable and non-retryable failures.
 15. As an app developer, I want a non-JSON content type such as `application/x-protobuf` rejected with 415 and a message saying only OTLP JSON is supported, and an oversized body rejected with 413, so that misconfiguration is obvious ^otlp-ohmj
 16. As an app developer, I want a malformed JSON body rejected with 400 and an OTLP-style error body, so that the exporter reports a clear, non-retryable error ^otlp-qso2
 
+17. As a developer, I want a log with no top-level trace or span id, but with `traceId`/`trace_id` or `spanId`/`span_id` log attributes, correlated through those attributes, so that loggers that only put ids in attributes still link to traces (motel does this) ^otlp-beaj
+
 ## Implementation Decisions
 
 - **Model changes.** Span start and end become integer Unix nanoseconds, with
@@ -85,6 +87,8 @@ status codes OTLP defines for retryable and non-retryable failures.
 - Protobuf, gzip, and gRPC stay out of scope.
 
 ## Testing Decisions
+
+- Attribute-based log correlation fallback, with a valid hex id taken from the attributes (otlp-beaj).
 
 - Decoder unit tests use fixture payloads shaped like those from Effect's
   `OtlpSerialization.layerJson` and from `eta_otel`. Capture one real payload

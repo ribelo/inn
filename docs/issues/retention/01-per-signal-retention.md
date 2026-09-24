@@ -84,13 +84,15 @@ active retention settings and the last prune result.
   bound parameters are capped at the batch size. A subquery-based delete is
   preferred where Eta SQL can express it.
 - **Size cap.** Live bytes are computed as (page count minus freelist count)
-  times page size. If Eta SQL cannot read those pragmas through its typed or
-  driver API, that is an Eta gap: stop and report it, so an Eta ticket can be
-  opened. Do not fall back to raw SQL in the store path. Under size pressure,
+  times page size. Eta SQL has no typed pragma API. Its sanctioned escape hatch
+  for pragmas is Pool.Raw. Read and run pragmas (page_count, freelist_count,
+  page_size, auto_vacuum, incremental_vacuum) through one small, clearly named
+  store helper that uses it. Use no raw SQL anywhere else. Under size pressure,
   delete the oldest data first by ingestion time, across all signals, in
-  batches, until live bytes are under the cap. Returning free pages to the
-  filesystem (incremental vacuum) is desirable, but only if Eta SQL supports
-  it. Otherwise record it in the dogfooding notes.
+  batches, until live bytes are under the cap. Create new databases with
+  auto_vacuum=INCREMENTAL. End each prune pass that deleted rows with an
+  incremental vacuum, so the file shrinks. Record the missing typed pragma API
+  in the dogfooding notes.
 - **Indexes.** Add ingestion-time indexes for logs, metric points, and trace
   summaries, so pruning is an index range scan. The schema versioning spec
   covers the schema change.
