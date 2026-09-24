@@ -3,6 +3,7 @@
 (generate_opam_files true)
 
 (name inn)
+(version 0.1.0)
 
 (package
  (name inn)

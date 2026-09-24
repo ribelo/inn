@@ -2,3 +2,11 @@
  (name test_inn)
  (package inn)
  (libraries inn alcotest eta eta_eio eta_http eio_main unix))
+
+(test
+ (name test_mcp)
+ (package inn)
+ (libraries inn alcotest yojson))
+
+(cram
+ (deps ../bin/main.exe check_mcp.py))
