@@ -10,7 +10,13 @@ Inn uses Eta SQL's typed builders for application storage:
 Raw SQL is not part of the application store path. SQLite pragmas are supplied
 through `Eta_sql.Sqlite.config`.
 
-## API Gaps Found
+## Resolved Gaps
+
+None of the three workarounds below is resolved by local Eta master at
+`d38804d0` (checked against its SQL public interfaces). Inn therefore keeps
+its typed builders and existing store behavior unchanged.
+
+## Remaining Gaps
 
 ### Heterogeneous Composite Indexes
 

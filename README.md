@@ -33,17 +33,29 @@ SQLite can reuse pages for future writes.
 
 ## Build
 
+With the existing shared OxCaml opam switch (`~/.cache/opam/5.4.0+ox`) and a
+local Eta checkout next to Inn, run the local-source build and full test suite:
+
 ```sh
-nix develop .#oxcaml -c dune build
-nix develop .#oxcaml -c dune runtest
+./scripts/test-local-eta.sh
 ```
 
-Run `inn-oxcaml-init` once inside the Nix shell to create the OxCaml opam
-switch. It pins Eta packages from `git+https://github.com/ribelo/eta.git#master`
-by default. For local Eta dogfooding:
+Set `ETA_PATH=/path/to/Eta` before the command if the checkout is elsewhere.
+The script enters Eta's Nix shell for native SQLite/OpenSSL dependencies, uses
+only the OCaml packages already installed in the shared switch, and builds a
+source-file-symlink mirror of Eta under ignored `_dev/`. It installs the
+needed Eta libraries under `_dev/eta-install`, then builds and tests Inn
+with that local installation first in `OCAMLPATH`. It neither pins nor
+installs packages into the shared switch and does not edit Eta. Missing OCaml
+dependencies must be addressed outside this workflow, not installed into the
+shared switch.
+
+To check Inn against the previously installed Eta in the shared switch instead:
 
 ```sh
-ETA_OPAM_PIN=git+file:///home/ribelo/projects/ribelo/ocaml/Eta#master inn-oxcaml-init
+export OPAMROOT="$HOME/.cache/opam"
+eval "$(opam env --switch 5.4.0+ox --set-switch)"
+dune build && dune runtest
 ```
 
 ## Run
