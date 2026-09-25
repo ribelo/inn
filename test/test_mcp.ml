@@ -117,8 +117,12 @@ let test_window_arguments_in_schemas () =
   check "inn_trace_stats" [ "lookback"; "minDurationMs"; "attributeContains" ];
   check "inn_log_stats" [ "lookback"; "minSeverity"; "attributeContains" ];
   check "inn_facets" [ "lookback" ];
-  check "inn_search_ai_calls" [ "lookback"; "cursor"; "minDurationMs" ];
-  check "inn_ai_stats" [ "lookback"; "minDurationMs" ];
+  (* aic-5j9w: the AI surfaces carry the same fields and filters. *)
+  check "inn_search_ai_calls"
+    [ "lookback"; "cursor"; "minDurationMs"; "finishReason"; "operation"; "text";
+      "model"; "provider" ];
+  check "inn_ai_stats"
+    [ "lookback"; "minDurationMs"; "finishReason"; "operation"; "groupBy"; "agg" ];
   check "inn_metrics" [ "lookback"; "cursor" ];
   check "inn_stats" [ "lookback" ]
 
@@ -165,6 +169,11 @@ let test_window_arguments_reach_http () =
     (`Assoc [ ("text", `String "100%_conversation");
       ("minDurationMs", `Float 5.);
       ("attributeContains", `Assoc [ ("tag", `String "50%") ]) ]);
+  call "inn_ai_stats"
+    (`Assoc [ ("groupBy", `String "finishReason");
+      ("agg", `String "total_tokens");
+      ("finishReason", `String "tool_calls");
+      ("operation", `String "chat") ]);
   let paths = List.rev !paths in
   let check_contains index fragment =
     match List.nth_opt paths index with
@@ -192,7 +201,12 @@ let test_window_arguments_reach_http () =
   check_contains 4 "/traces/search";
   check_contains 4 "text=100%25_conversation";
   check_contains 4 "minDurationMs=5";
-  check_contains 4 "attrContains.tag=50%25"
+  check_contains 4 "attrContains.tag=50%25";
+  check_contains 5 "/ai/stats";
+  check_contains 5 "groupBy=finishReason";
+  check_contains 5 "agg=total_tokens";
+  check_contains 5 "finishReason=tool_calls";
+  check_contains 5 "operation=chat"
 
 let test_down_server () =
   (* mcp-j7lb: connection errors stay tool results, not protocol errors. *)

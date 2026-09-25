@@ -73,4 +73,32 @@ for command in ["health", "stats", "facets"]:
     for flag in filter_commands:
         assert flag not in help_text(command), (command, flag)
 
+"""tree-d24c: inn trace renders a tree by default and JSON with --json."""
+trace_help = help_text("trace")
+assert "--json" in trace_help, trace_help
+for command in ["span", "ai-call", "traces"]:
+    assert "--json" not in help_text(command), command
+
+"""aic-5j9w: the AI insight filters reach the CLI that can use them."""
+ai_call_flags = [
+    "--model",
+    "--provider",
+    "--operation",
+    "--finish-reason",
+    "--text",
+    "--min-duration-ms",
+    "--session-id",
+    "--function-id",
+    "--lookback",
+    "--cursor",
+]
+for flag in ai_call_flags:
+    assert flag in help_text("ai-calls"), (flag, help_text("ai-calls"))
+for flag in ["--finish-reason", "--operation", "--text", "--min-duration-ms",
+             "--lookback", "GROUP_BY", "AGG"]:
+    assert flag in help_text("ai-stats"), (flag, help_text("ai-stats"))
+for command in ["traces", "logs", "facets", "stats"]:
+    assert "--finish-reason" not in help_text(command), command
+
 print("win-y63l and srch-fe5d: windows and search flags match CLI commands")
+print("tree-d24c and aic-5j9w: tree rendering and AI flags match CLI commands")

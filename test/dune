@@ -1,6 +1,7 @@
 (test
  (name test_inn)
  (package inn)
+ (deps ../README.md)
  (libraries inn alcotest eta eta_eio eta_http eta_http_eio eio_main unix)
  ; The suite starts many short-lived Eio runtimes. Each io_uring ring locks
  ; memory against a per-user cap that this sandbox sets to 8 MiB, so under
@@ -15,4 +16,4 @@
  (libraries inn alcotest yojson))
 
 (cram
- (deps ../bin/main.exe check_mcp.py check_cli.py))
+ (deps ../bin/main.exe check_mcp.py check_cli.py check_trace_cli.py))

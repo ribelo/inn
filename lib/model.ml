@@ -69,12 +69,81 @@ type trace_summary = {
   duration_ms : float;
   span_count : int;
   error_count : int;
+  is_running : bool;
+  warning_count : int;
+}
+
+type span_node = {
+  span : span;
+  depth : int;
+  parent_operation_name : string option;
+  root_operation_name : string;
+  is_running : bool;
+  warnings : string list;
 }
 
 type trace = {
   summary : trace_summary;
-  spans : span list;
+  spans : span_node list;
   logs : log_record list;
+  warnings : string list;
+}
+
+type token_usage = {
+  input_tokens : int option;
+  output_tokens : int option;
+  total_tokens : int option;
+  cached_input_tokens : int option;
+  reasoning_tokens : int option;
+}
+
+type ai_call = {
+  span_id : string;
+  trace_id : string;
+  service_name : string;
+  operation : string;
+  provider : string option;
+  model : string option;
+  status : string;
+  start_time_ns : int;
+  duration_ms : float option;
+  is_running : bool;
+  finish_reason : string option;
+  session_id : string option;
+  function_id : string option;
+  user_id : string option;
+  tool_call_count : int;
+  usage : token_usage;
+  prompt_preview : string option;
+  response_preview : string option;
+}
+
+type ai_tool_call = {
+  tool_name : string;
+  tool_span_id : string option;
+  tool_status : string;
+  tool_duration_ms : float option;
+  tool_arguments : string option;
+  tool_result : string option;
+}
+
+type ai_prompt = { messages : Yojson.Safe.t list; raw : string option }
+
+type ai_timing = {
+  time_to_first_chunk_ms : float option;
+  time_to_finish_ms : float option;
+  output_tokens_per_second : float option;
+}
+
+type ai_call_detail = {
+  call : ai_call;
+  prompt : ai_prompt;
+  response_text : string option;
+  response_raw : string option;
+  tool_calls : ai_tool_call list;
+  tools : Yojson.Safe.t list;
+  provider_metadata : Yojson.Safe.t option;
+  timing : ai_timing;
 }
 
 type prune_report = {
@@ -140,58 +209,10 @@ let attr_string_value = function
   | `Null -> ""
   | value -> Yojson.Safe.to_string value
 
-let is_ai_span (span : span) =
-  let attrs = span.resource @ span.attributes in
-  List.exists
-    (fun (key, _) ->
-      String.starts_with ~prefix:"ai." key
-      || String.starts_with ~prefix:"gen_ai." key)
-    attrs
-  ||
-  let operation = String.lowercase_ascii span.operation_name in
-  List.exists
-    (fun needle ->
-      let needle = String.lowercase_ascii needle in
-      let length = String.length needle in
-      let rec search index =
-        if index + length > String.length operation then false
-        else if String.sub operation index length = needle then true
-        else search (index + 1)
-      in
-      search 0)
-    [ "generateText"; "streamText"; "generateObject"; "streamObject" ]
-
-let ai_value keys (span : span) =
-  let attrs = span.resource @ span.attributes in
-  List.find_map (fun key ->
-    Option.map attr_string_value (List.assoc_opt key attrs)) keys
-
-let ai_model span = ai_value
-  ["ai.model.id"; "ai.model"; "gen_ai.request.model"; "gen_ai.response.model"] span
-let ai_provider span = ai_value
-  ["ai.model.provider"; "ai.provider"; "gen_ai.system";
-   "gen_ai.provider.name"] span
-let ai_session_id span = ai_value
-  ["ai.telemetry.metadata.sessionId"; "ai.session.id"; "session.id"] span
-let ai_function_id span = ai_value
-  ["ai.telemetry.functionId"; "ai.function.id"; "function.id"] span
-let ai_input_tokens span =
-  Option.bind (ai_value ["ai.usage.inputTokens"; "ai.usage.promptTokens";
-    "gen_ai.usage.input_tokens"; "gen_ai.usage.prompt_tokens"] span) int_of_string_opt
-let ai_output_tokens span =
-  Option.bind (ai_value ["ai.usage.outputTokens"; "ai.usage.completionTokens";
-    "gen_ai.usage.output_tokens"; "gen_ai.usage.completion_tokens"] span) int_of_string_opt
-let ai_search_text (span : span) =
-  let content_key key = List.exists (fun prefix ->
-    String.starts_with ~prefix key)
-    [ "ai.prompt"; "ai.response"; "ai.tool";
-      "gen_ai.input"; "gen_ai.output"; "gen_ai.prompt";
-      "gen_ai.tool"; "gen_ai.response.content" ] in
-  let attributes attrs = attrs |> List.filter_map (fun (key, value) ->
-    if content_key key then Some (attr_string_value value) else None) in
-  let events = span.events |> List.concat_map (fun (event : span_event) ->
-    attributes event.attributes) in
-  String.concat "\n" (attributes (span.resource @ span.attributes) @ events)
+(* A span with no end time, or an end before its start, has not finished
+   (tree-78hm). *)
+let span_is_running (span : span) =
+  span.end_time_ns = 0 || span.end_time_ns < span.start_time_ns
 
 let span_kind_to_string = function
   | Internal -> "internal" | Server -> "server" | Client -> "client"
@@ -238,7 +259,9 @@ let span_to_json (span : span) =
        ("startTimeUnixNano", `String (string_of_int span.start_time_ns));
        ("endTimeMs", `Float (milliseconds span.end_time_ns));
        ("endTimeUnixNano", `String (string_of_int span.end_time_ns));
-       ("durationMs", `Float span.duration_ms);
+       ( "durationMs",
+         if span_is_running span then `Null else `Float span.duration_ms );
+       ("isRunning", `Bool (span_is_running span));
        ("status", `String (span_status_to_string span.status));
        ("links", `List (List.map (fun (link : span_link) -> `Assoc [ ("traceId", `String link.trace_id); ("spanId", `String link.span_id); ("attributes", attrs_to_json link.attributes) ]) span.links));
        ("attributes", attrs_to_json span.attributes);
@@ -249,6 +272,23 @@ let span_to_json (span : span) =
     @ option_string "scopeName" span.scope_name
     @ (match span.kind with None -> [ ("kind", `Null) ] | Some kind -> [ ("kind", `String (span_kind_to_string kind)) ])
     @ option_string "statusMessage" span.status_message)
+
+let span_node_to_json (node : span_node) =
+  match span_to_json node.span with
+  | `Assoc fields ->
+      `Assoc
+        (fields
+        @ [
+            ("depth", `Int node.depth);
+            ( "parentOperationName",
+              match node.parent_operation_name with
+              | None -> `Null
+              | Some name -> `String name );
+            ("rootOperationName", `String node.root_operation_name);
+            ( "warnings",
+              `List (List.map (fun warning -> `String warning) node.warnings) );
+          ])
+  | json -> json
 
 let log_to_json (log : log_record) =
   `Assoc
@@ -299,14 +339,106 @@ let trace_summary_to_json (summary : trace_summary) =
       ("durationMs", `Float summary.duration_ms);
       ("spanCount", `Int summary.span_count);
       ("errorCount", `Int summary.error_count);
+      ("isRunning", `Bool summary.is_running);
+      ("warningCount", `Int summary.warning_count);
     ]
 
 let trace_to_json (trace : trace) =
   `Assoc
     [
       ("summary", trace_summary_to_json trace.summary);
-      ("spans", `List (List.map span_to_json trace.spans));
+      ("spans", `List (List.map span_node_to_json trace.spans));
       ("logs", `List (List.map log_to_json trace.logs));
+      ( "warnings",
+        `List (List.map (fun warning -> `String warning) trace.warnings) );
+    ]
+
+let optional_string name = function
+  | None -> (name, `Null)
+  | Some value -> (name, `String value)
+
+let optional_int name = function
+  | None -> (name, `Null)
+  | Some value -> (name, `Int value)
+
+let optional_float name = function
+  | None -> (name, `Null)
+  | Some value -> (name, `Float value)
+
+let token_usage_to_json (usage : token_usage) =
+  `Assoc
+    [
+      optional_int "inputTokens" usage.input_tokens;
+      optional_int "outputTokens" usage.output_tokens;
+      optional_int "totalTokens" usage.total_tokens;
+      optional_int "cachedInputTokens" usage.cached_input_tokens;
+      optional_int "reasoningTokens" usage.reasoning_tokens;
+    ]
+
+let ai_call_to_json (call : ai_call) =
+  `Assoc
+    [
+      ("spanId", `String call.span_id);
+      ("traceId", `String call.trace_id);
+      ("serviceName", `String call.service_name);
+      ("operation", `String call.operation);
+      optional_string "provider" call.provider;
+      optional_string "model" call.model;
+      ("status", `String call.status);
+      ("startTimeMs", `Float (milliseconds call.start_time_ns));
+      ("startTimeUnixNano", `String (string_of_int call.start_time_ns));
+      optional_float "durationMs" call.duration_ms;
+      ("isRunning", `Bool call.is_running);
+      optional_string "finishReason" call.finish_reason;
+      optional_string "sessionId" call.session_id;
+      optional_string "functionId" call.function_id;
+      optional_string "userId" call.user_id;
+      ("toolCallCount", `Int call.tool_call_count);
+      ("usage", token_usage_to_json call.usage);
+      optional_string "promptPreview" call.prompt_preview;
+      optional_string "responsePreview" call.response_preview;
+    ]
+
+let ai_tool_call_to_json (call : ai_tool_call) =
+  `Assoc
+    [
+      ("name", `String call.tool_name);
+      optional_string "spanId" call.tool_span_id;
+      ("status", `String call.tool_status);
+      optional_float "durationMs" call.tool_duration_ms;
+      optional_string "arguments" call.tool_arguments;
+      optional_string "result" call.tool_result;
+    ]
+
+let ai_timing_to_json (timing : ai_timing) =
+  `Assoc
+    [
+      optional_float "timeToFirstChunkMs" timing.time_to_first_chunk_ms;
+      optional_float "timeToFinishMs" timing.time_to_finish_ms;
+      optional_float "outputTokensPerSecond" timing.output_tokens_per_second;
+    ]
+
+let ai_call_detail_to_json (detail : ai_call_detail) =
+  `Assoc
+    [
+      ("call", ai_call_to_json detail.call);
+      ( "prompt",
+        `Assoc
+          [
+            ("messages", `List detail.prompt.messages);
+            optional_string "raw" detail.prompt.raw;
+          ] );
+      ( "response",
+        `Assoc
+          [
+            optional_string "text" detail.response_text;
+            optional_string "raw" detail.response_raw;
+          ] );
+      ("toolCalls", `List (List.map ai_tool_call_to_json detail.tool_calls));
+      ("tools", `List detail.tools);
+      ( "providerMetadata",
+        match detail.provider_metadata with None -> `Null | Some json -> json );
+      ("timing", ai_timing_to_json detail.timing);
     ]
 
 let prune_report_to_json (report : prune_report) =

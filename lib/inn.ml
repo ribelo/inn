@@ -1,3 +1,4 @@
+module Ai = Ai
 module Config = Config
 module List_policy = List_policy
 module Mcp = Mcp
@@ -6,3 +7,4 @@ module Version = Version
 module Otlp = Otlp
 module Server = Server
 module Store = Store
+module Trace_tree = Trace_tree

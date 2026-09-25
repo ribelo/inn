@@ -516,7 +516,68 @@ let traces service lookback cursor limit config =
         ])
     config
 
-let trace trace_id config = get ("/traces/" ^ percent_encode trace_id) config
+(* CLI tree rendering: one line per span, indented by depth, with the
+   operation, the service, the duration, and an error mark (tree-d24c). *)
+let json_field name = function
+  | `Assoc fields -> (
+      match List.assoc_opt name fields with Some value -> value | None -> `Null)
+  | _ -> `Null
+
+let json_text = function
+  | `String value -> value
+  | `Null -> ""
+  | `Int value -> string_of_int value
+  | `Float value -> string_of_float value
+  | value -> Yojson.Safe.to_string value
+
+let json_number = function
+  | `Float value -> value
+  | `Int value -> float_of_int value
+  | _ -> 0.
+
+let json_flag = function `Bool value -> value | _ -> false
+let json_items = function `List items -> items | _ -> []
+
+let span_line span =
+  let depth = match json_field "depth" span with `Int value -> value | _ -> 0 in
+  let operation = json_text (json_field "operationName" span) in
+  let service = json_text (json_field "serviceName" span) in
+  let mark = if json_text (json_field "status" span) = "error" then "!" else "-" in
+  let duration =
+    if json_flag (json_field "isRunning" span) then "running"
+    else Printf.sprintf "%.3fms" (json_number (json_field "durationMs" span))
+  in
+  Printf.sprintf "%s%s %s  (%s, %s)\n"
+    (String.make (2 * max 0 depth) ' ') mark operation service duration
+
+let render_trace json =
+  let summary = json_field "summary" json in
+  let spans = json_items (json_field "spans" json) in
+  let warnings = json_items (json_field "warnings" json) in
+  let buffer = Buffer.create 1024 in
+  Buffer.add_string buffer
+    (Printf.sprintf "trace %s  %d spans  %s  %s\n"
+       (json_text (json_field "traceId" summary))
+       (match json_field "spanCount" summary with `Int value -> value | _ -> List.length spans)
+       (Printf.sprintf "%.3fms" (json_number (json_field "durationMs" summary)))
+       (if json_flag (json_field "isRunning" summary) then "running" else "finished"));
+  List.iter (fun span -> Buffer.add_string buffer (span_line span)) spans;
+  List.iter
+    (fun warning -> Buffer.add_string buffer ("warning: " ^ json_text warning ^ "\n"))
+    warnings;
+  Buffer.contents buffer
+
+let trace json_flag trace_id config =
+  let path = "/traces/" ^ percent_encode trace_id in
+  match http_request config "GET" path with
+  | Ok (status, body) when status >= 200 && status < 300 ->
+      if json_flag then (print_string body; 0)
+      else
+        (match Yojson.Safe.from_string body with
+        | json -> print_string (render_trace json); 0
+        | exception _ -> print_string body; 0)
+  | Ok (_status, body) -> prerr_string body; 1
+  | Error message -> prerr_endline (friendly_http_error config message); 1
 
 let span span_id config = get ("/spans/" ^ percent_encode span_id) config
 
@@ -621,7 +682,7 @@ let facets kind field key service lookback limit config =
     config
 
 let ai_calls service trace_id session_id function_id provider model operation
-    status text lookback cursor min_duration limit config =
+    status finish_reason text lookback cursor min_duration limit config =
   get
     ("/ai/calls"
     ^ query
@@ -634,6 +695,7 @@ let ai_calls service trace_id session_id function_id provider model operation
           ("model", model);
           ("operation", operation);
           ("status", status);
+          ("finishReason", finish_reason);
           ("text", text);
            ("minDurationMs", Option.map string_of_float min_duration);
           ("lookback", lookback);
@@ -646,7 +708,7 @@ let ai_call span_id config =
   get ("/ai/calls/" ^ percent_encode span_id) config
 
 let ai_stats group_by agg service trace_id session_id function_id provider model
-    operation status text lookback min_duration limit config =
+    operation status finish_reason text lookback min_duration limit config =
   get
     ("/ai/stats"
     ^ query
@@ -661,6 +723,7 @@ let ai_stats group_by agg service trace_id session_id function_id provider model
           ("model", model);
           ("operation", operation);
           ("status", status);
+          ("finishReason", finish_reason);
           ("text", text);
            ("minDurationMs", Option.map string_of_float min_duration);
           ("lookback", lookback);
@@ -799,6 +862,19 @@ let text_t =
     & opt (some string) None
     & info [ "text" ] ~docv:"TEXT" ~doc:"Filter AI calls by text.")
 
+let finish_reason_t =
+  Arg.(
+    value
+    & opt (some string) None
+    & info [ "finish-reason" ] ~docv:"REASON"
+        ~doc:"Filter AI calls by finish reason substring.")
+
+let json_t =
+  Arg.(
+    value
+    & flag
+    & info [ "json" ] ~doc:"Print the raw JSON response instead of the tree.")
+
 let attr_pair =
   let parse text =
     match String.index_opt text '=' with
@@ -885,8 +961,11 @@ let traces_cmd =
     Term.(const traces $ service_t $ lookback_t $ cursor_t $ limit_t $ config_t)
 
 let trace_cmd =
-  cmd "trace" "Read one trace by trace id."
-    Term.(const trace $ trace_id_t $ config_t)
+  cmd "trace" "Read one trace by trace id as a tree."
+    Term.(
+      const (fun json_flag trace_id config ->
+          finish (trace json_flag trace_id config))
+      $ json_t $ trace_id_t $ config_t)
 
 let span_cmd =
   cmd "span" "Read one span by span id."
@@ -954,7 +1033,8 @@ let ai_calls_cmd =
   cmd "ai-calls" "Search AI call spans."
     Term.(
       const ai_calls $ service_t $ trace_id_filter_t $ session_id_t
-      $ function_id_t $ provider_t $ model_t $ operation_t $ status_t $ text_t
+      $ function_id_t $ provider_t $ model_t $ operation_t $ status_t
+      $ finish_reason_t $ text_t
       $ lookback_t $ cursor_t $ min_duration_t $ limit_t $ config_t)
 
 let ai_call_cmd =
@@ -966,8 +1046,8 @@ let ai_stats_cmd =
     Term.(
       const ai_stats $ group_by_t $ agg_t $ service_t $ trace_id_filter_t
       $ session_id_t $ function_id_t $ provider_t $ model_t $ operation_t
-      $ status_t $ text_t $ lookback_t $ min_duration_t $ limit_t
-       $ config_t)
+      $ status_t $ finish_reason_t $ text_t $ lookback_t $ min_duration_t
+      $ limit_t $ config_t)
 
 let metrics_cmd =
   cmd "metrics" "List metric points."

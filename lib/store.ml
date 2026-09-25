@@ -68,6 +68,23 @@ type log_search_filter = {
   limit : int;
 }
 
+type ai_call_filter = {
+  service : string option;
+  trace_id : string option;
+  operation : string option;
+  status : string option;
+  provider : string option;
+  model : string option;
+  session_id : string option;
+  function_id : string option;
+  finish_reason : string option;
+  text : string option;
+  attrs : (string * string) list;
+  window : Model.window;
+  cursor : Model.cursor_position option;
+  limit : int;
+}
+
 type trace_stats_filter = {
   group_by : string;
   agg : string;
@@ -119,7 +136,7 @@ type metric_filter = {
    every change to the statements in [schemas]. [open_] recreates any database
    whose stored version differs, so a schema change without a bump would be
    silently skipped on an existing database (schm-hnis). *)
-let schema_version = 4
+let schema_version = 5
 
 let schema_version_text = string_of_int schema_version
 
@@ -154,13 +171,7 @@ module Spans = struct
   let duration_ms = column "duration_ms" Q.float
   let status = column "status" Q.text
   let is_ai_call = column "is_ai_call" Q.bool
-  let ai_model = column "ai_model" (Q.nullable Q.text)
-  let ai_provider = column "ai_provider" (Q.nullable Q.text)
-  let ai_session_id = column "ai_session_id" (Q.nullable Q.text)
-  let ai_function_id = column "ai_function_id" (Q.nullable Q.text)
-  let ai_input_tokens = column "ai_input_tokens" Q.int
-  let ai_output_tokens = column "ai_output_tokens" Q.int
-  let ai_search_text = column "ai_search_text" Q.text
+  let ai_kind = column "ai_kind" Q.text
   let status_message = column "status_message" (Q.nullable Q.text)
   let attributes_json = column "attributes_json" Q.text
   let resource_json = column "resource_json" Q.text
@@ -233,6 +244,45 @@ module Trace_summaries = struct
   let duration_ms = column "duration_ms" Q.float
   let span_count = column "span_count" Q.int
   let error_count = column "error_count" Q.int
+  let is_running = column "is_running" Q.bool
+  let warning_count = column "warning_count" Q.int
+  let updated_at_ms = column "updated_at_ms" Q.int
+end
+
+(* AI call summaries are denormalized at ingest so search, filters, grouping,
+   and aggregates run in SQL over the complete window (aic-q5qt, aic-qpv6). *)
+module Ai_calls = struct
+  module T = Q.Table.Make (struct
+    let name = "ai_calls"
+  end)
+
+  include T
+
+  let span_id = column "span_id" Q.text
+  let trace_id = column "trace_id" Q.text
+  let service_name = column "service_name" Q.text
+  let operation = column "operation" Q.text
+  let provider = column "provider" (Q.nullable Q.text)
+  let model = column "model" (Q.nullable Q.text)
+  let status = column "status" Q.text
+  let start_time_ns = column "start_time_ns" Q.int
+  let duration_ms = column "duration_ms" Q.float
+  let is_running = column "is_running" Q.bool
+  (* An empty finish reason means "not reported"; a non-nullable column keeps
+     the typed LIKE and GROUP BY builders available (see [none_if_empty]). *)
+  let finish_reason = column "finish_reason" Q.text
+  let session_id = column "session_id" (Q.nullable Q.text)
+  let function_id = column "function_id" (Q.nullable Q.text)
+  let user_id = column "user_id" (Q.nullable Q.text)
+  let tool_call_count = column "tool_call_count" Q.int
+  let input_tokens = column "input_tokens" (Q.nullable Q.int)
+  let output_tokens = column "output_tokens" (Q.nullable Q.int)
+  let total_tokens = column "total_tokens" (Q.nullable Q.int)
+  let cached_input_tokens = column "cached_input_tokens" (Q.nullable Q.int)
+  let reasoning_tokens = column "reasoning_tokens" (Q.nullable Q.int)
+  let prompt_preview = column "prompt_preview" (Q.nullable Q.text)
+  let response_preview = column "response_preview" (Q.nullable Q.text)
+  let search_text = column "search_text" Q.text
   let updated_at_ms = column "updated_at_ms" Q.int
 end
 
@@ -453,13 +503,7 @@ let schemas =
         column ~not_null:true Spans.duration_ms;
         column ~not_null:true Spans.status;
         column ~not_null:true Spans.is_ai_call;
-        column Spans.ai_model;
-        column Spans.ai_provider;
-        column Spans.ai_session_id;
-        column Spans.ai_function_id;
-        column ~not_null:true Spans.ai_input_tokens;
-        column ~not_null:true Spans.ai_output_tokens;
-        column ~not_null:true Spans.ai_search_text;
+        column ~not_null:true Spans.ai_kind;
         column Spans.status_message;
         column ~not_null:true Spans.attributes_json;
         column ~not_null:true Spans.resource_json;
@@ -546,6 +590,8 @@ let schemas =
         column ~not_null:true Trace_summaries.duration_ms;
         column ~not_null:true Trace_summaries.span_count;
         column ~not_null:true Trace_summaries.error_count;
+        column ~not_null:true Trace_summaries.is_running;
+        column ~not_null:true Trace_summaries.warning_count;
         column ~not_null:true Trace_summaries.updated_at_ms;
       ];
     create_index ~if_not_exists:true ~name:"idx_trace_summaries_service"
@@ -565,6 +611,51 @@ let schemas =
     create_index ~if_not_exists:true ~name:"idx_trace_summaries_service_start"
       Trace_summaries.table
       [ Q.Column.any Trace_summaries.service_name; Q.Column.any Trace_summaries.started_at_ns ];
+    create_table ~if_not_exists:true Ai_calls.table
+      [
+        column ~primary_key:true Ai_calls.span_id;
+        column ~not_null:true Ai_calls.trace_id;
+        column ~not_null:true Ai_calls.service_name;
+        column ~not_null:true Ai_calls.operation;
+        column Ai_calls.provider;
+        column Ai_calls.model;
+        column ~not_null:true Ai_calls.status;
+        column ~not_null:true Ai_calls.start_time_ns;
+        column ~not_null:true Ai_calls.duration_ms;
+        column ~not_null:true Ai_calls.is_running;
+        column ~not_null:true Ai_calls.finish_reason;
+        column Ai_calls.session_id;
+        column Ai_calls.function_id;
+        column Ai_calls.user_id;
+        column ~not_null:true Ai_calls.tool_call_count;
+        column Ai_calls.input_tokens;
+        column Ai_calls.output_tokens;
+        column Ai_calls.total_tokens;
+        column Ai_calls.cached_input_tokens;
+        column Ai_calls.reasoning_tokens;
+        column Ai_calls.prompt_preview;
+        column Ai_calls.response_preview;
+        column ~not_null:true Ai_calls.search_text;
+        column ~not_null:true Ai_calls.updated_at_ms;
+      ];
+    create_index ~if_not_exists:true ~name:"idx_ai_calls_start" Ai_calls.table
+      [ Q.Column.any Ai_calls.start_time_ns ];
+    create_index ~if_not_exists:true ~name:"idx_ai_calls_trace" Ai_calls.table
+      [ Q.Column.any Ai_calls.trace_id ];
+    create_index ~if_not_exists:true ~name:"idx_ai_calls_model" Ai_calls.table
+      [ Q.Column.any Ai_calls.model; Q.Column.any Ai_calls.start_time_ns ];
+    create_index ~if_not_exists:true ~name:"idx_ai_calls_provider" Ai_calls.table
+      [ Q.Column.any Ai_calls.provider; Q.Column.any Ai_calls.start_time_ns ];
+    create_index ~if_not_exists:true ~name:"idx_ai_calls_operation" Ai_calls.table
+      [ Q.Column.any Ai_calls.operation ];
+    create_index ~if_not_exists:true ~name:"idx_ai_calls_status" Ai_calls.table
+      [ Q.Column.any Ai_calls.status ];
+    create_index ~if_not_exists:true ~name:"idx_ai_calls_finish_reason"
+      Ai_calls.table [ Q.Column.any Ai_calls.finish_reason ];
+    create_index ~if_not_exists:true ~name:"idx_ai_calls_session" Ai_calls.table
+      [ Q.Column.any Ai_calls.session_id ];
+    create_index ~if_not_exists:true ~name:"idx_ai_calls_function" Ai_calls.table
+      [ Q.Column.any Ai_calls.function_id ];
     create_table ~if_not_exists:true Metric_points.table
       [
         column ~primary_key:true Metric_points.id;
@@ -967,14 +1058,15 @@ let metric_projection =
 let trace_summary_projection =
   Q.Projection.(
     map
-      (fun ( trace_id,
-             service_name,
-             root_operation_name,
-             started_at_ns,
-             ended_at_ns,
-             duration_ms,
-             span_count,
-             error_count ) ->
+      (fun ( ( trace_id,
+               service_name,
+               root_operation_name,
+               started_at_ns,
+               ended_at_ns,
+               duration_ms,
+               span_count,
+               error_count ),
+             (is_running, warning_count) ) ->
         {
           Model.trace_id;
           service_name;
@@ -984,12 +1076,17 @@ let trace_summary_projection =
           duration_ms;
           span_count;
           error_count;
+          is_running;
+          warning_count;
         })
-      (t8 (one Trace_summaries.trace_id) (one Trace_summaries.service_name)
-         (one Trace_summaries.root_operation_name)
-         (one Trace_summaries.started_at_ns) (one Trace_summaries.ended_at_ns)
-         (one Trace_summaries.duration_ms) (one Trace_summaries.span_count)
-         (one Trace_summaries.error_count)))
+      (t2
+         (t8 (one Trace_summaries.trace_id) (one Trace_summaries.service_name)
+            (one Trace_summaries.root_operation_name)
+            (one Trace_summaries.started_at_ns) (one Trace_summaries.ended_at_ns)
+            (one Trace_summaries.duration_ms) (one Trace_summaries.span_count)
+            (one Trace_summaries.error_count))
+         (t2 (one Trace_summaries.is_running)
+            (one Trace_summaries.warning_count))))
 
 let span_query trace_id =
     Q.Select.(
@@ -1031,6 +1128,13 @@ let rec take count values =
     | [] -> []
     | value :: rest -> value :: take (count - 1) rest
 
+let rec drop count values =
+  if count <= 0 then values
+  else
+    match values with
+    | [] -> []
+    | _ :: rest -> drop (count - 1) rest
+
 (* Keyset pagination and resolved windows (win-edze, win-7xet, win-xi3q). The
    HTTP layer resolves the window and decodes the cursor; the store only
    compares rows against them, fetching one row past the page size so
@@ -1067,21 +1171,6 @@ let log_position (log : Model.log_record) =
 
 let trace_position (summary : Model.trace_summary) =
   { Model.sort_key_ns = summary.started_at_ns; tie_breaker = summary.trace_id }
-
-let trace_spans_page_query ~window ~cursor ~limit trace_id =
-  let max_rows = limit + 1 in
-  Q.Select.(
-    from Spans.table span_projection
-    |> where
-         Q.Expr.(
-           and_ (eq Spans.trace_id trace_id)
-             (and_
-                (window_predicate Spans.start_time_ns window)
-                (keyset_predicate ~sort_key:Spans.start_time_ns
-                   ~tie_breaker:Spans.id cursor)))
-    |> order_by ~desc:true Spans.start_time_ns
-    |> order_by ~desc:true Spans.id
-    |> limit max_rows)
 
 let logs_for_trace_page_query ~window ~cursor ~limit trace_id =
   let max_rows = limit + 1 in
@@ -1283,51 +1372,109 @@ let insert_metric_attrs runner owner_id attrs =
   in
   Eta.Effect.unit
 
-let refresh_trace_summary ~now_ms runner trace_id =
+(* One trace refresh owns every derived row of a trace: the span's stored AI
+   classification (which can change when a late parent or child arrives), the
+   denormalized AI call summaries, the trace summary (tree order, running
+   state, warnings), and the participating services. *)
+let refresh_trace ~now_ms runner trace_id =
   let open Eta.Syntax in
   let* spans = select_spans_for_trace_pool runner trace_id in
   match spans with
   | [] -> Eta.Effect.unit
   | spans ->
-      let ordered =
-        List.sort
-          (fun (left : Model.span) right ->
-            compare left.start_time_ns right.start_time_ns)
-          spans
+      let tree = Trace_tree.assemble spans in
+      let classifications = Ai.classify_spans spans in
+      let children_by_parent = Hashtbl.create (List.length spans) in
+      List.iter
+        (fun (span : Model.span) ->
+          match span.parent_span_id with
+          | Some parent ->
+              let existing =
+                Option.value (Hashtbl.find_opt children_by_parent parent)
+                  ~default:[]
+              in
+              Hashtbl.replace children_by_parent parent (span :: existing)
+          | None -> ())
+        spans;
+      let children_of span_id =
+        Option.value (Hashtbl.find_opt children_by_parent span_id) ~default:[]
       in
-      let root =
-        match List.find_opt (fun span -> Option.is_none span.Model.parent_span_id) ordered with
-        | Some span -> span
-        | None -> List.hd ordered
+      let* () =
+        effect_iter classifications (fun ((span : Model.span), kind) ->
+            let* _ =
+              q_exec_pool runner
+                Q.Update.(
+                  table Spans.table
+                  |> set Spans.ai_kind (Ai.classification_to_string kind)
+                  |> set Spans.is_ai_call (kind = Ai.Ai_call)
+                  |> where Q.Expr.(eq Spans.id (span_row_id span))
+                  |> compile)
+            in
+            Eta.Effect.unit)
       in
-      let started_at_ns =
-        List.fold_left
-          (fun acc (span : Model.span) -> min acc span.start_time_ns)
-          root.start_time_ns spans
+      let* _ =
+        q_exec_pool runner
+          Q.Delete.(
+            from Ai_calls.table
+            |> where Q.Expr.(eq Ai_calls.trace_id trace_id)
+            |> compile)
       in
-      let ended_at_ns =
-        List.fold_left
-          (fun acc (span : Model.span) -> max acc span.end_time_ns)
-          root.end_time_ns spans
-      in
-      let error_count =
-        List.fold_left
-          (fun acc (span : Model.span) ->
-            if span.status = Model.Error then acc + 1 else acc)
-          0 spans
+      let* () =
+        effect_iter classifications (fun ((span : Model.span), kind) ->
+            match kind with
+            | Ai.Ai_call ->
+                let children = children_of span.span_id in
+                let call = Ai.call_of_span ~children span in
+                let search_text = Ai.search_text ~children span in
+                let insert =
+                  Q.Insert.(
+                    into Ai_calls.table
+                    |> value Ai_calls.span_id call.Model.span_id
+                    |> value Ai_calls.trace_id call.trace_id
+                    |> value Ai_calls.service_name call.service_name
+                    |> value Ai_calls.operation call.operation
+                    |> value Ai_calls.provider call.provider
+                    |> value Ai_calls.model call.model
+                    |> value Ai_calls.status call.status
+                    |> value Ai_calls.start_time_ns call.start_time_ns
+                    |> value Ai_calls.duration_ms
+                         (Option.value call.duration_ms ~default:0.)
+                    |> value Ai_calls.is_running call.is_running
+                    |> value Ai_calls.finish_reason
+                         (Option.value call.finish_reason ~default:"")
+                    |> value Ai_calls.session_id call.session_id
+                    |> value Ai_calls.function_id call.function_id
+                    |> value Ai_calls.user_id call.user_id
+                    |> value Ai_calls.tool_call_count call.tool_call_count
+                    |> value Ai_calls.input_tokens call.usage.Model.input_tokens
+                    |> value Ai_calls.output_tokens call.usage.output_tokens
+                    |> value Ai_calls.total_tokens call.usage.total_tokens
+                    |> value Ai_calls.cached_input_tokens
+                         call.usage.cached_input_tokens
+                    |> value Ai_calls.reasoning_tokens call.usage.reasoning_tokens
+                    |> value Ai_calls.prompt_preview call.prompt_preview
+                    |> value Ai_calls.response_preview call.response_preview
+                    |> value Ai_calls.search_text search_text
+                    |> value Ai_calls.updated_at_ms now_ms
+                    |> compile)
+                in
+                let* _ = q_exec_pool runner insert in
+                Eta.Effect.unit
+            | _ -> Eta.Effect.unit)
       in
       let insert =
         Q.Insert.(
           into Trace_summaries.table
           |> value Trace_summaries.trace_id trace_id
-          |> value Trace_summaries.service_name root.service_name
-          |> value Trace_summaries.root_operation_name root.operation_name
-          |> value Trace_summaries.started_at_ns started_at_ns
-          |> value Trace_summaries.ended_at_ns ended_at_ns
-          |> value Trace_summaries.duration_ms
-               (float_of_int (ended_at_ns - started_at_ns) /. 1_000_000.)
-          |> value Trace_summaries.span_count (List.length spans)
-          |> value Trace_summaries.error_count error_count
+          |> value Trace_summaries.service_name tree.root_service_name
+          |> value Trace_summaries.root_operation_name tree.root_operation_name
+          |> value Trace_summaries.started_at_ns tree.started_at_ns
+          |> value Trace_summaries.ended_at_ns tree.ended_at_ns
+          |> value Trace_summaries.duration_ms tree.duration_ms
+          |> value Trace_summaries.span_count tree.span_count
+          |> value Trace_summaries.error_count tree.error_count
+          |> value Trace_summaries.is_running tree.is_running
+          |> value Trace_summaries.warning_count (List.length tree.warnings)
           |> value Trace_summaries.updated_at_ms now_ms
           |> on_conflict_update [ Q.Column.any Trace_summaries.trace_id ]
                ~set:[ Q.Column.any Trace_summaries.service_name;
@@ -1337,6 +1484,8 @@ let refresh_trace_summary ~now_ms runner trace_id =
                       Q.Column.any Trace_summaries.duration_ms;
                       Q.Column.any Trace_summaries.span_count;
                       Q.Column.any Trace_summaries.error_count;
+                      Q.Column.any Trace_summaries.is_running;
+                      Q.Column.any Trace_summaries.warning_count;
                       Q.Column.any Trace_summaries.updated_at_ms ]
           |> compile)
       in
@@ -1485,6 +1634,13 @@ let delete_trace_batch runner ~batch cutoff =
     from Trace_services.table
     |> where Q.Expr.(in_select Trace_services.trace_id trace_ids)
     |> compile) in
+  let* _ =
+    q_exec_pool runner
+      Q.Delete.(
+        from Ai_calls.table
+        |> where Q.Expr.(in_select Ai_calls.trace_id trace_ids)
+        |> compile)
+  in
   let* spans =
     q_exec_pool runner
       Q.Delete.(
@@ -1644,6 +1800,17 @@ let ingest_traces t spans =
   let open Eta.Syntax in
   let now_ms = t.now_ms () in
   let touched = Hashtbl.create 16 in
+  (* The batch classifies what it can see; [refresh_trace] re-classifies against
+     the complete trace, so a provider sub-span whose parent arrives in another
+     export is corrected in the same transaction. *)
+  let kinds = Hashtbl.create (List.length spans) in
+  List.iter
+    (fun ((span : Model.span), kind) ->
+      Hashtbl.replace kinds span.span_id kind)
+    (Ai.classify_spans spans);
+  let kind_of (span : Model.span) =
+    Option.value (Hashtbl.find_opt kinds span.span_id) ~default:Ai.Not_ai
+  in
   let insert_span runner (span : Model.span) =
     let id = span_row_id span in
     let insert =
@@ -1661,14 +1828,8 @@ let ingest_traces t spans =
         |> value Spans.end_time_ns span.end_time_ns
         |> value Spans.duration_ms span.duration_ms
         |> value Spans.status (Model.span_status_to_string span.status)
-        |> value Spans.is_ai_call (Model.is_ai_span span)
-        |> value Spans.ai_model (Model.ai_model span)
-        |> value Spans.ai_provider (Model.ai_provider span)
-        |> value Spans.ai_session_id (Model.ai_session_id span)
-        |> value Spans.ai_function_id (Model.ai_function_id span)
-        |> value Spans.ai_input_tokens (Option.value (Model.ai_input_tokens span) ~default:0)
-        |> value Spans.ai_output_tokens (Option.value (Model.ai_output_tokens span) ~default:0)
-        |> value Spans.ai_search_text (Model.ai_search_text span)
+        |> value Spans.is_ai_call (kind_of span = Ai.Ai_call)
+        |> value Spans.ai_kind (Ai.classification_to_string (kind_of span))
         |> value Spans.status_message span.status_message
         |> value Spans.attributes_json (Model.attrs_json_string span.attributes)
         |> value Spans.resource_json (Model.attrs_json_string span.resource)
@@ -1682,13 +1843,7 @@ let ingest_traces t spans =
                     Q.Column.any Spans.operation_name; Q.Column.any Spans.kind;
                     Q.Column.any Spans.start_time_ns; Q.Column.any Spans.end_time_ns;
                     Q.Column.any Spans.duration_ms; Q.Column.any Spans.status;
-                    Q.Column.any Spans.is_ai_call;
-                    Q.Column.any Spans.ai_model; Q.Column.any Spans.ai_provider;
-                    Q.Column.any Spans.ai_session_id;
-                    Q.Column.any Spans.ai_function_id;
-                    Q.Column.any Spans.ai_input_tokens;
-                    Q.Column.any Spans.ai_output_tokens;
-                    Q.Column.any Spans.ai_search_text;
+                    Q.Column.any Spans.is_ai_call; Q.Column.any Spans.ai_kind;
                     Q.Column.any Spans.status_message;
                     Q.Column.any Spans.attributes_json; Q.Column.any Spans.resource_json;
                     Q.Column.any Spans.events_json; Q.Column.any Spans.links_json;
@@ -1704,7 +1859,7 @@ let ingest_traces t spans =
     Q.Pool.with_transaction t.pool (fun tx ->
         let* () = effect_iter spans (insert_span tx) in
         let trace_ids = List.of_seq (Hashtbl.to_seq_keys touched) in
-        effect_iter trace_ids (refresh_trace_summary ~now_ms tx))
+        effect_iter trace_ids (refresh_trace ~now_ms tx))
     |> Eta.Effect.map_error widen_pool_error
   in
   Eta.Effect.pure (List.length spans)
@@ -1848,6 +2003,23 @@ let list_trace_summaries ?service ~window ?cursor ~limit t =
   q_select t.pool query
   |> Eta.Effect.map (page_of_rows ~limit ~position:trace_position)
 
+let summary_of_tree trace_id (tree : Trace_tree.t) : Model.trace_summary =
+  {
+    Model.trace_id;
+    service_name = tree.root_service_name;
+    root_operation_name = tree.root_operation_name;
+    started_at_ns = tree.started_at_ns;
+    ended_at_ns = tree.ended_at_ns;
+    duration_ms = tree.duration_ms;
+    span_count = tree.span_count;
+    error_count = tree.error_count;
+    is_running = tree.is_running;
+    warning_count = List.length tree.warnings;
+  }
+
+(* A trace is served whenever it has spans, even if its summary row is missing
+   (tree-ddll): the tree is the source of truth for the response, and the
+   summary is only the stored projection of it. *)
 let get_trace t trace_id =
   let open Eta.Syntax in
   let* summaries =
@@ -1858,21 +2030,97 @@ let get_trace t trace_id =
         |> limit 1)
   in
   let* summary = one_or_none "trace summary lookup" summaries in
-  match summary with
-  | None -> Eta.Effect.pure None
-  | Some summary ->
-      let* spans = select_spans_for_trace t.pool trace_id in
+  let* spans = select_spans_for_trace t.pool trace_id in
+  match (summary, spans) with
+  | None, [] -> Eta.Effect.pure None
+  | summary, spans ->
+      let tree = Trace_tree.assemble spans in
+      let summary =
+        match summary with
+        | Some summary -> summary
+        | None -> summary_of_tree trace_id tree
+      in
       let* logs = q_select t.pool (logs_for_trace_query trace_id) in
-      Eta.Effect.pure (Some { Model.summary; spans; logs })
+      Eta.Effect.pure
+        (Some
+           {
+             Model.summary;
+             spans = tree.nodes;
+             logs;
+             warnings = tree.warnings;
+           })
 
 let get_span t span_id =
   let open Eta.Syntax in
   let* spans = q_select t.pool (span_id_query span_id) in
   one_or_none "span lookup" spans
 
+(* The span detail carries the same tree context as the trace it belongs to, so
+   one lookup is enough to place a span (tree-o79f). *)
+let get_span_node t span_id =
+  let open Eta.Syntax in
+  let* spans = q_select t.pool (span_id_query span_id) in
+  match spans with
+  | [] -> Eta.Effect.pure None
+  | span :: _ ->
+      let* siblings = select_spans_for_trace t.pool span.Model.trace_id in
+      let tree = Trace_tree.assemble siblings in
+      let node =
+        List.find_opt
+          (fun (node : Model.span_node) -> node.span.span_id = span_id)
+          tree.nodes
+      in
+      (match node with
+      | Some node -> Eta.Effect.pure (Some node)
+      | None ->
+          Eta.Effect.pure
+            (Some
+               {
+                 Model.span;
+                 depth = 0;
+                 parent_operation_name = None;
+                 root_operation_name = span.operation_name;
+                 is_running = Trace_tree.is_running_span span;
+                 warnings = [];
+               }))
+
+(* The tree-ordered trace span list filters on the same window as every other
+   list query, then orders in the tree module (tree-uv04). *)
+let select_spans_for_trace_in_window trace_id window =
+  Q.Select.(
+    from Spans.table span_projection
+    |> where
+         Q.Expr.(
+           and_ (eq Spans.trace_id trace_id)
+             (window_predicate Spans.start_time_ns window))
+    |> order_by Spans.start_time_ns)
+
+(* [/traces/{id}/spans] returns the same tree order as the trace detail
+   (tree-uv04). A trace is small, so the page is sliced from the assembled
+   tree; the cursor carries the position in that tree order. *)
 let list_trace_spans t ~window ?cursor ~limit trace_id =
-  q_select t.pool (trace_spans_page_query ~window ~cursor ~limit trace_id)
-  |> Eta.Effect.map (page_of_rows ~limit ~position:span_position)
+  let open Eta.Syntax in
+  let* spans = q_select t.pool (select_spans_for_trace_in_window trace_id window) in
+  let tree = Trace_tree.assemble spans in
+  let nodes = tree.nodes in
+  let start = match cursor with
+    | None -> 0
+    | Some position -> max 0 (position.Model.sort_key_ns + 1) in
+  let remaining = drop start nodes in
+  let items = take limit remaining in
+  let next =
+    match items with
+    | [] -> None
+    | _ when List.length remaining > limit ->
+        let last = List.nth items (List.length items - 1) in
+        Some
+          {
+            Model.sort_key_ns = start + List.length items - 1;
+            tie_breaker = last.Model.span.span_id;
+          }
+    | _ -> None
+  in
+  Eta.Effect.pure { items; next }
 
 let list_trace_logs t ~window ?cursor ~limit trace_id =
   q_select t.pool (logs_for_trace_page_query ~window ~cursor ~limit trace_id)
@@ -1921,31 +2169,167 @@ let span_search_predicate ?(attr_contains = []) ?min_duration_ms
     | Some x -> Q.Expr.and_ p (Q.Expr.eq Spans.status x) in
   Q.Expr.and_ p (keyset_predicate ~sort_key:Spans.start_time_ns ~tie_breaker:Spans.id filter.cursor)
 
-let ai_span_predicate ?(attr_contains = []) ?min_duration_ms
-    ?model ?provider ?session_id ?function_id ?text
-    (filter : span_search_filter) =
-  let p = Q.Expr.and_ (span_search_predicate ~attr_contains ?min_duration_ms filter)
-    (Q.Expr.eq Spans.is_ai_call true) in
-  let nullable p col = match p with None -> Q.Expr.true_
-    | Some value -> Q.Expr.eq col (Some value) in
-  let p = Q.Expr.and_ p (nullable model Spans.ai_model) in
-  let p = Q.Expr.and_ p (nullable provider Spans.ai_provider) in
-  let p = Q.Expr.and_ p (nullable session_id Spans.ai_session_id) in
-  let p = Q.Expr.and_ p (nullable function_id Spans.ai_function_id) in
-  match text with None -> p | Some needle ->
-    let pattern, escape = Q.Expr.contains_pattern needle in
-    Q.Expr.and_ p (Q.Expr.like ~escape Spans.ai_search_text pattern)
+(* AI call summaries are read from their own table, so a filter or an
+   aggregate never scans non-AI spans (acc-gkoz, aic-yfcd). *)
+
+let none_if_empty value = if String.equal value "" then None else Some value
+
+(* Eta SQL aggregates [sum_int] and [avg] only over columns declared
+   non-nullable, and the typed DSL has no SUM over [Q.nullable]. SUM ignores
+   NULL, so reading the same physical token columns as non-nullable is exact:
+   the aggregate is NULL, decoded as [None], only when every value in the group
+   is NULL. The alias keeps the table identity and renders the same qualified
+   names, so this view is only used inside aggregates. Reported in
+   .spec/ETA_SQL_DOGFOODING.md. *)
+let ai_token_columns = Q.Table.alias Ai_calls.table "ai_calls"
+
+let ai_input_tokens_column = Q.Table.column ai_token_columns "input_tokens" Q.int
+let ai_output_tokens_column = Q.Table.column ai_token_columns "output_tokens" Q.int
+let ai_total_tokens_column = Q.Table.column ai_token_columns "total_tokens" Q.int
+
+let ai_call_projection =
+  Q.Projection.(
+    map
+      (fun ( ( span_id,
+               trace_id,
+               service_name,
+               operation,
+               provider,
+               model,
+               status,
+               start_time_ns ),
+             ( duration_ms,
+               is_running,
+               finish_reason,
+               session_id,
+               function_id,
+               user_id,
+               tool_call_count,
+               input_tokens ),
+             ( output_tokens,
+               total_tokens,
+               cached_input_tokens,
+               reasoning_tokens,
+               prompt_preview,
+               response_preview ) ) ->
+        {
+          Model.span_id;
+          trace_id;
+          service_name;
+          operation;
+          provider;
+          model;
+          status;
+          start_time_ns;
+          duration_ms = (if is_running then None else Some duration_ms);
+          is_running;
+          finish_reason = none_if_empty finish_reason;
+          session_id;
+          function_id;
+          user_id;
+          tool_call_count;
+          usage =
+            {
+              Model.input_tokens;
+              output_tokens;
+              total_tokens;
+              cached_input_tokens;
+              reasoning_tokens;
+            };
+          prompt_preview;
+          response_preview;
+        })
+      (t3
+         (t8 (one Ai_calls.span_id) (one Ai_calls.trace_id)
+            (one Ai_calls.service_name) (one Ai_calls.operation)
+            (one Ai_calls.provider) (one Ai_calls.model) (one Ai_calls.status)
+            (one Ai_calls.start_time_ns))
+         (t8 (one Ai_calls.duration_ms) (one Ai_calls.is_running)
+            (one Ai_calls.finish_reason) (one Ai_calls.session_id)
+            (one Ai_calls.function_id) (one Ai_calls.user_id)
+            (one Ai_calls.tool_call_count) (one Ai_calls.input_tokens))
+         (t6 (one Ai_calls.output_tokens) (one Ai_calls.total_tokens)
+            (one Ai_calls.cached_input_tokens) (one Ai_calls.reasoning_tokens)
+            (one Ai_calls.prompt_preview) (one Ai_calls.response_preview))))
+
+let ai_call_position (call : Model.ai_call) =
+  { Model.sort_key_ns = call.start_time_ns; tie_breaker = call.span_id }
+
+let substring_predicate column value =
+  let pattern, escape = Q.Expr.contains_pattern value in
+  Q.Expr.like ~escape column pattern
+
+let ai_call_predicate ?(attr_contains = []) ?min_duration_ms
+    (filter : ai_call_filter) =
+  let p =
+    Q.Expr.and_
+      (window_predicate Ai_calls.start_time_ns filter.window)
+      (keyset_predicate ~sort_key:Ai_calls.start_time_ns
+         ~tie_breaker:Ai_calls.span_id filter.cursor)
+  in
+  let and_ = Q.Expr.and_ in
+  let p = match filter.service with
+    | None -> p | Some x -> and_ p (Q.Expr.eq Ai_calls.service_name x) in
+  let p = match filter.trace_id with
+    | None -> p | Some x -> and_ p (Q.Expr.eq Ai_calls.trace_id x) in
+  let p = match filter.provider with
+    | None -> p | Some x -> and_ p (Q.Expr.eq Ai_calls.provider (Some x)) in
+  let p = match filter.model with
+    | None -> p | Some x -> and_ p (Q.Expr.eq Ai_calls.model (Some x)) in
+  let p = match filter.session_id with
+    | None -> p | Some x -> and_ p (Q.Expr.eq Ai_calls.session_id (Some x)) in
+  let p = match filter.function_id with
+    | None -> p | Some x -> and_ p (Q.Expr.eq Ai_calls.function_id (Some x)) in
+  let p = match filter.operation with
+    | None -> p | Some x -> and_ p (substring_predicate Ai_calls.operation x) in
+  let p = match filter.finish_reason with
+    | None -> p | Some x -> and_ p (substring_predicate Ai_calls.finish_reason x) in
+  let p = match filter.text with
+    | None -> p | Some x -> and_ p (substring_predicate Ai_calls.search_text x) in
+  let p = match filter.status with
+    | None -> p
+    | Some "ok" -> and_ p Q.Expr.(not_ (eq Ai_calls.status "error"))
+    | Some x -> and_ p (Q.Expr.eq Ai_calls.status x) in
+  let p = match min_duration_ms with
+    | None -> p | Some x -> and_ p (Q.Expr.ge Ai_calls.duration_ms x) in
+  if filter.attrs = [] && attr_contains = [] then p
+  else
+    let span_ids =
+      Q.Select.(
+        from Spans.table Q.Projection.(one Spans.id)
+        |> where (span_attrs_predicate ~contains:attr_contains Spans.id filter.attrs)
+        |> compile)
+    in
+    and_ p (Q.Expr.in_select Ai_calls.span_id span_ids)
 
 let search_ai_calls ?(attr_contains = []) ?min_duration_ms
-    ?model ?provider ?session_id ?function_id ?text
-    (filter : span_search_filter) t =
-  q_select t.pool Q.Select.(from Spans.table span_projection
-    |> where (ai_span_predicate ~attr_contains ?min_duration_ms
-      ?model ?provider ?session_id ?function_id ?text filter)
-    |> order_by ~desc:true Spans.start_time_ns
-    |> order_by ~desc:true Spans.id
-    |> limit (filter.limit + 1))
-  |> Eta.Effect.map (page_of_rows ~limit:filter.limit ~position:span_position)
+    (filter : ai_call_filter) t =
+  q_select t.pool
+    Q.Select.(
+      from Ai_calls.table ai_call_projection
+      |> where (ai_call_predicate ~attr_contains ?min_duration_ms filter)
+      |> order_by ~desc:true Ai_calls.start_time_ns
+      |> order_by ~desc:true Ai_calls.span_id
+      |> limit (filter.limit + 1))
+  |> Eta.Effect.map (page_of_rows ~limit:filter.limit ~position:ai_call_position)
+
+(* The stored AI classification of one span, which is what the 404 hint needs:
+   a nested provider span's parent is outside the span itself (aic-t8tl). *)
+let span_ai_kind t span_id =
+  q_select t.pool
+    Q.Select.(
+      from Spans.table Q.Projection.(one Spans.ai_kind)
+      |> where Q.Expr.(eq Spans.span_id span_id)
+      |> limit 1)
+  |> Eta.Effect.map (function [] -> None | kind :: _ -> Some kind)
+
+(* Direct children of one span, for the AI call's tool calls (aic-fy0u). *)
+let list_span_children t span_id =
+  q_select t.pool
+    Q.Select.(
+      from Spans.table span_projection
+      |> where Q.Expr.(eq Spans.parent_span_id (Some span_id))
+      |> order_by Spans.start_time_ns)
 
 let search_spans ?(attr_contains = []) ?min_duration_ms (filter : span_search_filter) t =
   q_select t.pool Q.Select.(
@@ -2249,53 +2633,101 @@ let trace_stats ?(attr_contains = []) ?min_duration_ms (filter : trace_stats_fil
            let* items = collect groups in
            Eta.Effect.pure (sort_stat_items filter.limit items))
 
+(* Every group and aggregate runs in SQL over the complete window; no group
+   samples a page (aic-qpv6). *)
 let ai_stats ?(attr_contains = []) ?min_duration_ms
-    ?model ?provider ?session_id ?function_id ?text
-    ~group_by ~agg (filter : span_search_filter) t =
+    ~group_by ~agg (filter : ai_call_filter) t =
   let open Eta.Syntax in
-  let predicate = ai_span_predicate ~attr_contains ?min_duration_ms
-    ?model ?provider ?session_id ?function_id ?text filter in
+  let predicate = ai_call_predicate ~attr_contains ?min_duration_ms filter in
   let p95 count group_pred =
-    let ranked = Q.Select.(
-      from Spans.table Q.Projection.(t2 (one Spans.duration_ms)
-        (row_number ~as_:"rank" ~order_by:Spans.duration_ms ()))
-      |> where Q.Expr.(and_ predicate group_pred) |> compile) in
+    let ranked =
+      Q.Select.(
+        from Ai_calls.table
+          Q.Projection.(
+            t2 (one Ai_calls.duration_ms)
+              (row_number ~as_:"rank" ~order_by:Ai_calls.duration_ms ()))
+        |> where Q.Expr.(and_ predicate (group_pred ()))
+        |> compile)
+    in
     let rank = int_of_float (ceil (0.95 *. float_of_int count)) in
-    let* durations = q_select t.pool Q.Select.(
-      from Ranked_trace_duration.table Q.Projection.(one Ranked_trace_duration.duration_ms)
-      |> with_cte ~name:"ranked_trace_duration" ranked
-      |> where Q.Expr.(eq Ranked_trace_duration.rank rank)) in
-    Eta.Effect.pure (match durations with duration :: _ -> duration | [] -> 0.) in
+    let* durations =
+      q_select t.pool
+        Q.Select.(
+          from Ranked_trace_duration.table
+            Q.Projection.(one Ranked_trace_duration.duration_ms)
+          |> with_cte ~name:"ranked_trace_duration" ranked
+          |> where Q.Expr.(eq Ranked_trace_duration.rank rank))
+    in
+    Eta.Effect.pure (match durations with duration :: _ -> duration | [] -> 0.)
+  in
   let by_column label col =
-    let* groups = q_select t.pool Q.Select.(
-      from Spans.table Q.Projection.(t2
-        (t3 (one col) (count ()) (avg Q.Numeric.float Spans.duration_ms))
-        (t2 (sum_int Spans.ai_input_tokens) (sum_int Spans.ai_output_tokens)))
-      |> where predicate |> group_by col) in
+    let* groups =
+      q_select t.pool
+        Q.Select.(
+          from Ai_calls.table
+            Q.Projection.(
+              t6 (one col) (count ())
+                (avg Q.Numeric.float Ai_calls.duration_ms)
+                (sum_int ai_input_tokens_column)
+                (sum_int ai_output_tokens_column)
+                (sum_int ai_total_tokens_column))
+          |> where predicate |> group_by col)
+    in
+    let* error_groups =
+      if agg = "error_rate" then
+        q_select t.pool
+          Q.Select.(
+            from Ai_calls.table Q.Projection.(t2 (one col) (count ()))
+            |> where Q.Expr.(and_ predicate (eq Ai_calls.status "error"))
+            |> group_by col)
+      else Eta.Effect.pure []
+    in
+    let error_counts = Hashtbl.create (List.length error_groups) in
+    List.iter
+      (fun (key, count) -> Hashtbl.replace error_counts (label key) count)
+      error_groups;
     let rec collect = function
       | [] -> Eta.Effect.pure []
-      | ((key, count, avg), (input_tokens, output_tokens)) :: rest ->
+      | (key, count, avg, input_tokens, output_tokens, total_tokens) :: rest ->
           let group = label key in
-          let* value = match agg with
+          let* value =
+            match agg with
             | "avg_duration" -> Eta.Effect.pure (Option.value avg ~default:0.)
-            | "p95_duration" -> p95 count (Q.Expr.eq col key)
-            | "total_input_tokens" -> Eta.Effect.pure
-                (float_of_int (Option.value input_tokens ~default:0))
-            | "total_output_tokens" -> Eta.Effect.pure
-                (float_of_int (Option.value output_tokens ~default:0))
-            | _ -> Eta.Effect.pure (float_of_int count) in
+            | "p95_duration" -> p95 count (fun () -> Q.Expr.eq col key)
+            | "total_input_tokens" ->
+                Eta.Effect.pure
+                  (float_of_int (Option.value input_tokens ~default:0))
+            | "total_output_tokens" ->
+                Eta.Effect.pure
+                  (float_of_int (Option.value output_tokens ~default:0))
+            | "total_tokens" ->
+                Eta.Effect.pure
+                  (float_of_int (Option.value total_tokens ~default:0))
+            | "error_rate" ->
+                let errors =
+                  Option.value (Hashtbl.find_opt error_counts group) ~default:0
+                in
+                Eta.Effect.pure
+                  (float_of_int errors /. float_of_int (max 1 count))
+            | _ -> Eta.Effect.pure (float_of_int count)
+          in
           let* tail = collect rest in
-          Eta.Effect.pure ({ Model.group; value; count } :: tail) in
+          Eta.Effect.pure ({ Model.group; value; count } :: tail)
+    in
     let* items = collect groups in
-    Eta.Effect.pure (sort_stat_items filter.limit items) in
-  let nullable = Option.value ~default:"unknown" in
+    Eta.Effect.pure (sort_stat_items filter.limit items)
+  in
+  let label = function Some "" | None -> "unknown" | Some value -> value in
+  let report_label value = if String.equal value "" then "unknown" else value in
   match group_by with
-  | "model" -> by_column nullable Spans.ai_model
-  | "provider" -> by_column nullable Spans.ai_provider
-  | "sessionId" -> by_column nullable Spans.ai_session_id
-  | "functionId" -> by_column nullable Spans.ai_function_id
-  | "status" -> by_column Fun.id Spans.status
-  | _ -> by_column (fun _ -> "unknown") Spans.is_ai_call
+  | "model" -> by_column label Ai_calls.model
+  | "provider" -> by_column label Ai_calls.provider
+  | "sessionId" -> by_column label Ai_calls.session_id
+  | "functionId" -> by_column label Ai_calls.function_id
+  | "finishReason" -> by_column report_label Ai_calls.finish_reason
+  | "operation" -> by_column Fun.id Ai_calls.operation
+  | "status" -> by_column Fun.id Ai_calls.status
+  | _ -> Eta.Effect.pure []
 
 let log_stats ?(attr_contains = []) ?min_severity
     (filter : log_stats_filter) t =

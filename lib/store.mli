@@ -45,6 +45,25 @@ type trace_search_filter = {
   limit : int;
 }
 
+type ai_call_filter = {
+  service : string option;
+  trace_id : string option;
+  operation : string option;
+  status : string option;
+  provider : string option;
+  model : string option;
+  session_id : string option;
+  function_id : string option;
+  finish_reason : string option;
+  text : string option;
+  attrs : (string * string) list;
+  window : Model.window;
+  cursor : Model.cursor_position option;
+  limit : int;
+}
+(** Every AI call filter, resolved by the caller. The store never parses a
+    query parameter (aic-yfcd). *)
+
 type log_search_filter = {
   service : string option;
   trace_id : string option;
@@ -135,8 +154,8 @@ val now_ms : t -> int
     against this clock, so tests can drive it. *)
 
 val span_position : Model.span -> Model.cursor_position
-(** The keyset position of a span row: its start time and unique row id. The
-    AI call search walks raw span pages, so it needs this position. *)
+(** The keyset position of a span row: its start time and unique row id, for
+    span search. *)
 
 val prune : ?now_ms:int -> t -> (Model.prune_report, error) Eta.Effect.t
 (** Delete expired telemetry and, when live data is over the size cap, the
@@ -159,14 +178,25 @@ val list_trace_summaries :
   t ->
   (Model.trace_summary page, error) Eta.Effect.t
 val get_trace : t -> string -> (Model.trace option, error) Eta.Effect.t
+(** [None] only when the trace has no spans at all: a trace whose summary row is
+    missing is still served from its spans (tree-ddll). *)
 val get_span : t -> string -> (Model.span option, error) Eta.Effect.t
+val get_span_node :
+  t -> string -> (Model.span_node option, error) Eta.Effect.t
+(** The span with its place in the trace tree (tree-o79f). *)
 val list_trace_spans :
   t ->
   window:Model.window ->
   ?cursor:Model.cursor_position ->
   limit:int ->
   string ->
-  (Model.span page, error) Eta.Effect.t
+  (Model.span_node page, error) Eta.Effect.t
+(** Depth-first tree order, the same one the trace detail returns (tree-uv04).
+    The cursor carries the position in that order. *)
+val span_ai_kind : t -> string -> (string option, error) Eta.Effect.t
+(** The stored AI classification of a span: [call], [tool], [nested], [none],
+    or [None] when no such span exists (aic-t8tl). *)
+val list_span_children : t -> string -> (Model.span list, error) Eta.Effect.t
 val list_trace_logs :
   t ->
   window:Model.window ->
@@ -185,9 +215,9 @@ val list_logs :
   ?min_severity:int -> log_filter -> t -> (Model.log_record page, error) Eta.Effect.t
 val search_ai_calls :
   ?attr_contains:(string * string) list -> ?min_duration_ms:float ->
-  ?model:string -> ?provider:string -> ?session_id:string ->
-  ?function_id:string -> ?text:string -> span_search_filter -> t ->
-  (Model.span page, error) Eta.Effect.t
+  ai_call_filter -> t ->
+  (Model.ai_call page, error) Eta.Effect.t
+(** AI calls only, over their own indexed table (aic-yfcd). *)
 val search_spans :
   ?attr_contains:(string * string) list -> ?min_duration_ms:float -> span_search_filter -> t -> (Model.span page, error) Eta.Effect.t
 val search_traces :
@@ -199,10 +229,10 @@ val trace_stats :
   ?attr_contains:(string * string) list -> ?min_duration_ms:float -> trace_stats_filter -> t -> (Model.stat_item list, error) Eta.Effect.t
 val ai_stats :
   ?attr_contains:(string * string) list -> ?min_duration_ms:float ->
-  ?model:string -> ?provider:string -> ?session_id:string ->
-  ?function_id:string -> ?text:string ->
-  group_by:string -> agg:string -> span_search_filter -> t ->
+  group_by:string -> agg:string -> ai_call_filter -> t ->
   (Model.stat_item list, error) Eta.Effect.t
+(** Exact SQL grouping and aggregation over AI calls; an unknown [group_by] is
+    an empty list, and the HTTP layer rejects it first (aic-qpv6, aic-e67r). *)
 val log_stats :
   ?attr_contains:(string * string) list -> ?min_severity:int -> log_stats_filter -> t -> (Model.stat_item list, error) Eta.Effect.t
 val facets : facet_filter -> t -> (Model.facet_item list, error) Eta.Effect.t

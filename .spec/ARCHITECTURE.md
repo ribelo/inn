@@ -114,6 +114,21 @@ later pages cannot drift. Results are newest first. A malformed lookback,
 limit, or cursor, or a cursor issued for another endpoint kind, is a `400`.
 Log records expose the store-assigned stable `id` they were always keyed by.
 
+Traces are trees. The trace detail, the trace span list, and the span detail
+return the same depth-first order — siblings by start time — and annotate every
+span with its depth, its parent operation, the trace's root operation, and
+running state. A span whose parent id is missing from the trace becomes a root
+with a warning instead of a synthetic span, and a trace with several roots
+carries a warning; the trace response adds `warnings` and each trace summary
+carries `isRunning` and `warningCount`. A trace is served whenever it has
+spans, even without its summary row.
+
+AI calls are classified at ingest into AI calls, tool executions, and nested
+provider spans, using the OpenTelemetry GenAI conventions first and the Vercel
+AI SDK keys second. Only AI calls are listed, filtered, and aggregated; the
+stored summary carries the prompt and response previews, usage, finish reason,
+tool-call count, and the identifiers the filters and groups need.
+
 Core CLI commands:
 
 - `inn server`
@@ -158,6 +173,8 @@ plus attribute side tables for indexed filtering:
 - `logs`
 - `log_attributes`
 - `trace_summaries`
+- `trace_services`
+- `ai_calls`
 - `metric_points`
 - `metric_attributes`
 - `inn_meta`

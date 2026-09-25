@@ -71,13 +71,93 @@ type trace_summary = {
   duration_ms : float;
   span_count : int;
   error_count : int;
+  is_running : bool;
+  warning_count : int;
 }
+(** [is_running] and [warning_count] are maintained with the summary, so a
+    broken or in-flight trace is visible from the trace list (tree-6vac). *)
+
+type span_node = {
+  span : span;
+  depth : int;
+  parent_operation_name : string option;
+  root_operation_name : string;
+  is_running : bool;
+  warnings : string list;
+}
+(** [parent_operation_name] is [None] for a root and for a span whose parent id
+    is not in the trace. *)
+(** One span in trace-tree order with its context (tree-3w92, tree-sih1). *)
 
 type trace = {
   summary : trace_summary;
-  spans : span list;
+  spans : span_node list;
   logs : log_record list;
+  warnings : string list;
 }
+
+type token_usage = {
+  input_tokens : int option;
+  output_tokens : int option;
+  total_tokens : int option;
+  cached_input_tokens : int option;
+  reasoning_tokens : int option;
+}
+(** Token counts, each absent when the span does not report it (aic-q5qt). *)
+
+type ai_call = {
+  span_id : string;
+  trace_id : string;
+  service_name : string;
+  operation : string;
+  provider : string option;
+  model : string option;
+  status : string;
+  start_time_ns : int;
+  duration_ms : float option;
+  is_running : bool;
+  finish_reason : string option;
+  session_id : string option;
+  function_id : string option;
+  user_id : string option;
+  tool_call_count : int;
+  usage : token_usage;
+  prompt_preview : string option;
+  response_preview : string option;
+}
+(** The AI call summary both the list and the detail carry (aic-q5qt,
+    aic-kqhv). [duration_ms] is [None] while the call is running. *)
+
+type ai_tool_call = {
+  tool_name : string;
+  tool_span_id : string option;
+  tool_status : string;
+  tool_duration_ms : float option;
+  tool_arguments : string option;
+  tool_result : string option;
+}
+
+type ai_prompt = { messages : Yojson.Safe.t list; raw : string option }
+(** Parsed prompt messages when the attribute value is valid JSON; otherwise the
+    raw value is kept as it was stored. *)
+
+type ai_timing = {
+  time_to_first_chunk_ms : float option;
+  time_to_finish_ms : float option;
+  output_tokens_per_second : float option;
+}
+
+type ai_call_detail = {
+  call : ai_call;
+  prompt : ai_prompt;
+  response_text : string option;
+  response_raw : string option;
+  tool_calls : ai_tool_call list;
+  tools : Yojson.Safe.t list;
+  provider_metadata : Yojson.Safe.t option;
+  timing : ai_timing;
+}
+(** Everything the AI call detail adds to the summary (aic-fy0u). *)
 
 type window = { start_ms : int option }
 (** A resolved query window. [None] is the whole retained history. *)
@@ -131,15 +211,10 @@ type facet_item = {
   count : int;
 }
 
-val is_ai_span : span -> bool
-val ai_model : span -> string option
-val ai_provider : span -> string option
-val ai_session_id : span -> string option
-val ai_function_id : span -> string option
-val ai_input_tokens : span -> int option
-val ai_output_tokens : span -> int option
-val ai_search_text : span -> string
 val attr_string_value : Yojson.Safe.t -> string
+val span_is_running : span -> bool
+(** A span with no end time (zero) or an end before its start is still running
+    (tree-78hm). *)
 val span_kind_to_string : span_kind -> string
 val span_kind_of_string : string -> span_kind option
 val span_status_to_string : span_status -> string
@@ -147,6 +222,11 @@ val span_status_of_string : string -> span_status option
 val attrs_to_json : attrs -> Yojson.Safe.t
 val attrs_json_string : attrs -> string
 val span_to_json : span -> Yojson.Safe.t
+val span_node_to_json : span_node -> Yojson.Safe.t
+(** A span plus [depth], [parentOperationName], [rootOperationName], and its
+    own warnings (tree-3w92, tree-sih1). *)
+val ai_call_to_json : ai_call -> Yojson.Safe.t
+val ai_call_detail_to_json : ai_call_detail -> Yojson.Safe.t
 val log_to_json : log_record -> Yojson.Safe.t
 val metric_point_to_json : metric_point -> Yojson.Safe.t
 val trace_summary_to_json : trace_summary -> Yojson.Safe.t

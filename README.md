@@ -145,9 +145,9 @@ GET /spans/<span-id>/logs
 GET /logs?service=<name>&severity=<text>&contains=<text>&limit=<n>
 GET /logs/search?service=<name>&body=<text>&attr.<key>=<value>
 GET /logs/stats?groupBy=<field>
-GET /ai/calls?model=<model>&provider=<provider>&sessionId=<id>&text=<text>
+GET /ai/calls?model=<model>&provider=<provider>&operation=<name>&finishReason=<text>&text=<text>
 GET /ai/calls/<span-id>
-GET /ai/stats?groupBy=<field>&agg=<count|avg_duration|p95_duration|total_input_tokens|total_output_tokens>
+GET /ai/stats?groupBy=<provider|model|functionId|sessionId|status|operation|finishReason>&agg=<count|avg_duration|p95_duration|total_input_tokens|total_output_tokens|total_tokens|error_rate>
 GET /metrics?service=<name>&name=<metric>&limit=<n>
 GET /facets?type=<traces|logs>&field=<field>&key=<attribute-key>
 GET /stats
@@ -190,6 +190,90 @@ services; add `signal=metrics` to include metrics-only services.
 `/endpoints` lists supported `filters` per route and `/openapi.json`
 publishes typed query parameters; `x-inn-query-prefixes` describes the
 dynamic `attr.<key>` and `attrContains.<key>` keys.
+
+### Trace tree
+
+A trace is a tree, and Inn returns it as one. The trace detail
+(`GET /traces/<id>`), the trace span list (`GET /traces/<id>/spans`), and the
+span detail (`GET /spans/<id>`) share one order and one set of annotations:
+
+- Spans come depth-first from the roots, siblings by start time.
+- Every span carries `depth` (roots are 0) and `rootOperationName`; a span
+  with a parent in the trace also carries `parentOperationName`.
+- A span with no end time (or an end before its start) has `isRunning: true`
+  and a null `durationMs`. The trace is running when any of its spans is.
+- A span whose parent id is not in the trace is treated as a root at depth 0
+  and carries a warning; the trace carries the same warning plus one when it
+  has more than one root. Missing parents are never replaced with synthetic
+  spans.
+- The trace response adds `warnings`, and every trace summary carries
+  `isRunning` and `warningCount`, so broken or in-flight traces are visible
+  from the list.
+- A trace that has spans is served even if its summary row is missing; only a
+  trace with no span at all is a `404`.
+
+### AI calls
+
+Inn classifies AI spans at ingest, and only AI calls are searchable:
+
+- **AI call**: a span from the OpenTelemetry GenAI conventions
+  (`gen_ai.operation.name` such as `chat` or `text_completion`, or
+  `gen_ai.request.model`, or any other `gen_ai.*`/`ai.*` attribute) or a
+  top-level Vercel AI SDK span.
+- **Tool execution**: `gen_ai.operation.name=execute_tool` or a Vercel
+  `ai.toolCall` span. Counted on its AI call, never listed as a call.
+- **Nested provider span**: a Vercel `ai.*.do*` span whose parent is an AI
+  call, such as `ai.generateText.doGenerate`. Excluded from the call list.
+  Without its parent it is the only record of the call and is listed.
+
+`GET /ai/calls` and `GET /ai/stats` read the AI call table written at ingest,
+so they are exact over the window and never scan unrelated spans. Filters are
+`service`, `traceId`, `sessionId`, `functionId`, `provider`, `model`,
+`operation` (substring), `finishReason` (substring), `status`, `text`
+(literal substring of the prompt, response, and tool content, ignoring case),
+`minDurationMs`, `lookback`, and `cursor`. `GET /ai/calls/<span-id>` adds the
+parsed prompt messages, the full response text, the tool calls (name, span id,
+status, duration, arguments, result), the available tools, provider metadata,
+timing (time to first chunk, time to finish, output tokens per second), the
+correlated logs, and links to the parent trace. Asking for the detail of a tool
+execution or a nested provider span is a `404` whose body names the kind and
+points at the AI call parent.
+
+An unsupported `groupBy` or `agg` is a `400` that lists the allowed values.
+
+### AI call field provenance
+
+Every AI call field is read from the OpenTelemetry GenAI semantic conventions
+first and the Vercel AI SDK keys second. This table is the contract for what
+instrumentation must emit.
+
+| Field | GenAI convention | Vercel AI SDK |
+|---|---|---|
+| operation | `gen_ai.operation.name` | `ai.operationId` |
+| provider | `gen_ai.provider.name`, `gen_ai.system` | `ai.model.provider` |
+| model | `gen_ai.request.model`, `gen_ai.response.model` | `ai.model.id` |
+| input tokens | `gen_ai.usage.input_tokens`, `gen_ai.usage.prompt_tokens` | `ai.usage.inputTokens`, `ai.usage.promptTokens` |
+| output tokens | `gen_ai.usage.output_tokens`, `gen_ai.usage.completion_tokens` | `ai.usage.outputTokens`, `ai.usage.completionTokens` |
+| total tokens | `gen_ai.usage.total_tokens` | `ai.usage.totalTokens` (otherwise input + output) |
+| cached input tokens | `gen_ai.usage.cached_input_tokens`, `gen_ai.usage.cache_read.input_tokens` | `ai.usage.cachedInputTokens` |
+| reasoning tokens | `gen_ai.usage.reasoning_tokens` | `ai.usage.reasoningTokens` |
+| finish reason | `gen_ai.response.finish_reasons` | `ai.response.finishReason` |
+| prompt | `gen_ai.input.messages`, `gen_ai.prompt` | `ai.prompt.messages`, `ai.prompt` |
+| response | `gen_ai.output.messages`, `gen_ai.completion` | `ai.response.text`, `ai.response.messages` |
+| available tools | `gen_ai.tool.definitions` | `ai.prompt.tools` |
+| provider metadata | — | `ai.response.providerMetadata` |
+| time to first chunk | `gen_ai.response.time_to_first_chunk` (seconds) | `ai.response.msToFirstChunk` (milliseconds) |
+| time to finish | — | `ai.response.msToFinish` |
+| output tokens per second | — | `ai.response.avgOutputTokensPerSecond` |
+| tool call | `gen_ai.operation.name=execute_tool`, `gen_ai.tool.name`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result` | `ai.toolCall`, `ai.toolCall.name`, `ai.toolCall.args`, `ai.toolCall.result`, `ai.response.toolCalls` |
+| session id | `gen_ai.session.id` | `ai.telemetry.metadata.sessionId` |
+| function id | `gen_ai.function.id` | `ai.telemetry.functionId` |
+| user id | `gen_ai.user.id` | `ai.telemetry.metadata.userId` |
+
+Session and function ids also fall back to `session.id`, `ai.session.id`,
+`function.id`, and `ai.function.id`; a user id also falls back to
+`ai.user.id` and `user.id`. Content values that are JSON strings are parsed
+(the prompt as messages, the response as text) and kept raw otherwise.
 
 ### Windows and cursors
 
@@ -244,15 +328,20 @@ inn search-logs --service api --body timeout --attr-contains route=/users --min-
 inn trace-stats operation count --service api
 inn log-stats severity --service api
 inn facets traces attribute_keys --service api
-inn ai-calls --model gpt-test --provider openai
+inn ai-calls --model gpt-test --provider openai --finish-reason stop
 inn ai-call bbbbbbbbbbbbbbbb
-inn ai-stats model count --service api
+inn ai-stats finishReason count --service api
 inn metrics --service api --name requests.total
 inn stats
 inn endpoints
 inn instructions
 inn openapi
 ```
+
+`inn trace` prints one indented line per span by default — the operation, the
+service, the duration, and an error mark — followed by the trace warnings. Add
+`--json` for the raw trace response. `inn ai-calls` and `inn ai-stats` accept
+`--finish-reason` next to the other AI filters.
 
 Query commands that accept a time window or page through results use
 `--lookback` and `--cursor`; the values are passed to the HTTP API unchanged:
@@ -288,8 +377,10 @@ logs.
 
 List and search tools take `lookback` and `cursor`. `inn_stats`,
 `inn_services`, `inn_trace_stats`, `inn_log_stats`, `inn_facets`, and
-`inn_ai_stats` take `lookback` only. The tool arguments become the same HTTP
-query parameters the CLI sends.
+`inn_ai_stats` take `lookback` only. The AI tools take the same
+`operation`, `finishReason`, `text`, and `minDurationMs` filters the HTTP API
+does, and `inn_ai_stats` groups by every field the API accepts. The tool
+arguments become the same HTTP query parameters the CLI sends.
 
 ## Eta SQL
 
@@ -298,5 +389,11 @@ transactions. Raw SQL is not used in the application storage path. The one
 exception is SQLite pragmas, which have no typed API: `page_count`,
 `freelist_count`, `page_size`, `auto_vacuum`, and `incremental_vacuum` all run
 through one store helper that uses `Eta_sql.Pool.Raw`, the escape hatch
-`Eta_sql.mli` documents for pragmas. Known Eta SQL API gaps found while building
-Inn are recorded in [.spec/ETA_SQL_DOGFOODING.md](.spec/ETA_SQL_DOGFOODING.md).
+`Eta_sql.mli` documents for pragmas. AI token totals are summed over columns
+declared `Q.nullable`, which the typed aggregates reject: `sum_int` and `avg`
+accept only non-nullable columns and the DSL has no SUM over a nullable column.
+Because SQL `SUM` ignores NULL, the AI stats read the same physical token
+columns through a same-table alias declared non-nullable, so a group with no
+reported tokens still decodes as `None`. Known Eta SQL API gaps found while
+building Inn are recorded in
+[.spec/ETA_SQL_DOGFOODING.md](.spec/ETA_SQL_DOGFOODING.md).

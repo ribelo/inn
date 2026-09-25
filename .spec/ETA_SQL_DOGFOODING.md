@@ -29,6 +29,26 @@ the workarounds described here.
 
 ## Remaining Gaps
 
+### Aggregates Over Nullable Columns
+
+The AI call table stores token counts as nullable columns, because "not
+reported" and "zero tokens" are different answers. The typed aggregate
+builders only accept non-nullable columns:
+
+{[
+(* Eta master: [tokens] is declared [Q.nullable Q.int]. *)
+let tokens = Q.Table.column Ai_calls.table "input_tokens" (Q.nullable Q.int)
+let total = Q.Projection.sum_int tokens   (* (_, int) column expected *)
+]}
+
+`sum_int` is `('scope, int) column -> ('scope, int option) t`, and there is no
+`SUM`, `COALESCE`, or `cast` expression for a nullable column, so a nullable
+token column cannot be aggregated without changing its declared type. Inn
+reads the same physical column through `Q.Table.alias` with a non-nullable
+declaration: SQL `SUM` ignores NULL, so the sum is exact and a group with no
+reported tokens decodes as `NULL`/`None`. A `sum_int` (or `coalesce`) that
+accepts `('scope, 'a option) column` would remove the alias.
+
 ### Spin on a File That Is Not a SQLite Database
 
 Found while adding the schema-version check. A pool on a file that is not a

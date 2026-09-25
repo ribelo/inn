@@ -568,10 +568,10 @@ let wait_until ~clock ~timeout_seconds predicate =
 
 (* Recorded together with [Store.schema_version]: change one and you must
    change the other (schm-hnis). *)
-let recorded_schema_fingerprint = "b5e45540023c5e505c6ab5d0b0784786"
+let recorded_schema_fingerprint = "01081774dc377e7be68d0b468b43ce6c"
 
 let test_schema_fingerprint_matches_version () =
-  Alcotest.(check int) "schema version" 4 Store.schema_version;
+  Alcotest.(check int) "schema version" 5 Store.schema_version;
   Alcotest.(check string)
     "schema fingerprint (schm-hnis)" recorded_schema_fingerprint
     Store.schema_fingerprint
@@ -2533,6 +2533,1009 @@ let test_search_filters_and_exact_stats () =
       (json_list "x-inn-query-prefixes" operation))
 
 
+
+(* Trace tree ------------------------------------------------------------ *)
+
+let tree_span ?(trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    ?(span_id = "b000000000000001") ?(parent_span_id = None)
+    ?(service_name = "svc") ?(operation_name = "op") ?(status = "ok")
+    ?(start_ms = base_time) ?(duration_ms = 1.) ?(running = false)
+    ?(attributes = []) () =
+  let start_time_ns = start_ms * 1_000_000 in
+  let span =
+    test_span ~trace_id ~span_id ~parent_span_id ~service_name ~operation_name
+      ~status ~attributes ~timestamp_ms:start_ms ()
+  in
+  {
+    span with
+    Model.end_time_ns =
+      (if running then 0
+       else start_time_ns + int_of_float (duration_ms *. 1_000_000.));
+    duration_ms;
+  }
+
+let node_ids (tree : Trace_tree.t) =
+  List.map (fun (node : Model.span_node) -> node.span.span_id) tree.nodes
+
+let node_depths (tree : Trace_tree.t) =
+  List.map (fun (node : Model.span_node) -> node.depth) tree.nodes
+
+let find_node (tree : Trace_tree.t) span_id =
+  match
+    List.find_opt
+      (fun (node : Model.span_node) -> String.equal node.span.span_id span_id)
+      tree.nodes
+  with
+  | Some node -> node
+  | None -> Alcotest.failf "span %s is missing from the tree" span_id
+
+let json_span_order json =
+  json_list "spans" json
+  |> List.map (fun span ->
+         (json_string_field "spanId" span, json_member "depth" span))
+
+let test_trace_tree_assembly () =
+  (* tree-tflv, tree-3w92, tree-sih1, tree-78hm, tree-ap92 *)
+  let root =
+    tree_span ~span_id:"root" ~operation_name:"GET /" ~service_name:"api"
+      ~start_ms:(base_time - 5_000) ()
+  in
+  let slow =
+    tree_span ~span_id:"slow" ~parent_span_id:(Some "root") ~operation_name:"db"
+      ~start_ms:(base_time - 3_000) ()
+  in
+  let fast =
+    tree_span ~span_id:"fast" ~parent_span_id:(Some "root")
+      ~operation_name:"cache" ~start_ms:(base_time - 4_000) ()
+  in
+  let leaf =
+    tree_span ~span_id:"leaf" ~parent_span_id:(Some "slow")
+      ~operation_name:"select" ~start_ms:(base_time - 2_000) ()
+  in
+  let unrelated =
+    tree_span ~span_id:"other" ~operation_name:"job"
+      ~start_ms:(base_time - 1_000) ()
+  in
+  let tree = Trace_tree.assemble [ leaf; slow; unrelated; root; fast ] in
+  Alcotest.(check (list string))
+    "tree-tflv depth-first from the roots, siblings by start time"
+    [ "root"; "fast"; "slow"; "leaf"; "other" ]
+    (node_ids tree);
+  Alcotest.(check (list int)) "tree-3w92 depth counts from zero at the roots"
+    [ 0; 1; 1; 2; 0 ] (node_depths tree);
+  Alcotest.(check (option string)) "tree-sih1 a root has no parent operation"
+    None (find_node tree "root").parent_operation_name;
+  Alcotest.(check (option string))
+    "tree-sih1 a child carries its parent's operation" (Some "GET /")
+    (find_node tree "fast").parent_operation_name;
+  List.iter
+    (fun id ->
+      Alcotest.(check string)
+        ("tree-sih1 root operation of " ^ id) "GET /"
+        (find_node tree id).root_operation_name)
+    [ "root"; "fast"; "slow"; "leaf" ];
+  Alcotest.(check string) "tree-sih1 a second root is its own root operation"
+    "job" (find_node tree "other").root_operation_name;
+  Alcotest.(check bool) "tree-ap92 two roots are reported" true
+    (List.exists (fun warning -> contains warning "2 roots") tree.warnings);
+  Alcotest.(check bool) "tree-78hm a finished trace is not running" false
+    tree.is_running;
+  let running =
+    tree_span ~span_id:"running" ~operation_name:"llm"
+      ~start_ms:(base_time - 500) ~running:true ()
+  in
+  let running_tree = Trace_tree.assemble [ root; running ] in
+  Alcotest.(check bool) "tree-78hm one unfinished span runs the trace" true
+    running_tree.is_running;
+  let node = find_node running_tree "running" in
+  Alcotest.(check bool) "tree-78hm the span is marked running" true
+    node.is_running;
+  let json = Model.span_node_to_json node in
+  Alcotest.(check bool) "tree-78hm a running span has a null duration" true
+    (json_member "durationMs" json = `Null);
+  Alcotest.(check bool) "tree-3w92 the JSON node carries its depth" true
+    (json_member "depth" json = `Int 0);
+  Alcotest.(check bool) "tree-sih1 the JSON node carries the root operation" true
+    (json_member "rootOperationName" json = `String "llm");
+  Alcotest.(check bool) "tree-78hm an end before the start is running" true
+    (Trace_tree.is_running_span { running with Model.end_time_ns = 1 })
+
+let test_trace_tree_warnings () =
+  (* tree-ffmn, tree-ap92 *)
+  let root =
+    tree_span ~span_id:"root" ~operation_name:"root"
+      ~start_ms:(base_time - 3_000) ()
+  in
+  let orphan =
+    tree_span ~span_id:"orphan" ~parent_span_id:(Some "gone")
+      ~operation_name:"orphan" ~start_ms:(base_time - 2_000) ()
+  in
+  let tree = Trace_tree.assemble [ root; orphan ] in
+  Alcotest.(check (list string)) "tree-ffmn a missing parent is a root"
+    [ "root"; "orphan" ] (node_ids tree);
+  Alcotest.(check (list int)) "tree-ffmn a missing parent sits at depth zero"
+    [ 0; 0 ] (node_depths tree);
+  let node = find_node tree "orphan" in
+  Alcotest.(check (option string))
+    "tree-ffmn a missing parent has no known operation" None
+    node.parent_operation_name;
+  Alcotest.(check int) "tree-ffmn the span carries one warning" 1
+    (List.length node.warnings);
+  Alcotest.(check bool) "tree-ffmn the span warning names the missing parent"
+    true
+    (List.exists (fun warning -> contains warning "gone") node.warnings);
+  Alcotest.(check bool) "tree-ffmn the trace carries the same warning" true
+    (List.exists (fun warning -> contains warning "gone") tree.warnings);
+  Alcotest.(check bool) "tree-ap92 the extra root is still a warning" true
+    (List.exists (fun warning -> contains warning "2 roots") tree.warnings);
+  let left =
+    tree_span ~span_id:"left" ~parent_span_id:(Some "right")
+      ~operation_name:"left" ()
+  in
+  let right =
+    tree_span ~span_id:"right" ~parent_span_id:(Some "left")
+      ~operation_name:"right" ()
+  in
+  let cycle = Trace_tree.assemble [ left; right ] in
+  Alcotest.(check int) "tree-ffmn a parent cycle terminates" 2
+    (List.length cycle.nodes);
+  Alcotest.(check (list string)) "tree-ffmn a cycled span is emitted once"
+    [ "left"; "right" ] (node_ids cycle);
+  Alcotest.(check bool) "tree-ffmn the cycle is reported" true
+    (List.exists (fun warning -> contains warning "cycle") cycle.warnings)
+
+(* Test-only probe: the store never leaves a trace without its summary row, so
+   the 404 rule needs one deleted by hand (tree-ddll). *)
+module Test_trace_summaries = struct
+  module T = Eta_sql.Table.Make (struct
+    let name = "trace_summaries"
+  end)
+
+  include T
+
+  let trace_id = column "trace_id" Eta_sql.text
+end
+
+let delete_trace_summary path trace_id =
+  run_test_db path (fun pool ->
+      let open Eta.Syntax in
+      let delete =
+        Eta_sql.Delete.(
+          from Test_trace_summaries.table
+          |> where Eta_sql.Expr.(eq Test_trace_summaries.trace_id trace_id)
+          |> compile)
+      in
+      let* _ = Eta_sql.Pool.Typed.execute_compiled pool delete in
+      Eta.Effect.pure ())
+
+let test_trace_tree_handlers () =
+  (* tree-o79f, tree-uv04, tree-ddll, tree-6vac, tree-3w92, tree-sih1 *)
+  let config = temp_config () in
+  Fun.protect
+    ~finally:(fun () -> cleanup_config config)
+    (fun () ->
+      let store = run_store (Store.open_ ~now_ms:(fun () -> base_time) config) in
+      Fun.protect
+        ~finally:(fun () -> run_store (Store.close store))
+        (fun () ->
+          let trace_id = "dddddddddddddddddddddddddddddddd" in
+          let root_id = "d000000000000001"
+          and child_id = "d000000000000002"
+          and running_id = "d000000000000003" in
+          let root =
+            tree_span ~trace_id ~span_id:root_id ~operation_name:"root"
+              ~service_name:"api" ~start_ms:(base_time - 4_000) ()
+          in
+          let child =
+            tree_span ~trace_id ~span_id:child_id
+              ~parent_span_id:(Some root_id) ~operation_name:"child"
+              ~service_name:"api" ~start_ms:(base_time - 3_000) ()
+          in
+          let running =
+            tree_span ~trace_id ~span_id:running_id
+              ~parent_span_id:(Some root_id) ~operation_name:"running"
+              ~service_name:"api" ~start_ms:(base_time - 2_000) ~running:true ()
+          in
+          ignore
+            (run_store
+               (let open Eta.Syntax in
+                let* _ = Store.ingest_traces store [ root; child; running ] in
+                Eta.Effect.pure ()));
+          let detail = server_json config store ("/traces/" ^ trace_id) in
+          let spans = json_list "spans" detail in
+          Alcotest.(check (list string))
+            "tree-uv04 the trace detail is in tree order"
+            [ root_id; child_id; running_id ]
+            (List.map (fun span -> json_string_field "spanId" span) spans);
+          Alcotest.(check (list int)) "tree-3w92 the trace detail depths"
+            [ 0; 1; 1 ]
+            (List.map
+               (fun span ->
+                 match json_member "depth" span with
+                 | `Int value -> value
+                 | _ -> -1)
+               spans);
+          Alcotest.(check (option string))
+            "tree-sih1 the detail carries the parent operation"
+            (Some "root")
+            (match json_member "parentOperationName" (List.nth spans 1) with
+            | `String value -> Some value
+            | _ -> None);
+          Alcotest.(check string)
+            "tree-sih1 the detail carries the root operation" "root"
+            (json_string_field "rootOperationName" (List.nth spans 1));
+          Alcotest.(check bool) "tree-78hm the detail marks the running span"
+            true
+            (json_member "isRunning" (List.nth spans 2) = `Bool true);
+          Alcotest.(check bool)
+            "tree-78hm the running span has a null duration" true
+            (json_member "durationMs" (List.nth spans 2) = `Null);
+          Alcotest.(check (list string)) "tree-ffmn a clean trace has no warnings" []
+            (List.map (function `String value -> value | json -> Yojson.Safe.to_string json) (json_list "warnings" detail));
+          let summary = json_member "summary" detail in
+          Alcotest.(check bool) "tree-78hm the trace summary is running" true
+            (json_member "isRunning" summary = `Bool true);
+          Alcotest.(check int) "tree-ffmn the summary warning count" 0
+            (match json_member "warningCount" summary with
+            | `Int value -> value
+            | _ -> -1);
+          let listed =
+            server_json config store
+              ("/traces/" ^ trace_id ^ "/spans?lookback=all")
+          in
+          Alcotest.(check (list (pair string string)))
+            "tree-uv04 the trace spans list agrees with the detail"
+            (List.map
+               (fun (id, depth) -> (id, Yojson.Safe.to_string depth))
+               (json_span_order detail))
+            (List.map
+               (fun (id, depth) -> (id, Yojson.Safe.to_string depth))
+               (json_span_order listed));
+          let node = server_json config store ("/spans/" ^ child_id) in
+          Alcotest.(check bool) "tree-o79f the span detail carries its depth"
+            true (json_member "depth" node = `Int 1);
+          Alcotest.(check bool)
+            "tree-o79f the span detail carries the parent operation" true
+            (json_member "parentOperationName" node = `String "root");
+          Alcotest.(check bool)
+            "tree-o79f the span detail carries the root operation" true
+            (json_member "rootOperationName" node = `String "root");
+          let summaries =
+            json_list "traces" (server_json config store "/traces?lookback=all")
+          in
+          let listed_summary = List.hd summaries in
+          Alcotest.(check bool)
+            "tree-6vac the summary list marks running traces" true
+            (json_member "isRunning" listed_summary = `Bool true);
+          Alcotest.(check bool)
+            "tree-6vac the summary list carries the warning count" true
+            (match json_member "warningCount" listed_summary with
+            | `Int _ -> true
+            | _ -> false);
+          delete_trace_summary config.Config.db_path trace_id;
+          let still = server_get config store ("/traces/" ^ trace_id) in
+          Alcotest.(check int)
+            "tree-ddll a trace without its summary row still answers" 200
+            (Eta_http.Server.Response.status still);
+          Alcotest.(check int) "tree-ddll and still has all its spans" 3
+            (List.length (json_list "spans" (response_json still)));
+          let missing =
+            server_get config store
+              "/traces/00000000000000000000000000000000"
+          in
+          Alcotest.(check int)
+            "tree-ddll a trace with no span at all is a 404" 404
+            (Eta_http.Server.Response.status missing)))
+
+(* AI calls -------------------------------------------------------------- *)
+
+let ai_attrs pairs = List.map (fun (key, value) -> (key, `String value)) pairs
+
+let ai_span ?(trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    ?(span_id = "b000000000000001") ?(parent_span_id = None)
+    ?(service_name = "ai-app") ?(operation_name = "chat") ?(status = "ok")
+    ?(start_ms = base_time) ?(duration_ms = 10.) ?(running = false)
+    ?(attributes : Model.attrs = []) () =
+  let start_time_ns = start_ms * 1_000_000 in
+  let span =
+    test_span ~trace_id ~span_id ~parent_span_id ~service_name ~operation_name
+      ~status ~timestamp_ms:start_ms ()
+  in
+  {
+    span with
+    Model.end_time_ns =
+      (if running then 0
+       else start_time_ns + int_of_float (duration_ms *. 1_000_000.));
+    duration_ms;
+    attributes;
+  }
+
+(* An Eta gen_ai chat span: what eta_ai emits through provider_telemetry.ml. *)
+let eta_chat_span ?(trace_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+    ?(span_id = "e000000000000001") ?(parent_span_id = None) () =
+  ai_span ~trace_id ~span_id ~parent_span_id ~service_name:"eta-app"
+    ~operation_name:"chat gpt-4o" ~duration_ms:5_000.
+    ~attributes:
+      (ai_attrs
+         [
+           ("gen_ai.operation.name", "chat");
+           ("gen_ai.provider.name", "openai");
+           ("gen_ai.request.model", "gpt-4o");
+           ("gen_ai.response.model", "gpt-4o-2024-08-06");
+           ("gen_ai.response.finish_reasons", "stop");
+           ("gen_ai.response.time_to_first_chunk", "0.250");
+           ("gen_ai.usage.input_tokens", "120");
+           ("gen_ai.usage.output_tokens", "48");
+           ( "gen_ai.input.messages",
+             {|[{"role":"user","content":"book a flight"}]|} );
+           ( "gen_ai.output.messages",
+             {|[{"role":"assistant","content":[{"type":"text","text":"booked"}]}]|}
+           );
+           ("ai.telemetry.functionId", "trip.plan");
+           ("ai.telemetry.metadata.sessionId", "session-3");
+           ("gen_ai.user.id", "user-7");
+         ])
+    ()
+
+let eta_tool_span ?(trace_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+    ?(span_id = "e000000000000002") ?(parent_span_id = Some "e000000000000001")
+    () =
+  ai_span ~trace_id ~span_id ~parent_span_id ~service_name:"eta-app"
+    ~operation_name:"execute_tool get_weather" ~duration_ms:5.
+    ~attributes:
+      (ai_attrs
+         [
+           ("gen_ai.operation.name", "execute_tool");
+           ("gen_ai.tool.name", "get_weather");
+           ("gen_ai.tool.call.arguments", {|{"city":"Paris"}|});
+           ("gen_ai.tool.call.result", "sunny");
+         ])
+    ()
+
+let kind_of spans span =
+  match
+    List.find_opt (fun (candidate, _) -> candidate == span) (Ai.classify_spans spans)
+  with
+  | Some (_, kind) -> Ai.classification_to_string kind
+  | None -> Alcotest.fail "span is not in the classified list"
+
+let test_ai_classification () =
+  (* aic-cw6h, aic-jupv, aic-qs41 *)
+  let eta = eta_chat_span () in
+  Alcotest.(check string)
+    "aic-cw6h a GenAI chat span is an AI call" "call"
+    (kind_of [ eta ] eta);
+  let effect_chat =
+    ai_span ~trace_id:"ffffffffffffffffffffffffffffffff"
+      ~span_id:"f000000000000001" ~service_name:"effect-app"
+      ~operation_name:"openai.chat"
+      ~attributes:
+        (ai_attrs
+           [ ("gen_ai.operation.name", "chat"); ("gen_ai.system", "openai") ])
+      ()
+  in
+  let tool =
+    ai_span ~trace_id:"ffffffffffffffffffffffffffffffff"
+      ~span_id:"f000000000000002" ~parent_span_id:(Some "f000000000000001")
+      ~service_name:"effect-app" ~operation_name:"execute_tool get_weather"
+      ~attributes:
+        (ai_attrs
+           [
+             ("gen_ai.operation.name", "execute_tool");
+             ("gen_ai.tool.name", "get_weather");
+           ])
+      ()
+  in
+  Alcotest.(check string)
+    "aic-qs41 gen_ai execute_tool is a tool execution, not a call" "tool"
+    (kind_of [ effect_chat; tool ] tool);
+  Alcotest.(check string) "aic-cw6h its parent GenAI span is still the call"
+    "call" (kind_of [ effect_chat; tool ] effect_chat);
+  Alcotest.(check bool) "aic-qs41 a tool span is not AI-detected" false
+    (Ai.is_ai_span tool);
+  Alcotest.(check int) "aic-q5qt the tool call is counted on the call" 1
+    (Ai.call_of_span ~children:[ tool ] effect_chat).tool_call_count;
+  let vercel =
+    ai_span ~trace_id:"abababababababababababababababab"
+      ~span_id:"a000000000000001" ~service_name:"vercel-app"
+      ~operation_name:"ai.generateText"
+      ~attributes:
+        (ai_attrs
+           [
+             ("ai.operationId", "ai.generateText");
+             ("ai.model.id", "gpt-4o-mini");
+             ("ai.model.provider", "openai");
+           ])
+      ()
+  in
+  let do_generate =
+    ai_span ~trace_id:"abababababababababababababababab"
+      ~span_id:"a000000000000002" ~parent_span_id:(Some "a000000000000001")
+      ~service_name:"vercel-app" ~operation_name:"ai.generateText.doGenerate"
+      ~attributes:
+        (ai_attrs
+           [
+             ("ai.operationId", "ai.generateText.doGenerate");
+             ("ai.model.id", "gpt-4o-mini");
+           ])
+      ()
+  in
+  let vercel_tool =
+    ai_span ~trace_id:"abababababababababababababababab"
+      ~span_id:"a000000000000003" ~parent_span_id:(Some "a000000000000001")
+      ~service_name:"vercel-app" ~operation_name:"ai.toolCall"
+      ~attributes:
+        (ai_attrs
+           [
+             ("ai.operationId", "ai.toolCall");
+             ("ai.toolCall.name", "weather");
+           ])
+      ()
+  in
+  let vercel_spans = [ vercel; do_generate; vercel_tool ] in
+  Alcotest.(check string)
+    "aic-cw6h the Vercel top-level span is an AI call" "call"
+    (kind_of vercel_spans vercel);
+  Alcotest.(check string)
+    "aic-jupv doGenerate under an AI call is a nested provider span" "nested"
+    (kind_of vercel_spans do_generate);
+  Alcotest.(check string) "aic-qs41 ai.toolCall is a tool execution" "tool"
+    (kind_of vercel_spans vercel_tool);
+  Alcotest.(check string)
+    "aic-jupv without its parent the provider span is the call" "call"
+    (kind_of [ do_generate ] do_generate);
+  Alcotest.(check int) "aic-jupv only the top-level span is listed" 1
+    (List.length
+       (List.filter
+          (fun (_, kind) -> kind = Ai.Ai_call)
+          (Ai.classify_spans vercel_spans)))
+
+let test_ai_extraction () =
+  (* aic-q5qt, aic-kqhv, aic-fy0u, aic-gywl, aic-cw6h *)
+  let eta = eta_chat_span () in
+  let tool = eta_tool_span () in
+  let children = [ tool ] in
+  let call = Ai.call_of_span ~children eta in
+  Alcotest.(check string) "aic-q5qt operation comes from the GenAI convention"
+    "chat" call.operation;
+  Alcotest.(check string) "aic-q5qt service" "eta-app" call.service_name;
+  Alcotest.(check (option string)) "aic-q5qt provider" (Some "openai")
+    call.provider;
+  Alcotest.(check (option string)) "aic-q5qt model" (Some "gpt-4o") call.model;
+  Alcotest.(check string) "aic-q5qt status" "ok" call.status;
+  Alcotest.(check bool) "aic-q5qt start time" true
+    (call.start_time_ns = base_time * 1_000_000);
+  Alcotest.(check (option (float 0.001))) "aic-q5qt duration" (Some 5_000.)
+    call.duration_ms;
+  Alcotest.(check (option string)) "aic-q5qt finish reason" (Some "stop")
+    call.finish_reason;
+  Alcotest.(check (option string)) "aic-q5qt session id" (Some "session-3")
+    call.session_id;
+  Alcotest.(check (option string)) "aic-q5qt function id" (Some "trip.plan")
+    call.function_id;
+  Alcotest.(check (option string)) "aic-q5qt user id" (Some "user-7")
+    call.user_id;
+  Alcotest.(check int) "aic-q5qt tool call count" 1 call.tool_call_count;
+  Alcotest.(check (option int)) "aic-q5qt input tokens" (Some 120)
+    call.usage.input_tokens;
+  Alcotest.(check (option int)) "aic-q5qt output tokens" (Some 48)
+    call.usage.output_tokens;
+  Alcotest.(check (option int)) "aic-q5qt total tokens are derived" (Some 168)
+    call.usage.total_tokens;
+  Alcotest.(check (option string)) "aic-kqhv the prompt preview is text"
+    (Some "book a flight") call.prompt_preview;
+  Alcotest.(check (option string)) "aic-kqhv the response preview is text"
+    (Some "booked") call.response_preview;
+  let long_prompt = String.make 500 'x' in
+  let long =
+    ai_span ~trace_id:"ffffffffffffffffffffffffffffffff"
+      ~span_id:"f000000000000009" ~service_name:"effect-app"
+      ~operation_name:"generateText"
+      ~attributes:
+        (ai_attrs
+           [ ("ai.prompt", long_prompt); ("ai.response.text", long_prompt) ])
+      ()
+  in
+  let long_call = Ai.call_of_span ~children:[] long in
+  Alcotest.(check (option int)) "aic-kqhv previews stop at 200 characters"
+    (Some 200)
+    (Option.map String.length long_call.prompt_preview);
+  Alcotest.(check (option int)) "aic-kqhv response previews stop at 200 too"
+    (Some 200)
+    (Option.map String.length long_call.response_preview);
+  let detail = Ai.detail_of_span ~children eta in
+  Alcotest.(check int) "aic-fy0u the parsed prompt messages" 1
+    (List.length detail.prompt.messages);
+  Alcotest.(check (option string)) "aic-fy0u the raw prompt is kept"
+    (Some {|[{"role":"user","content":"book a flight"}]|})
+    detail.prompt.raw;
+  Alcotest.(check (option string)) "aic-fy0u the full response text"
+    (Some "booked") detail.response_text;
+  Alcotest.(check int) "aic-fy0u the tool call is listed" 1
+    (List.length detail.tool_calls);
+  let tool_call = List.hd detail.tool_calls in
+  Alcotest.(check string) "aic-fy0u the tool call name" "get_weather"
+    tool_call.tool_name;
+  Alcotest.(check (option string)) "aic-fy0u the tool call span id"
+    (Some "e000000000000002") tool_call.tool_span_id;
+  Alcotest.(check (option string)) "aic-fy0u the tool call arguments"
+    (Some {|{"city":"Paris"}|}) tool_call.tool_arguments;
+  Alcotest.(check (option string)) "aic-fy0u the tool call result"
+    (Some "sunny") tool_call.tool_result;
+  Alcotest.(check (option (float 0.001))) "aic-fy0u time to first chunk in ms"
+    (Some 250.) detail.timing.time_to_first_chunk_ms;
+  Alcotest.(check (option (float 0.001))) "aic-fy0u time to finish in ms"
+    (Some 4_750.) detail.timing.time_to_finish_ms;
+  Alcotest.(check (option (float 0.001))) "aic-fy0u output tokens per second"
+    (Some (48. /. 4.75)) detail.timing.output_tokens_per_second;
+  let vercel =
+    ai_span ~trace_id:"abababababababababababababababab"
+      ~span_id:"a000000000000001" ~service_name:"vercel-app"
+      ~operation_name:"ai.generateText" ~duration_ms:1_000.
+      ~attributes:
+        (ai_attrs
+           [
+             ("ai.operationId", "ai.generateText");
+             ("ai.model.id", "gpt-4o-mini");
+             ("ai.prompt.messages", {|[{"role":"user","content":"hi"}]|});
+             ("ai.prompt.tools", {|[{"name":"weather"}]|});
+             ("ai.response.text", "hello there");
+             ("ai.response.finishReason", "stop");
+             ("ai.response.msToFirstChunk", "80");
+             ("ai.response.providerMetadata", {|{"openai":{"serviceTier":"default"}}|});
+             ("ai.usage.outputTokens", "20");
+             ("ai.response.toolCalls",
+              {|[{"toolName":"weather","input":{"city":"Paris"}}]|});
+           ])
+      ()
+  in
+  let vercel_detail = Ai.detail_of_span ~children:[] vercel in
+  Alcotest.(check (option string)) "aic-fy0u the Vercel response text"
+    (Some "hello there") vercel_detail.response_text;
+  Alcotest.(check int) "aic-fy0u the available tools are parsed" 1
+    (List.length vercel_detail.tools);
+  Alcotest.(check bool) "aic-fy0u provider metadata is parsed" true
+    (match vercel_detail.provider_metadata with
+    | Some (`Assoc _) -> true
+    | _ -> false);
+  Alcotest.(check int) "aic-fy0u the response tool calls are listed" 1
+    (List.length vercel_detail.tool_calls);
+  Alcotest.(check (option (float 0.001))) "aic-fy0u msToFirstChunk stays in ms"
+    (Some 80.) vercel_detail.timing.time_to_first_chunk_ms;
+  Alcotest.(check (option (float 0.001))) "aic-fy0u msToFinish is the remainder"
+    (Some 920.) vercel_detail.timing.time_to_finish_ms;
+  Alcotest.(check (option (float 0.001))) "aic-fy0u Vercel tokens per second"
+    (Some (20. /. 0.92)) vercel_detail.timing.output_tokens_per_second;
+  (* Typed OTLP values are read as they were decoded, not re-parsed from text. *)
+  let typed =
+    ai_span ~trace_id:"ffffffffffffffffffffffffffffffff"
+      ~span_id:"f00000000000000a" ~service_name:"effect-app"
+      ~operation_name:"generateText"
+      ~attributes:
+        [
+          ("gen_ai.operation.name", `String "chat");
+          ("gen_ai.request.model", `String "typed-model");
+          ("gen_ai.usage.input_tokens", `Int 12);
+          ("gen_ai.usage.output_tokens", `Int 3);
+        ]
+      ()
+  in
+  let typed_call = Ai.call_of_span ~children:[] typed in
+  Alcotest.(check (option int)) "aic-q5qt typed token counts are used directly"
+    (Some 12) typed_call.usage.input_tokens;
+  Alcotest.(check (option int)) "aic-q5qt typed totals are derived" (Some 15)
+    typed_call.usage.total_tokens;
+  (* GenAI content events are honored when no content attribute is present. *)
+  let evented =
+    {
+      (ai_span ~trace_id:"ffffffffffffffffffffffffffffffff"
+         ~span_id:"f00000000000000b" ~service_name:"eta-app"
+         ~operation_name:"chat evented"
+         ~attributes:(ai_attrs [ ("gen_ai.operation.name", "chat") ])
+         ())
+      with
+      Model.events =
+        [
+          {
+            Model.name = "gen_ai.content.prompt";
+            timestamp_ns = base_time * 1_000_000;
+            attributes =
+              ai_attrs
+                [ ("gen_ai.prompt", {|[{"role":"user","content":"evented"}]|}) ];
+          };
+        ];
+    }
+  in
+  let evented_detail = Ai.detail_of_span ~children:[] evented in
+  Alcotest.(check (option string)) "aic-kqhv a GenAI prompt event is read"
+    (Some "evented") (Ai.call_of_span ~children:[] evented).prompt_preview;
+  Alcotest.(check int) "aic-fy0u a GenAI prompt event parses into messages" 1
+    (List.length evented_detail.prompt.messages);
+  let search = Ai.search_text ~children eta in
+  Alcotest.(check bool) "aic-gywl text covers the prompt" true
+    (contains search "book a flight");
+  Alcotest.(check bool) "aic-gywl text covers the response" true
+    (contains search "booked");
+  Alcotest.(check bool) "aic-gywl text covers tool arguments" true
+    (contains search "Paris");
+  Alcotest.(check bool) "aic-gywl text covers tool results" true
+    (contains search "sunny")
+
+let test_ai_call_store_and_handlers () =
+  (* aic-cw6h, aic-jupv, aic-qs41, aic-q5qt, aic-hjcg, aic-yfcd, aic-gywl,
+     aic-qpv6, aic-e67r, aic-t8tl *)
+  let config = temp_config () in
+  Fun.protect
+    ~finally:(fun () -> cleanup_config config)
+    (fun () ->
+      let store = run_store (Store.open_ ~now_ms:(fun () -> base_time) config) in
+      Fun.protect
+        ~finally:(fun () -> run_store (Store.close store))
+        (fun () ->
+          let trace_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" in
+          let call_id = "e000000000000001"
+          and tool_id = "e000000000000002"
+          and nested_id = "e000000000000003" in
+          let eta = eta_chat_span ~trace_id ~span_id:call_id () in
+          let tool = eta_tool_span ~trace_id ~span_id:tool_id
+              ~parent_span_id:(Some call_id) () in
+          let nested =
+            ai_span ~trace_id ~span_id:nested_id
+              ~parent_span_id:(Some call_id) ~service_name:"eta-app"
+              ~operation_name:"ai.generateText.doGenerate" ~duration_ms:30.
+              ~attributes:
+                (ai_attrs
+                   [
+                     ("ai.operationId", "ai.generateText.doGenerate");
+                     ("ai.model.id", "gpt-4o");
+                   ])
+              ()
+          in
+          let failing_trace = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1" in
+          let failing_id = "a100000000000001" in
+          let failing =
+            ai_span ~trace_id:failing_trace ~span_id:failing_id
+              ~service_name:"other-app" ~operation_name:"completion"
+              ~status:"error" ~duration_ms:100_000. ~start_ms:(base_time - (2 * hour_ms))
+              ~attributes:
+                (ai_attrs
+                   [
+                     ("gen_ai.operation.name", "text_completion");
+                     ("gen_ai.provider.name", "anthropic");
+                     ("gen_ai.request.model", "claude-3");
+                     ("gen_ai.response.finish_reasons", "length");
+                     ("gen_ai.usage.input_tokens", "10");
+                     ("gen_ai.usage.output_tokens", "4");
+                     ("gen_ai.input.messages",
+                      {|[{"role":"user","content":"summarize"}]|});
+                   ])
+              ()
+          in
+          let log =
+            {
+              (test_log ~body:"tool finished"
+                 ~attributes:[ ("ai.model.id", "gpt-4o") ] ())
+              with
+              Model.trace_id = Some trace_id;
+              span_id = Some call_id;
+            }
+          in
+          ignore
+            (run_store
+               (let open Eta.Syntax in
+                let* _ = Store.ingest_traces store [ eta; tool; nested; failing ] in
+                let* _ = Store.ingest_logs store [ log ] in
+                Eta.Effect.pure ()));
+          let calls path = json_list "calls" (server_json config store path) in
+          let all = calls "/ai/calls?lookback=all" in
+          Alcotest.(check int)
+            "aic-cw6h only classified AI calls are listed" 2 (List.length all);
+          let call =
+            List.find
+              (fun json -> json_member "spanId" json = `String call_id)
+              all
+          in
+          Alcotest.(check bool)
+            "aic-jupv the nested provider span is not listed" true
+            (not
+               (List.exists
+                  (fun json -> json_member "spanId" json = `String nested_id)
+                  all));
+          Alcotest.(check bool)
+            "aic-qs41 the tool execution is not listed" true
+            (not
+               (List.exists
+                  (fun json -> json_member "spanId" json = `String tool_id)
+                  all));
+          Alcotest.(check string) "aic-q5qt the summary operation" "chat"
+            (json_string_field "operation" call);
+          Alcotest.(check string) "aic-q5qt the summary service" "eta-app"
+            (json_string_field "serviceName" call);
+          Alcotest.(check string) "aic-q5qt the summary provider" "openai"
+            (json_string_field "provider" call);
+          Alcotest.(check string) "aic-q5qt the summary model" "gpt-4o"
+            (json_string_field "model" call);
+          Alcotest.(check string) "aic-q5qt the summary status" "ok"
+            (json_string_field "status" call);
+          Alcotest.(check string) "aic-q5qt the summary finish reason" "stop"
+            (json_string_field "finishReason" call);
+          Alcotest.(check string) "aic-q5qt the summary session id" "session-3"
+            (json_string_field "sessionId" call);
+          Alcotest.(check string) "aic-q5qt the summary function id" "trip.plan"
+            (json_string_field "functionId" call);
+          Alcotest.(check string) "aic-q5qt the summary user id" "user-7"
+            (json_string_field "userId" call);
+          Alcotest.(check bool) "aic-q5qt the summary start time" true
+            (match json_member "startTimeMs" call with
+            | `Float _ -> true
+            | _ -> false);
+          Alcotest.(check (float 0.001)) "aic-q5qt the summary duration" 5_000.
+            (match json_member "durationMs" call with
+            | `Float value -> value
+            | _ -> -1.);
+          Alcotest.(check bool) "aic-q5qt the summary tool call count" true
+            (json_member "toolCallCount" call = `Int 1);
+          let usage = json_member "usage" call in
+          Alcotest.(check bool) "aic-q5qt nullable token counts" true
+            (json_member "inputTokens" usage = `Int 120
+            && json_member "outputTokens" usage = `Int 48
+            && json_member "totalTokens" usage = `Int 168
+            && json_member "cachedInputTokens" usage = `Null
+            && json_member "reasoningTokens" usage = `Null);
+          Alcotest.(check string) "aic-kqhv the summary prompt preview"
+            "book a flight" (json_string_field "promptPreview" call);
+          Alcotest.(check string) "aic-kqhv the summary response preview"
+            "booked" (json_string_field "responsePreview" call);
+          Alcotest.(check int) "aic-yfcd the model filter" 1
+            (List.length (calls "/ai/calls?lookback=all&model=claude-3"));
+          Alcotest.(check int) "aic-yfcd the provider filter" 1
+            (List.length (calls "/ai/calls?lookback=all&provider=anthropic"));
+          Alcotest.(check int) "aic-yfcd the operation filter is a substring" 1
+            (List.length (calls "/ai/calls?lookback=all&operation=text_comp"));
+          Alcotest.(check int) "aic-yfcd the finish reason filter" 1
+            (List.length (calls "/ai/calls?lookback=all&finishReason=length"));
+          Alcotest.(check int) "aic-yfcd the session filter" 1
+            (List.length (calls "/ai/calls?lookback=all&sessionId=session-3"));
+          Alcotest.(check int) "aic-yfcd the function filter" 1
+            (List.length (calls "/ai/calls?lookback=all&functionId=trip.plan"));
+          Alcotest.(check int) "aic-yfcd the status filter" 1
+            (List.length (calls "/ai/calls?lookback=all&status=error"));
+          Alcotest.(check int) "aic-yfcd the duration filter" 1
+            (List.length (calls "/ai/calls?lookback=all&minDurationMs=50000"));
+          Alcotest.(check int) "aic-yfcd the lookback filter" 1
+            (List.length (calls "/ai/calls?lookback=1h"));
+          Alcotest.(check int)
+            "aic-gywl text matches the prompt, ignoring case" 1
+            (List.length (calls "/ai/calls?lookback=all&text=BOOK%20A%20FLIGHT"));
+          Alcotest.(check int) "aic-gywl text matches the response" 1
+            (List.length (calls "/ai/calls?lookback=all&text=BOOKED"));
+          Alcotest.(check int) "aic-gywl text matches tool arguments" 1
+            (List.length (calls "/ai/calls?lookback=all&text=paris"));
+          Alcotest.(check int) "aic-gywl text matches tool results" 1
+            (List.length (calls "/ai/calls?lookback=all&text=SUNNY"));
+          ignore
+            (check_walk ~config ~store ~name:"calls"
+               ~key:(fun json ->
+                 json_string_field "traceId" json ^ ":"
+                 ^ json_string_field "spanId" json)
+               ~limit:1 "/ai/calls?lookback=all");
+          let detail =
+            server_json config store ("/ai/calls/" ^ call_id)
+          in
+          let detail_call = json_member "call" detail in
+          Alcotest.(check string) "aic-fy0u the detail repeats the summary"
+            call_id (json_string_field "spanId" detail_call);
+          Alcotest.(check int) "aic-fy0u the detail parses the prompt messages" 1
+            (List.length (json_list "messages" (json_member "prompt" detail)));
+          Alcotest.(check string) "aic-fy0u the detail response text" "booked"
+            (json_string_field "text" (json_member "response" detail));
+          Alcotest.(check int) "aic-fy0u the detail lists tool calls" 1
+            (List.length (json_list "toolCalls" detail));
+          Alcotest.(check string) "aic-fy0u the tool call name" "get_weather"
+            (json_string_field "name" (List.hd (json_list "toolCalls" detail)));
+          Alcotest.(check bool) "aic-fy0u the detail carries timing" true
+            (match json_member "timeToFirstChunkMs" (json_member "timing" detail) with
+            | `Float _ -> true
+            | _ -> false);
+          Alcotest.(check bool) "aic-fy0u the detail carries the raw span" true
+            (json_member "span" detail <> `Null);
+          Alcotest.(check int) "aic-hjcg the detail carries correlated logs" 1
+            (List.length (json_list "logs" detail));
+          Alcotest.(check string) "aic-hjcg the detail links to the parent trace"
+            ("http://127.0.0.1:" ^ string_of_int config.Config.port ^ "/traces/"
+           ^ trace_id)
+            (json_string_field "trace" (json_member "links" detail));
+          let statements path = json_list "stats" (server_json config store path) in
+          let group path name =
+            let rows = statements path in
+            match
+              List.find_opt
+                (fun row -> json_member "group" row = `String name)
+                rows
+            with
+            | Some row -> row
+            | None -> Alcotest.failf "%s has no group %s" path name
+          in
+          Alcotest.(check int) "aic-qpv6 group by provider" 2
+            (List.length (statements "/ai/stats?lookback=all&groupBy=provider&agg=count"));
+          Alcotest.(check bool) "aic-qpv6 provider counts are exact" true
+            (json_member "count"
+               (group "/ai/stats?lookback=all&groupBy=provider&agg=count" "openai")
+            = `Int 1);
+          Alcotest.(check bool) "aic-qpv6 group by model counts" true
+            (json_member "count"
+               (group "/ai/stats?lookback=all&groupBy=model&agg=count" "gpt-4o")
+            = `Int 1);
+          Alcotest.(check bool) "aic-qpv6 group by operation" true
+            (json_member "count"
+               (group "/ai/stats?lookback=all&groupBy=operation&agg=count" "chat")
+            = `Int 1);
+          Alcotest.(check bool) "aic-qpv6 group by finishReason" true
+            (json_member "count"
+               (group "/ai/stats?lookback=all&groupBy=finishReason&agg=count"
+                  "length")
+            = `Int 1);
+          Alcotest.(check bool) "aic-qpv6 group by functionId reports unknown"
+            true
+            (json_member "count"
+               (group "/ai/stats?lookback=all&groupBy=functionId&agg=count"
+                  "unknown")
+            = `Int 1);
+          Alcotest.(check bool) "aic-qpv6 group by sessionId reports unknown"
+            true
+            (json_member "count"
+               (group "/ai/stats?lookback=all&groupBy=sessionId&agg=count"
+                  "unknown")
+            = `Int 1);
+          Alcotest.(check bool) "aic-qpv6 error rate is exact" true
+            (match
+               json_member "value"
+                 (group "/ai/stats?lookback=all&groupBy=status&agg=error_rate"
+                    "error")
+             with
+            | `Float value -> Float.abs (value -. 1.) < 0.0001
+            | _ -> false);
+          Alcotest.(check bool) "aic-qpv6 avg duration is exact" true
+            (match
+               json_member "value"
+                 (group "/ai/stats?lookback=all&groupBy=model&agg=avg_duration"
+                    "gpt-4o")
+             with
+            | `Float value -> Float.abs (value -. 5000.) < 0.0001
+            | _ -> false);
+          Alcotest.(check bool) "aic-qpv6 p95 duration is exact" true
+            (match
+               json_member "value"
+                 (group "/ai/stats?lookback=all&groupBy=model&agg=p95_duration"
+                    "gpt-4o")
+             with
+            | `Float value -> Float.abs (value -. 5000.) < 0.0001
+            | _ -> false);
+          Alcotest.(check bool) "aic-qpv6 total input tokens are exact" true
+            (match
+               json_member "value"
+                 (group "/ai/stats?lookback=all&groupBy=model&agg=total_input_tokens"
+                    "gpt-4o")
+             with
+            | `Float value -> Float.abs (value -. 120.) < 0.0001
+            | _ -> false);
+          Alcotest.(check bool) "aic-qpv6 total output tokens are exact" true
+            (match
+               json_member "value"
+                 (group "/ai/stats?lookback=all&groupBy=model&agg=total_output_tokens"
+                    "claude-3")
+             with
+            | `Float value -> Float.abs (value -. 4.) < 0.0001
+            | _ -> false);
+          Alcotest.(check bool) "aic-qpv6 total tokens are exact" true
+            (match
+               json_member "value"
+                 (group "/ai/stats?lookback=all&groupBy=model&agg=total_tokens"
+                    "claude-3")
+             with
+            | `Float value -> Float.abs (value -. 14.) < 0.0001
+            | _ -> false);
+          check_invalid_query "aic-e67r an unknown groupBy"
+            (server_get config store
+               "/ai/stats?lookback=all&groupBy=bogus&agg=count")
+            "groupBy must be one of";
+          let invalid_group =
+            response_json
+              (server_get config store
+                 "/ai/stats?lookback=all&groupBy=bogus&agg=count")
+          in
+          Alcotest.(check bool) "aic-e67r it lists every allowed group" true
+            (List.for_all
+               (fun name -> contains (json_string_field "message" invalid_group) name)
+               [ "provider"; "model"; "functionId"; "sessionId"; "status";
+                 "operation"; "finishReason" ]);
+          let invalid_agg =
+            response_json
+              (server_get config store
+                 "/ai/stats?lookback=all&groupBy=model&agg=bogus")
+          in
+          check_invalid_query "aic-e67r an unknown agg"
+            (server_get config store
+               "/ai/stats?lookback=all&groupBy=model&agg=bogus")
+            "agg must be one of";
+          Alcotest.(check bool) "aic-e67r it lists every allowed agg" true
+            (List.for_all
+               (fun name -> contains (json_string_field "message" invalid_agg) name)
+               [ "count"; "avg_duration"; "p95_duration"; "total_input_tokens";
+                 "total_output_tokens"; "total_tokens"; "error_rate" ]);
+          let tool_miss = server_get config store ("/ai/calls/" ^ tool_id) in
+          Alcotest.(check int) "aic-t8tl a tool call is a 404" 404
+            (Eta_http.Server.Response.status tool_miss);
+          let tool_body = response_json tool_miss in
+          Alcotest.(check string) "aic-t8tl the hint names the kind" "tool"
+            (json_string_field "kind" tool_body);
+          Alcotest.(check string) "aic-t8tl the hint points at the AI call"
+            call_id (json_string_field "aiCallSpanId" tool_body);
+          Alcotest.(check bool) "aic-t8tl the hint shows the way" true
+            (contains (json_string_field "hint" tool_body) ("/ai/calls/" ^ call_id));
+          let nested_miss = server_get config store ("/ai/calls/" ^ nested_id) in
+          Alcotest.(check int)
+            "aic-t8tl a nested provider span is a 404" 404
+            (Eta_http.Server.Response.status nested_miss);
+          Alcotest.(check string)
+            "aic-t8tl the nested hint names the kind" "nested"
+            (json_string_field "kind" (response_json nested_miss));
+          Alcotest.(check string)
+            "aic-t8tl the nested hint points at the AI call" call_id
+            (json_string_field "aiCallSpanId" (response_json nested_miss));
+          let unknown =
+            server_get config store "/ai/calls/00000000000000ff"
+          in
+          Alcotest.(check int) "aic-t8tl an unknown span is a plain 404" 404
+            (Eta_http.Server.Response.status unknown);
+          Alcotest.(check bool)
+            "aic-t8tl an unknown span has no parent hint" true
+            (List.mem_assoc "kind" (match response_json unknown with
+              | `Assoc fields -> fields
+              | _ -> []) = false)))
+
+(* aic-6xrr: the field provenance table lives in the README. *)
+let read_repository_file names =
+  match List.find_opt Sys.file_exists names with
+  | Some path -> In_channel.with_open_bin path In_channel.input_all
+  | None -> Alcotest.failf "none of %s exists" (String.concat ", " names)
+
+let test_ai_field_provenance_documented () =
+  let readme =
+    read_repository_file [ "../README.md"; "README.md"; "../../README.md" ]
+  in
+  Alcotest.(check bool) "aic-6xrr the provenance table exists" true
+    (contains readme "AI call field provenance");
+  List.iter
+    (fun fragment ->
+      Alcotest.(check bool) ("aic-6xrr documents " ^ fragment) true
+        (contains readme fragment))
+    [
+      "gen_ai.operation.name";
+      "ai.operationId";
+      "gen_ai.provider.name";
+      "gen_ai.system";
+      "ai.model.provider";
+      "gen_ai.request.model";
+      "ai.model.id";
+      "gen_ai.usage.input_tokens";
+      "ai.usage.inputTokens";
+      "gen_ai.usage.output_tokens";
+      "ai.usage.outputTokens";
+      "gen_ai.response.finish_reasons";
+      "ai.response.finishReason";
+      "gen_ai.input.messages";
+      "ai.prompt.messages";
+      "gen_ai.output.messages";
+      "ai.response.text";
+      "ai.prompt.tools";
+      "ai.response.providerMetadata";
+      "gen_ai.response.time_to_first_chunk";
+      "ai.response.msToFirstChunk";
+      "ai.toolCall";
+      "gen_ai.operation.name=execute_tool";
+    ]
+
 let () =
   Alcotest.run "inn"
     [
@@ -2618,5 +3621,30 @@ let () =
             test_server_handler_ingests_and_queries_services;
           Alcotest.test_case "pruner runs without ingest (ret-sj15, ret-sbgj)"
             `Slow test_server_pruner_prunes_without_ingest;
+        ] );
+      ( "tree",
+        [
+          Alcotest.test_case
+            "assembly order, depth, and running state (tree-tflv, tree-3w92, tree-sih1, tree-78hm, tree-ap92)"
+            `Quick test_trace_tree_assembly;
+          Alcotest.test_case "missing parents and cycles (tree-ffmn, tree-ap92)"
+            `Quick test_trace_tree_warnings;
+          Alcotest.test_case
+            "trace, span, and summary handlers (tree-o79f, tree-uv04, tree-ddll, tree-6vac)"
+            `Quick test_trace_tree_handlers;
+        ] );
+      ( "ai",
+        [
+          Alcotest.test_case
+            "classification (aic-cw6h, aic-jupv, aic-qs41, aic-q5qt)" `Quick
+            test_ai_classification;
+          Alcotest.test_case
+            "extraction (aic-q5qt, aic-kqhv, aic-fy0u, aic-gywl)" `Quick
+            test_ai_extraction;
+          Alcotest.test_case
+            "search, stats, and hints (aic-cw6h, aic-jupv, aic-qs41, aic-q5qt, aic-hjcg, aic-yfcd, aic-gywl, aic-qpv6, aic-e67r, aic-t8tl)"
+            `Quick test_ai_call_store_and_handlers;
+          Alcotest.test_case "field provenance in the docs (aic-6xrr)" `Quick
+            test_ai_field_provenance_documented;
         ] );
     ]

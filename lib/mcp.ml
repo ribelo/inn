@@ -210,8 +210,8 @@ let mcp_tools =
         ("limit", mcp_int_property "Maximum number of values");
       ];
     mcp_tool "inn_search_ai_calls"
-      "Search spans that represent AI calls by model, provider, session, \
-       operation, status, and text."
+      "Search AI calls by service, model, provider, session, function, \
+       operation, status, finish reason, and text."
       [
         ("service", mcp_string_property "OTel service.name");
         ("traceId", mcp_string_property "Trace id");
@@ -219,10 +219,11 @@ let mcp_tools =
         ("functionId", mcp_string_property "AI function id");
         ("provider", mcp_string_property "AI provider");
         ("model", mcp_string_property "AI model");
-        ("operation", mcp_string_property "AI operation");
+        ("operation", mcp_string_property "GenAI operation name");
         ("status", mcp_string_property "ok or error");
+        ("finishReason", mcp_string_property "Model finish reason substring");
         ( "text",
-          mcp_string_property "Text contained in AI span attributes/events" );
+          mcp_string_property "Text contained in the prompt, response, or tools" );
         ("minDurationMs", mcp_number_property "Minimum duration in milliseconds");
         ("lookback", mcp_lookback_property);
         ("cursor", mcp_cursor_property);
@@ -233,25 +234,27 @@ let mcp_tools =
       [ ("spanId", mcp_string_property "AI call span id") ];
     mcp_tool ~required:[ "groupBy"; "agg" ] "inn_ai_stats"
       "Aggregate AI call statistics by provider, model, functionId, sessionId, \
-       or status."
+       status, operation, or finishReason."
       [
         ( "groupBy",
           mcp_string_property
-            "provider, model, functionId, sessionId, or status" );
+            "provider, model, functionId, sessionId, status, operation, or \
+             finishReason" );
         ( "agg",
           mcp_string_property
-            "count, avg_duration, p95_duration, total_input_tokens, or \
-             total_output_tokens" );
+            "count, avg_duration, p95_duration, total_input_tokens, \
+             total_output_tokens, total_tokens, or error_rate" );
         ("service", mcp_string_property "OTel service.name");
         ("traceId", mcp_string_property "Trace id");
         ("sessionId", mcp_string_property "AI session id");
         ("functionId", mcp_string_property "AI function id");
         ("provider", mcp_string_property "AI provider");
         ("model", mcp_string_property "AI model");
-        ("operation", mcp_string_property "AI operation");
+        ("operation", mcp_string_property "GenAI operation name");
         ("status", mcp_string_property "ok or error");
+        ("finishReason", mcp_string_property "Model finish reason substring");
         ( "text",
-          mcp_string_property "Text contained in AI span attributes/events" );
+          mcp_string_property "Text contained in the prompt, response, or tools" );
         ("minDurationMs", mcp_number_property "Minimum duration in milliseconds");
         ("lookback", mcp_lookback_property);
         ("limit", mcp_int_property "Maximum number of rows");
@@ -511,6 +514,7 @@ let tool_call ~request ~status ~base_url name args =
               optional_arg "model" "model" args;
               optional_arg "operation" "operation" args;
               optional_arg "status" "status" args;
+              optional_arg "finishReason" "finishReason" args;
               optional_arg "text" "text" args;
                 ("minDurationMs", json_number_arg "minDurationMs" args);
               optional_arg "lookback" "lookback" args;
@@ -541,6 +545,7 @@ let tool_call ~request ~status ~base_url name args =
                   optional_arg "model" "model" args;
                   optional_arg "operation" "operation" args;
                   optional_arg "status" "status" args;
+                  optional_arg "finishReason" "finishReason" args;
                   optional_arg "text" "text" args;
                 ("minDurationMs", json_number_arg "minDurationMs" args);
                   optional_arg "lookback" "lookback" args;

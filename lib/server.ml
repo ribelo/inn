@@ -25,6 +25,12 @@ let error_response status code message =
         ("message", `String message);
       ])
 
+(* A 404 that can say where to look instead (aic-t8tl). *)
+let error_response_with_details status code message details =
+  json_response ~status
+    (`Assoc
+      (([ ("error", `String code); ("message", `String message) ]) @ details))
+
 let otlp_error ?(headers = None) status code message =
   let response = json_response ~status
     (`Assoc [ ("code", `Int code); ("message", `String message) ]) in
@@ -88,11 +94,12 @@ let query_filters path =
         "severity"; "body"; "contains"; "minSeverity" ]
   | "/ai/calls" -> paged @
       [ "service"; "traceId"; "sessionId"; "functionId"; "provider";
-        "model"; "operation"; "status"; "text"; "minDurationMs" ]
+        "model"; "operation"; "status"; "finishReason"; "text";
+        "minDurationMs" ]
   | "/ai/stats" -> summary @
       [ "groupBy"; "agg"; "service"; "traceId"; "sessionId";
         "functionId"; "provider"; "model"; "operation"; "status";
-        "text"; "minDurationMs" ]
+        "finishReason"; "text"; "minDurationMs" ]
   | "/metrics" -> paged @ [ "service"; "name" ]
   | "/facets" -> summary @ [ "type"; "field"; "key"; "service" ]
   | "/stats" -> [ "lookback" ]
@@ -126,9 +133,9 @@ let endpoint_inventory =
     endpoint "GET" "/logs" "recent logs with lookback, limit, and cursor";
     endpoint "GET" "/logs/search" "search logs with lookback, limit, and cursor";
     endpoint "GET" "/logs/stats" "aggregate log counts over a lookback window";
-    endpoint "GET" "/ai/calls" "search spans that represent AI calls with lookback, limit, and cursor";
-    endpoint "GET" "/ai/calls/{spanId}" "AI call detail with correlated logs";
-    endpoint "GET" "/ai/stats" "aggregate AI call statistics over a lookback window";
+    endpoint "GET" "/ai/calls" "search AI calls with filters, lookback, limit, and cursor";
+    endpoint "GET" "/ai/calls/{spanId}" "AI call detail with tools, timing, correlated logs, and trace links";
+    endpoint "GET" "/ai/stats" "exact AI call statistics grouped by provider, model, functionId, sessionId, status, operation, or finishReason";
     endpoint "GET" "/metrics" "recent metric points with lookback, limit, and cursor";
     endpoint "GET" "/facets" "discover trace and log facet values over a lookback window";
     endpoint "GET" "/stats" "store row counts over a lookback window";
@@ -363,12 +370,6 @@ let valid_trace_agg = function
   | "count" | "avg_duration" | "p95_duration" | "error_rate" -> true
   | _ -> false
 
-let valid_ai_agg = function
-  | "count" | "avg_duration" | "p95_duration" | "total_input_tokens"
-  | "total_output_tokens" ->
-      true
-  | _ -> false
-
 let json_list name encode values =
   `Assoc [ (name, `List (List.map encode values)) ]
 
@@ -475,14 +476,15 @@ let span store span_id _req =
   let* result = Eta.Effect.fold
       ~ok:(fun value -> Ok value)
       ~error:(fun error -> Error error)
-      (Store.get_span store span_id) in
+      (Store.get_span_node store span_id) in
   match result with
   | Error error ->
       Eta.Effect.pure
         (error_response 500 "store_error" (store_error_message error))
   | Ok None ->
       Eta.Effect.pure (error_response 404 "span_not_found" "span was not found")
-  | Ok (Some span) -> Eta.Effect.pure (json_response (Model.span_to_json span))
+  | Ok (Some node) ->
+      Eta.Effect.pure (json_response (Model.span_node_to_json node))
 
 let trace_spans store trace_id req =
   with_query req @@ fun params ->
@@ -496,7 +498,7 @@ let trace_spans store trace_id req =
       store_json
         (Store.list_trace_spans store ~window:policy.List_policy.window
            ?cursor:policy.cursor ~limit:policy.limit trace_id)
-        (page_json "spans" Model.span_to_json policy)
+        (page_json "spans" Model.span_node_to_json policy)
 
 let trace_logs store trace_id req =
   with_query req @@ fun params ->
@@ -534,258 +536,253 @@ let span_logs store span_id req =
       store_json (Store.search_logs ~attr_contains filter store)
         (page_json "logs" Model.log_to_json policy)
 
-let has_prefix prefix text = String.starts_with ~prefix text
+(* AI calls -------------------------------------------------------------- *)
 
-let contains_substring ~needle text =
-  let text = String.lowercase_ascii text in
-  let needle = String.lowercase_ascii needle in
-  let text_len = String.length text in
-  let needle_len = String.length needle in
-  if needle_len = 0 then true
-  else
-    let rec loop index =
-      if index + needle_len > text_len then false
-      else if String.equal (String.sub text index needle_len) needle then true
-      else loop (index + 1)
-    in
-    loop 0
-
-let span_all_attrs (span : Model.span) = span.resource @ span.attributes
-
-let attr_any keys attrs =
-  List.find_map
-    (fun key ->
-      match List.assoc_opt key attrs with
-      | Some value -> Some (Model.attr_string_value value)
-      | None -> None)
-    keys
-
-let attr_int keys attrs =
-  match attr_any keys attrs with
-  | None -> None
-  | Some value -> int_of_string_opt value
-
-let ai_model attrs =
-  attr_any
-    [
-      "ai.model.id";
-      "ai.model";
-      "gen_ai.request.model";
-      "gen_ai.response.model";
-    ]
-    attrs
-
-let ai_provider attrs =
-  attr_any
-    [
-      "ai.model.provider";
-      "ai.provider";
-      "gen_ai.system";
-      "gen_ai.provider.name";
-    ]
-    attrs
-
-let ai_session_id attrs =
-  attr_any
-    [
-      "ai.telemetry.metadata.sessionId";
-      "ai.session.id";
-      "session.id";
-    ]
-    attrs
-
-let ai_function_id attrs =
-  attr_any
-    [
-      "ai.telemetry.functionId";
-      "ai.function.id";
-      "function.id";
-    ]
-    attrs
-
-let ai_input_tokens attrs =
-  attr_int
-    [
-      "ai.usage.inputTokens";
-      "ai.usage.promptTokens";
-      "gen_ai.usage.input_tokens";
-      "gen_ai.usage.prompt_tokens";
-    ]
-    attrs
-
-let ai_output_tokens attrs =
-  attr_int
-    [
-      "ai.usage.outputTokens";
-      "ai.usage.completionTokens";
-      "gen_ai.usage.output_tokens";
-      "gen_ai.usage.completion_tokens";
-    ]
-    attrs
-
-let is_ai_span = Model.is_ai_span
-
-let span_search_text (span : Model.span) =
-  let attrs = span_all_attrs span in
-  let attr_text =
-    attrs |> List.map (fun (key, value) -> key ^ "=" ^ Model.attr_string_value value) |> String.concat "\n"
-  in
-  let event_text =
-    span.events
-    |> List.map (fun (event : Model.span_event) ->
-           event.Model.name ^ "\n"
-           ^ (event.attributes
-             |> List.map (fun (key, value) -> key ^ "=" ^ Model.attr_string_value value)
-             |> String.concat "\n"))
-    |> String.concat "\n"
-  in
-  String.concat "\n" [ span.operation_name; attr_text; event_text ]
-
-let option_matches expected actual =
-  match expected with
-  | None -> true
-  | Some expected -> (
-      match actual with
-      | Some actual -> String.equal expected actual
-      | None -> false)
-
-let ai_call_matches params (span : Model.span) =
-  let attrs = span_all_attrs span in
-  option_matches (param "model" params) (ai_model attrs)
-  && option_matches (param "provider" params) (ai_provider attrs)
-  && option_matches (param "sessionId" params) (ai_session_id attrs)
-  && option_matches (param "functionId" params) (ai_function_id attrs)
-  &&
-  match param "text" params with
-  | None -> true
-  | Some text -> contains_substring ~needle:text (span_search_text span)
-
-let ai_call_to_json (span : Model.span) =
-  let attrs = span_all_attrs span in
-  let optional name = function
-    | None -> []
-    | Some value -> [ (name, `String value) ]
-  in
-  let optional_int name = function
-    | None -> []
-    | Some value -> [ (name, `Int value) ]
-  in
-  `Assoc
-    ([
-       ("traceId", `String span.trace_id);
-       ("spanId", `String span.span_id);
-       ("serviceName", `String span.service_name);
-       ("operationName", `String span.operation_name);
-       ("status", `String (Model.span_status_to_string span.status));
-       ("durationMs", `Float span.duration_ms);
-       ("attributes", Model.attrs_to_json span.attributes);
-       ("resource", Model.attrs_to_json span.resource);
-     ]
-    @ optional "model" (ai_model attrs)
-    @ optional "provider" (ai_provider attrs)
-    @ optional "sessionId" (ai_session_id attrs)
-    @ optional "functionId" (ai_function_id attrs)
-    @ optional_int "inputTokens" (ai_input_tokens attrs)
-    @ optional_int "outputTokens" (ai_output_tokens attrs))
-
-let ai_span_filter policy params cursor limit =
+(* Every filter the AI call spec defines, resolved for the store: the HTTP
+   layer parses, the store only queries (aic-yfcd). The attribute key table
+   behind the stored summary lives in [Ai] and the README. *)
+let ai_span_filter params policy cursor limit : Store.ai_call_filter =
   {
     Store.service = param "service" params;
     trace_id = param "traceId" params;
     operation = param "operation" params;
-    parent_operation = None;
     status = param "status" params;
+    provider = param "provider" params;
+    model = param "model" params;
+    session_id = param "sessionId" params;
+    function_id = param "functionId" params;
+    finish_reason = param "finishReason" params;
+    text = param "text" params;
     attrs = attr_filters params;
     window = policy.List_policy.window;
     cursor;
     limit;
   }
 
-(* AI call identity and all filters are indexed at ingestion and pushed to SQL.
-   Paging does not scan unrelated spans, even beyond the old 10,000 cap. *)
+let valid_ai_group_by =
+  [ "provider"; "model"; "functionId"; "sessionId"; "status"; "operation";
+    "finishReason" ]
+
+let valid_ai_agg =
+  [ "count"; "avg_duration"; "p95_duration"; "total_input_tokens";
+    "total_output_tokens"; "total_tokens"; "error_rate" ]
+
+let allowed_values name values =
+  Printf.sprintf "%s must be one of %s" name (String.concat ", " values)
+
+(* AI calls only, from the AI call table that ingest maintains; paging never
+   scans unrelated spans (acc-gkoz). *)
 let ai_calls store req =
   with_query req @@ fun params ->
-  match List_policy.list_request ~kind:List_policy.Ai_call
-    ~now_ms:(Store.now_ms store) params with
+  match
+    List_policy.list_request ~kind:List_policy.Ai_call
+      ~now_ms:(Store.now_ms store) params
+  with
   | Error message -> Eta.Effect.pure (error_response 400 "invalid_query" message)
   | Ok policy ->
       with_search_filters ~duration:true ~contains:true params @@
       fun min_duration_ms _ attr_contains ->
-      store_json (Store.search_ai_calls ~attr_contains ?min_duration_ms
-        ?model:(param "model" params) ?provider:(param "provider" params)
-        ?session_id:(param "sessionId" params)
-        ?function_id:(param "functionId" params)
-        ?text:(param "text" params)
-        (ai_span_filter policy params policy.cursor policy.limit) store)
-        (fun page ->
-          let returned = List.length page.Store.items in
-          `Assoc [
-            ("calls", `List (List.map ai_call_to_json page.items));
-            ("meta", List_policy.meta_json policy ~returned
-              ~truncated:(Option.is_some page.next) ~next:page.next) ])
+      store_json
+        (Store.search_ai_calls ~attr_contains ?min_duration_ms
+           (ai_span_filter params policy policy.cursor policy.limit) store)
+        (page_json "calls" Model.ai_call_to_json policy)
 
-let ai_call store span_id _req =
+(* The hint is best-effort: a store failure while looking up the parent must
+   not turn the 404 into a 500. *)
+let optional_store eff =
+  Eta.Effect.fold ~ok:(fun value -> Ok value) ~error:(fun _ -> Error ()) eff
+  |> Eta.Effect.map (function Ok value -> value | Error () -> None)
+
+let ai_call_hint store kind (span : Model.span) =
   let open Eta.Syntax in
-  let* span_result = Eta.Effect.fold
-      ~ok:(fun value -> Ok value)
+  let* parent =
+    match span.Model.parent_span_id with
+    | None -> Eta.Effect.pure None
+    | Some parent_id -> optional_store (Store.get_span store parent_id)
+  in
+  let* parent_is_call =
+    match parent with
+    | None -> Eta.Effect.pure false
+    | Some (parent : Model.span) ->
+        optional_store (Store.span_ai_kind store parent.Model.span_id)
+        |> Eta.Effect.map (fun parent_kind -> parent_kind = Some "call")
+  in
+  let label =
+    match kind with
+    | "tool" -> "a tool call"
+    | "nested" -> "a nested provider span"
+    | _ -> "not an AI call"
+  in
+  let parent_call =
+    match parent with
+    | Some (parent : Model.span) when parent_is_call -> Some parent
+    | _ -> None
+  in
+  Eta.Effect.pure
+    [
+      ("kind", `String kind);
+      ( "aiCallSpanId",
+        match parent_call with
+        | Some (parent : Model.span) -> `String parent.span_id
+        | None -> `Null );
+      ( "aiCallOperationName",
+        match parent_call with
+        | Some (parent : Model.span) -> `String parent.operation_name
+        | None -> `Null );
+      ( "hint",
+        match parent_call with
+        | Some (parent : Model.span) ->
+            `String
+              (Printf.sprintf
+                 "this span is %s; read its AI call with GET /ai/calls/%s" label
+                 parent.span_id)
+        | None ->
+            `String
+              (Printf.sprintf
+                 "this span is %s; no stored AI call parent was found" label) );
+    ]
+
+let ai_call_detail_json config (detail : Model.ai_call_detail) span logs =
+  let links =
+    [
+      ( "trace",
+        `String
+          (config.Config.base_url ^ "/traces/" ^ detail.Model.call.trace_id) );
+      ( "traceSpans",
+        `String
+          (config.Config.base_url ^ "/traces/" ^ detail.Model.call.trace_id
+         ^ "/spans") );
+    ]
+  in
+  match Model.ai_call_detail_to_json detail with
+  | `Assoc fields ->
+      `Assoc
+        (fields
+        @ [
+            ("span", Model.span_to_json span);
+            ("logs", `List (List.map Model.log_to_json logs));
+            ("links", `Assoc links);
+          ])
+  | json -> json
+
+(* The detail classifies from the stored kind, not from the span alone: a
+   nested provider span's parent is outside the span (aic-t8tl). *)
+let ai_call config store span_id _req =
+  let open Eta.Syntax in
+  let* kind_result =
+    Eta.Effect.fold ~ok:(fun value -> Ok value)
       ~error:(fun error -> Error error)
-      (Store.get_span store span_id) in
-  match span_result with
+      (Store.span_ai_kind store span_id)
+  in
+  match kind_result with
   | Error error ->
       Eta.Effect.pure
         (error_response 500 "store_error" (store_error_message error))
   | Ok None ->
       Eta.Effect.pure
-        (error_response 404 "ai_call_not_found" "AI call was not found")
-  | Ok (Some span) when not (is_ai_span span) ->
-      Eta.Effect.pure
-        (error_response 404 "ai_call_not_found" "AI call was not found")
-  | Ok (Some span) ->
-      let* logs_result = Eta.Effect.fold
-          ~ok:(fun value -> Ok value)
+        (error_response 404 "ai_call_not_found"
+           ("AI call was not found for span " ^ span_id))
+  | Ok (Some kind) when not (String.equal kind "call") ->
+      let* span_result =
+        Eta.Effect.fold ~ok:(fun value -> Ok value)
           ~error:(fun error -> Error error)
-          (Store.list_span_logs store ~window:Model.window_all ~limit:10_000
-             span.span_id) in
-      (match logs_result with
+          (Store.get_span store span_id)
+      in
+      (match span_result with
       | Error error ->
           Eta.Effect.pure
             (error_response 500 "store_error" (store_error_message error))
-      | Ok logs ->
+      | Ok None ->
           Eta.Effect.pure
-            (json_response
-               (`Assoc
-                 [
-                   ("call", ai_call_to_json span);
-                   ("span", Model.span_to_json span);
-                   ( "logs",
-                     `List (List.map Model.log_to_json logs.Store.items) );
-                 ])))
+            (error_response 404 "ai_call_not_found"
+               ("AI call was not found for span " ^ span_id))
+      | Ok (Some span) ->
+          let* details = ai_call_hint store kind span in
+          Eta.Effect.pure
+            (error_response_with_details 404 "ai_call_not_found"
+               ("span " ^ span_id ^ " is not an AI call")
+               details))
+  | Ok (Some _) ->
+      let* span_result =
+        Eta.Effect.fold ~ok:(fun value -> Ok value)
+          ~error:(fun error -> Error error)
+          (Store.get_span store span_id)
+      in
+      (match span_result with
+      | Error error ->
+          Eta.Effect.pure
+            (error_response 500 "store_error" (store_error_message error))
+      | Ok None ->
+          Eta.Effect.pure
+            (error_response 404 "ai_call_not_found"
+               ("AI call was not found for span " ^ span_id))
+      | Ok (Some span) -> (
+          let* children_result =
+            Eta.Effect.fold ~ok:(fun value -> Ok value)
+              ~error:(fun error -> Error error)
+              (Store.list_span_children store span.Model.span_id)
+          in
+          match children_result with
+          | Error error ->
+              Eta.Effect.pure
+                (error_response 500 "store_error" (store_error_message error))
+          | Ok children -> (
+              let* logs_result =
+                Eta.Effect.fold ~ok:(fun value -> Ok value)
+                  ~error:(fun error -> Error error)
+                  (Store.list_span_logs store ~window:Model.window_all
+                     ~limit:10_000 span.Model.span_id)
+              in
+              match logs_result with
+              | Error error ->
+                  Eta.Effect.pure
+                    (error_response 500 "store_error"
+                       (store_error_message error))
+              | Ok logs ->
+                  let detail = Ai.detail_of_span ~children span in
+                  Eta.Effect.pure
+                    (json_response
+                       (ai_call_detail_json config detail span
+                          logs.Store.items)))))
 
+(* Every group and aggregate runs in SQL over the whole window; an unknown
+   groupBy or agg is rejected with the allowed values (aic-qpv6, aic-e67r). *)
 let ai_stats store req =
   with_query req @@ fun params ->
-  match (param "groupBy" params, param "agg" params,
-    List_policy.summary_request ~now_ms:(Store.now_ms store) params) with
-  | None, _, _ -> Eta.Effect.pure
-      (error_response 400 "invalid_query" "groupBy is required")
-  | _, None, _ -> Eta.Effect.pure
-      (error_response 400 "invalid_query" "agg is required")
-  | _, _, Error message -> Eta.Effect.pure
-      (error_response 400 "invalid_query" message)
-  | Some _, Some agg, Ok _ when not (valid_ai_agg agg) ->
-      Eta.Effect.pure (error_response 400 "invalid_query"
-        "agg must be count, avg_duration, p95_duration, total_input_tokens, or total_output_tokens")
+  match
+    ( param "groupBy" params,
+      param "agg" params,
+      List_policy.summary_request ~now_ms:(Store.now_ms store) params )
+  with
+  | None, _, _ ->
+      Eta.Effect.pure
+        (error_response 400 "invalid_query" "groupBy is required")
+  | _, None, _ ->
+      Eta.Effect.pure (error_response 400 "invalid_query" "agg is required")
+  | _, _, Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Some group_by, Some _, Ok _ when not (List.mem group_by valid_ai_group_by)
+    ->
+      Eta.Effect.pure
+        (error_response 400 "invalid_query"
+           (allowed_values "groupBy" valid_ai_group_by))
+  | Some _, Some agg, Ok _ when not (List.mem agg valid_ai_agg) ->
+      Eta.Effect.pure
+        (error_response 400 "invalid_query" (allowed_values "agg" valid_ai_agg))
   | Some group_by, Some agg, Ok policy ->
       with_search_filters ~duration:true ~contains:true params @@
       fun min_duration_ms _ attr_contains ->
-      store_json (Store.ai_stats ~attr_contains ?min_duration_ms
-        ?model:(param "model" params) ?provider:(param "provider" params)
-        ?session_id:(param "sessionId" params)
-        ?function_id:(param "functionId" params) ?text:(param "text" params)
-        ~group_by ~agg (ai_span_filter policy params None policy.limit) store)
-        (fun stats -> `Assoc [
-          ("stats", `List (List.map Model.stat_item_to_json stats));
-          ("meta", List_policy.stats_meta
-            ~lookback:policy.lookback ~limit:policy.limit) ])
+      store_json
+        (Store.ai_stats ~attr_contains ?min_duration_ms ~group_by ~agg
+           (ai_span_filter params policy None policy.limit) store)
+        (fun stats ->
+          `Assoc
+            [
+              ("stats", `List (List.map Model.stat_item_to_json stats));
+              ( "meta",
+                List_policy.stats_meta ~lookback:policy.lookback
+                  ~limit:policy.limit );
+            ])
 
 let search_spans store req =
   with_query req @@ fun params ->
@@ -1096,7 +1093,7 @@ let handler config store =
   add_route router ~methods:[ "GET" ] "/logs/stats" (log_stats store);
   add_route router ~methods:[ "GET" ] "/ai/calls" (ai_calls store);
   add_route router ~methods:[ "GET" ] "/ai/calls/{spanId}"
-    (with_route_param "spanId" (ai_call store));
+    (with_route_param "spanId" (ai_call config store));
   add_route router ~methods:[ "GET" ] "/ai/stats" (ai_stats store);
   add_route router ~methods:[ "GET" ] "/facets" (facets store);
   add_route router ~methods:[ "GET" ] "/metrics" (metrics store);
