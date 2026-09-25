@@ -119,7 +119,7 @@ type metric_filter = {
    every change to the statements in [schemas]. [open_] recreates any database
    whose stored version differs, so a schema change without a bump would be
    silently skipped on an existing database (schm-hnis). *)
-let schema_version = 3
+let schema_version = 4
 
 let schema_version_text = string_of_int schema_version
 
@@ -153,6 +153,14 @@ module Spans = struct
   let end_time_ns = column "end_time_ns" Q.int
   let duration_ms = column "duration_ms" Q.float
   let status = column "status" Q.text
+  let is_ai_call = column "is_ai_call" Q.bool
+  let ai_model = column "ai_model" (Q.nullable Q.text)
+  let ai_provider = column "ai_provider" (Q.nullable Q.text)
+  let ai_session_id = column "ai_session_id" (Q.nullable Q.text)
+  let ai_function_id = column "ai_function_id" (Q.nullable Q.text)
+  let ai_input_tokens = column "ai_input_tokens" Q.int
+  let ai_output_tokens = column "ai_output_tokens" Q.int
+  let ai_search_text = column "ai_search_text" Q.text
   let status_message = column "status_message" (Q.nullable Q.text)
   let attributes_json = column "attributes_json" Q.text
   let resource_json = column "resource_json" Q.text
@@ -187,6 +195,7 @@ module Logs = struct
   let service_name = column "service_name" Q.text
   let scope_name = column "scope_name" (Q.nullable Q.text)
   let severity_text = column "severity_text" Q.text
+  let severity_normalized = column "severity_normalized" Q.text
   let severity_number = column "severity_number" (Q.nullable Q.int)
   let timestamp_ns = column "timestamp_ns" Q.int
   let observed_timestamp_ns = column "observed_timestamp_ns" (Q.nullable Q.int)
@@ -225,6 +234,17 @@ module Trace_summaries = struct
   let span_count = column "span_count" Q.int
   let error_count = column "error_count" Q.int
   let updated_at_ms = column "updated_at_ms" Q.int
+end
+
+module Trace_services = struct
+  module T = Q.Table.Make (struct
+    let name = "trace_services"
+  end)
+
+  include T
+
+  let trace_id = column "trace_id" Q.text
+  let service_name = column "service_name" Q.text
 end
 
 module Metric_points = struct
@@ -432,6 +452,14 @@ let schemas =
         column ~not_null:true Spans.end_time_ns;
         column ~not_null:true Spans.duration_ms;
         column ~not_null:true Spans.status;
+        column ~not_null:true Spans.is_ai_call;
+        column Spans.ai_model;
+        column Spans.ai_provider;
+        column Spans.ai_session_id;
+        column Spans.ai_function_id;
+        column ~not_null:true Spans.ai_input_tokens;
+        column ~not_null:true Spans.ai_output_tokens;
+        column ~not_null:true Spans.ai_search_text;
         column Spans.status_message;
         column ~not_null:true Spans.attributes_json;
         column ~not_null:true Spans.resource_json;
@@ -449,6 +477,12 @@ let schemas =
       [ Q.Column.any Spans.span_id ];
     create_index ~if_not_exists:true ~name:"idx_spans_status" Spans.table
       [ Q.Column.any Spans.status ];
+    create_index ~if_not_exists:true ~name:"idx_spans_service_start" Spans.table
+      [ Q.Column.any Spans.service_name; Q.Column.any Spans.start_time_ns ];
+    create_index ~if_not_exists:true ~name:"idx_spans_trace_parent" Spans.table
+      [ Q.Column.any Spans.trace_id; Q.Column.any Spans.parent_span_id ];
+    create_index ~if_not_exists:true ~name:"idx_spans_ai_start" Spans.table
+      [ Q.Column.any Spans.is_ai_call; Q.Column.any Spans.start_time_ns ];
     create_table ~if_not_exists:true Span_attributes.table
       [
         column ~primary_key:true Span_attributes.id;
@@ -469,6 +503,7 @@ let schemas =
         column ~not_null:true Logs.service_name;
         column Logs.scope_name;
         column ~not_null:true Logs.severity_text;
+        column ~not_null:true Logs.severity_normalized;
         column Logs.severity_number;
         column ~not_null:true Logs.timestamp_ns;
         column Logs.observed_timestamp_ns;
@@ -486,7 +521,7 @@ let schemas =
     create_index ~if_not_exists:true ~name:"idx_logs_span" Logs.table
       [ Q.Column.any Logs.span_id ];
     create_index ~if_not_exists:true ~name:"idx_logs_severity" Logs.table
-      [ Q.Column.any Logs.severity_text ];
+      [ Q.Column.any Logs.severity_normalized ];
     create_index ~if_not_exists:true ~name:"idx_logs_ingested" Logs.table
       [ Q.Column.any Logs.ingested_at_ms ];
     create_table ~if_not_exists:true Log_attributes.table
@@ -519,6 +554,17 @@ let schemas =
       Trace_summaries.table [ Q.Column.any Trace_summaries.started_at_ns ];
     create_index ~if_not_exists:true ~name:"idx_trace_summaries_updated"
       Trace_summaries.table [ Q.Column.any Trace_summaries.updated_at_ms ];
+    create_table ~if_not_exists:true Trace_services.table
+      [ column ~not_null:true Trace_services.trace_id;
+        column ~not_null:true Trace_services.service_name ];
+    create_index ~if_not_exists:true ~unique:true ~name:"idx_trace_services_pair"
+      Trace_services.table
+      [ Q.Column.any Trace_services.trace_id; Q.Column.any Trace_services.service_name ];
+    create_index ~if_not_exists:true ~name:"idx_trace_services_service"
+      Trace_services.table [ Q.Column.any Trace_services.service_name ];
+    create_index ~if_not_exists:true ~name:"idx_trace_summaries_service_start"
+      Trace_summaries.table
+      [ Q.Column.any Trace_summaries.service_name; Q.Column.any Trace_summaries.started_at_ns ];
     create_table ~if_not_exists:true Metric_points.table
       [
         column ~primary_key:true Metric_points.id;
@@ -1116,58 +1162,52 @@ let sort_stat_items limit (items : Model.stat_item list) =
          if by_value <> 0 then by_value else String.compare left.group right.group)
   |> take limit
 
-let owner_ids_for_span_attr runner key value =
-  q_select runner
-    Q.Select.(
-      from Span_attributes.table Q.Projection.(one Span_attributes.owner_id)
-      |> where
-           Q.Expr.(
-             and_ (eq Span_attributes.key key) (eq Span_attributes.value value)))
+(* LIKE's pattern is built from literal user text; '%' and '_' have no wildcard
+   meaning in filters (srch-zjff). Eta renders ESCAPE through its typed API. *)
+let literal_like_pattern text =
+  let b = Buffer.create (String.length text + 2) in
+  Buffer.add_char b '%';
+  String.iter (fun c ->
+    if c = '%' || c = '_' || c = '\\' then Buffer.add_char b '\\';
+    Buffer.add_char b c) text;
+  Buffer.add_char b '%';
+  Buffer.contents b
 
-let owner_ids_for_log_attr runner key value =
-  q_select runner
-    Q.Select.(
+let span_attrs_predicate ?(contains = []) owner attrs =
+  let exact = List.map (fun (key, value) -> (key, value, false)) attrs in
+  let partial = List.map (fun (key, value) -> (key, value, true)) contains in
+  List.fold_left (fun predicate (key, value, substring) ->
+    let value_predicate =
+      if substring then Q.Expr.like ~escape:'\\' Span_attributes.value
+        (literal_like_pattern value)
+      else Q.Expr.eq Span_attributes.value value in
+    let owners = Q.Select.(
+      from Span_attributes.table Q.Projection.(one Span_attributes.owner_id)
+      |> where Q.Expr.(and_ (eq Span_attributes.key key) value_predicate)
+      |> compile) in
+    Q.Expr.and_ predicate (Q.Expr.in_select owner owners))
+    Q.Expr.true_ (exact @ partial)
+
+let log_attrs_predicate ?(contains = []) owner attrs =
+  let exact = List.map (fun (key, value) -> (key, value, false)) attrs in
+  let partial = List.map (fun (key, value) -> (key, value, true)) contains in
+  List.fold_left (fun predicate (key, value, substring) ->
+    let value_predicate =
+      if substring then Q.Expr.like ~escape:'\\' Log_attributes.value
+        (literal_like_pattern value)
+      else Q.Expr.eq Log_attributes.value value in
+    let owners = Q.Select.(
       from Log_attributes.table Q.Projection.(one Log_attributes.owner_id)
-      |> where
-           Q.Expr.(
-             and_ (eq Log_attributes.key key) (eq Log_attributes.value value)))
+      |> where Q.Expr.(and_ (eq Log_attributes.key key) value_predicate)
+      |> compile) in
+    Q.Expr.and_ predicate (Q.Expr.in_select owner owners))
+    Q.Expr.true_ (exact @ partial)
 
 let span_attr_values_for_key runner key =
-  q_select runner
-    Q.Select.(
-      from Span_attributes.table
-        Q.Projection.(t2 (one Span_attributes.owner_id) (one Span_attributes.value))
-      |> where Q.Expr.(eq Span_attributes.key key))
-
-let span_owner_ids_for_attrs runner attrs =
-  let open Eta.Syntax in
-  let* ids =
-    effect_fold attrs None (fun acc (key, value) ->
-        let* ids = owner_ids_for_span_attr runner key value in
-        let ids = sorted_unique ids in
-        let next =
-          match acc with
-          | None -> ids
-          | Some existing -> intersect_sorted existing ids
-        in
-        Eta.Effect.pure (Some next))
-  in
-  Eta.Effect.pure (Option.value ids ~default:[])
-
-let log_owner_ids_for_attrs runner attrs =
-  let open Eta.Syntax in
-  let* ids =
-    effect_fold attrs None (fun acc (key, value) ->
-        let* ids = owner_ids_for_log_attr runner key value in
-        let ids = sorted_unique ids in
-        let next =
-          match acc with
-          | None -> ids
-          | Some existing -> intersect_sorted existing ids
-        in
-        Eta.Effect.pure (Some next))
-  in
-  Eta.Effect.pure (Option.value ids ~default:[])
+  q_select runner Q.Select.(
+    from Span_attributes.table
+      Q.Projection.(t2 (one Span_attributes.owner_id) (one Span_attributes.value))
+    |> where Q.Expr.(eq Span_attributes.key key))
 
 let parent_span_ids_for_operation runner ?service operation =
   let predicate =
@@ -1289,26 +1329,31 @@ let refresh_trace_summary ~now_ms runner trace_id =
           |> value Trace_summaries.span_count (List.length spans)
           |> value Trace_summaries.error_count error_count
           |> value Trace_summaries.updated_at_ms now_ms
-          |> on_conflict_do_nothing [ Q.Column.any Trace_summaries.trace_id ]
-          |> compile)
-      in
-      let update =
-        Q.Update.(
-          table Trace_summaries.table
-          |> set Trace_summaries.service_name root.service_name
-          |> set Trace_summaries.root_operation_name root.operation_name
-          |> set Trace_summaries.started_at_ns started_at_ns
-          |> set Trace_summaries.ended_at_ns ended_at_ns
-          |> set Trace_summaries.duration_ms (float_of_int (ended_at_ns - started_at_ns) /. 1_000_000.)
-          |> set Trace_summaries.span_count (List.length spans)
-          |> set Trace_summaries.error_count error_count
-          |> set Trace_summaries.updated_at_ms now_ms
-          |> where Q.Expr.(eq Trace_summaries.trace_id trace_id)
+          |> on_conflict_update [ Q.Column.any Trace_summaries.trace_id ]
+               ~set:[ Q.Column.any Trace_summaries.service_name;
+                      Q.Column.any Trace_summaries.root_operation_name;
+                      Q.Column.any Trace_summaries.started_at_ns;
+                      Q.Column.any Trace_summaries.ended_at_ns;
+                      Q.Column.any Trace_summaries.duration_ms;
+                      Q.Column.any Trace_summaries.span_count;
+                      Q.Column.any Trace_summaries.error_count;
+                      Q.Column.any Trace_summaries.updated_at_ms ]
           |> compile)
       in
       let* _ = q_exec_pool runner insert in
-      let* _ = q_exec_pool runner update in
-      Eta.Effect.unit
+      let* _ = q_exec_pool runner Q.Delete.(
+        from Trace_services.table
+        |> where Q.Expr.(eq Trace_services.trace_id trace_id)
+        |> compile) in
+      let services = List.sort_uniq String.compare
+        (List.map (fun (span : Model.span) -> span.service_name) spans) in
+      effect_iter services (fun service_name ->
+        let* _ = q_exec_pool runner Q.Insert.(
+          into Trace_services.table
+          |> value Trace_services.trace_id trace_id
+          |> value Trace_services.service_name service_name
+          |> compile) in
+        Eta.Effect.unit)
 
 (* Retention deletes owner rows in bounded batches. Every batch is a
    subquery delete limited to [prune_batch_size] rows, so no statement ever
@@ -1436,6 +1481,10 @@ let delete_trace_batch runner ~batch cutoff =
                  (trace_span_ids_select trace_ids))
         |> compile)
   in
+  let* _ = q_exec_pool runner Q.Delete.(
+    from Trace_services.table
+    |> where Q.Expr.(in_select Trace_services.trace_id trace_ids)
+    |> compile) in
   let* spans =
     q_exec_pool runner
       Q.Delete.(
@@ -1612,40 +1661,41 @@ let ingest_traces t spans =
         |> value Spans.end_time_ns span.end_time_ns
         |> value Spans.duration_ms span.duration_ms
         |> value Spans.status (Model.span_status_to_string span.status)
+        |> value Spans.is_ai_call (Model.is_ai_span span)
+        |> value Spans.ai_model (Model.ai_model span)
+        |> value Spans.ai_provider (Model.ai_provider span)
+        |> value Spans.ai_session_id (Model.ai_session_id span)
+        |> value Spans.ai_function_id (Model.ai_function_id span)
+        |> value Spans.ai_input_tokens (Option.value (Model.ai_input_tokens span) ~default:0)
+        |> value Spans.ai_output_tokens (Option.value (Model.ai_output_tokens span) ~default:0)
+        |> value Spans.ai_search_text (Model.ai_search_text span)
         |> value Spans.status_message span.status_message
         |> value Spans.attributes_json (Model.attrs_json_string span.attributes)
         |> value Spans.resource_json (Model.attrs_json_string span.resource)
         |> value Spans.events_json (events_json span.events)
         |> value Spans.links_json (links_json span.links)
         |> value Spans.ingested_at_ms now_ms
-        |> on_conflict_do_nothing [ Q.Column.any Spans.id ]
-        |> compile)
-    in
-    let update =
-      Q.Update.(
-        table Spans.table
-        |> set Spans.trace_id span.trace_id
-        |> set Spans.span_id span.span_id
-        |> set Spans.parent_span_id span.parent_span_id
-        |> set Spans.service_name span.service_name
-        |> set Spans.scope_name span.scope_name
-        |> set Spans.operation_name span.operation_name
-        |> set Spans.kind (Option.map Model.span_kind_to_string span.kind)
-        |> set Spans.start_time_ns span.start_time_ns
-        |> set Spans.end_time_ns span.end_time_ns
-        |> set Spans.duration_ms span.duration_ms
-        |> set Spans.status (Model.span_status_to_string span.status)
-        |> set Spans.status_message span.status_message
-        |> set Spans.attributes_json (Model.attrs_json_string span.attributes)
-        |> set Spans.resource_json (Model.attrs_json_string span.resource)
-        |> set Spans.events_json (events_json span.events)
-        |> set Spans.links_json (links_json span.links)
-        |> set Spans.ingested_at_ms now_ms
-        |> where Q.Expr.(eq Spans.id id)
+        |> on_conflict_update [ Q.Column.any Spans.id ]
+             ~set:[ Q.Column.any Spans.trace_id; Q.Column.any Spans.span_id;
+                    Q.Column.any Spans.parent_span_id;
+                    Q.Column.any Spans.service_name; Q.Column.any Spans.scope_name;
+                    Q.Column.any Spans.operation_name; Q.Column.any Spans.kind;
+                    Q.Column.any Spans.start_time_ns; Q.Column.any Spans.end_time_ns;
+                    Q.Column.any Spans.duration_ms; Q.Column.any Spans.status;
+                    Q.Column.any Spans.is_ai_call;
+                    Q.Column.any Spans.ai_model; Q.Column.any Spans.ai_provider;
+                    Q.Column.any Spans.ai_session_id;
+                    Q.Column.any Spans.ai_function_id;
+                    Q.Column.any Spans.ai_input_tokens;
+                    Q.Column.any Spans.ai_output_tokens;
+                    Q.Column.any Spans.ai_search_text;
+                    Q.Column.any Spans.status_message;
+                    Q.Column.any Spans.attributes_json; Q.Column.any Spans.resource_json;
+                    Q.Column.any Spans.events_json; Q.Column.any Spans.links_json;
+                    Q.Column.any Spans.ingested_at_ms ]
         |> compile)
     in
     let* _ = q_exec_pool runner insert in
-    let* _ = q_exec_pool runner update in
     let* () = insert_span_attrs runner id (span.resource @ span.attributes) in
     Hashtbl.replace touched span.trace_id ();
     Eta.Effect.unit
@@ -1674,6 +1724,7 @@ let ingest_logs t logs =
         |> value Logs.service_name log.service_name
         |> value Logs.scope_name log.scope_name
         |> value Logs.severity_text log.severity_text
+        |> value Logs.severity_normalized (String.uppercase_ascii log.severity_text)
         |> value Logs.severity_number log.severity_number
         |> value Logs.timestamp_ns timestamp_ns
         |> value Logs.observed_timestamp_ns log.observed_timestamp_ns
@@ -1728,7 +1779,14 @@ let ingest_metrics t points =
   in
   Eta.Effect.pure (List.length points)
 
-let list_services_runner ?window runner =
+let trace_service_predicate trace_id service =
+  let participating = Q.Select.(
+    from Trace_services.table Q.Projection.(one Trace_services.trace_id)
+    |> where Q.Expr.(eq Trace_services.service_name service)
+    |> compile) in
+  Q.Expr.in_select trace_id participating
+
+let list_services_runner ?window ?(include_metrics = false) runner =
   let window = Option.value window ~default:Model.window_all in
   let open Eta.Syntax in
   let* span_services =
@@ -1748,24 +1806,26 @@ let list_services_runner ?window runner =
         |> order_by Logs.service_name)
   in
   let* metric_services =
-    q_select runner
-      Q.Select.(
+    if include_metrics then
+      q_select runner Q.Select.(
         from Metric_points.table Q.Projection.(one Metric_points.service_name)
         |> where (window_predicate Metric_points.timestamp_ns window)
         |> distinct
         |> order_by Metric_points.service_name)
+    else Eta.Effect.pure []
   in
   Eta.Effect.pure
     (List.sort_uniq String.compare
        (span_services @ log_services @ metric_services))
 
-let list_services ?window t = list_services_runner ?window t.pool
+let list_services ?window ?include_metrics t =
+  list_services_runner ?window ?include_metrics t.pool
 
 let list_trace_summaries ?service ~window ?cursor ~limit t =
   let predicate =
     match service with
     | None -> Q.Expr.true_
-    | Some service -> Q.Expr.eq Trace_summaries.service_name service
+    | Some service -> trace_service_predicate Trace_summaries.trace_id service
   in
   let predicate =
     Q.Expr.and_ predicate
@@ -1822,149 +1882,160 @@ let list_span_logs t ~window ?cursor ~limit span_id =
   q_select t.pool (logs_for_span_page_query ~window ~cursor ~limit span_id)
   |> Eta.Effect.map (page_of_rows ~limit ~position:log_position)
 
-let span_search_predicate (filter : span_search_filter) owner_ids parent_span_ids =
-  let predicate = Q.Expr.true_ in
-  let predicate =
-    match filter.service with
-    | None -> predicate
-    | Some service -> Q.Expr.and_ predicate (Q.Expr.eq Spans.service_name service)
-  in
-  let predicate =
-    match filter.trace_id with
-    | None -> predicate
-    | Some trace_id -> Q.Expr.and_ predicate (Q.Expr.eq Spans.trace_id trace_id)
-  in
-  let predicate =
-    match filter.operation with
-    | None -> predicate
-    | Some operation ->
-        Q.Expr.and_ predicate (Q.Expr.eq Spans.operation_name operation)
-  in
-  let predicate =
-    match filter.status with
-    | None -> predicate
-    | Some "ok" -> Q.Expr.and_ predicate (Q.Expr.not_ (Q.Expr.eq Spans.status "error"))
-    | Some status -> Q.Expr.and_ predicate (Q.Expr.eq Spans.status status)
-  in
-  let predicate =
-    match owner_ids with
-    | None -> predicate
-    | Some ids -> Q.Expr.and_ predicate (Q.Expr.in_values Spans.id ids)
-  in
-  let predicate =
-    Q.Expr.and_ predicate (window_predicate Spans.start_time_ns filter.window)
-  in
-  let predicate =
-    Q.Expr.and_ predicate
-      (keyset_predicate ~sort_key:Spans.start_time_ns ~tie_breaker:Spans.id
-         filter.cursor)
-  in
-  match parent_span_ids with
-  | None -> predicate
-  | Some ids ->
-      Q.Expr.and_ predicate
-        (Q.Expr.in_values Spans.parent_span_id (List.map Option.some ids))
+(* The self-join tests both span and trace IDs; an unrelated trace's matching
+   operation cannot qualify a child (srch-ypr2). *)
+let parent_operation_predicate operation =
+  let parent_table = Q.Table.alias Spans.table "parent" in
+  let parent_trace = Q.Table.column parent_table "trace_id" Q.text in
+  let parent_span = Q.Table.column parent_table "span_id" Q.text in
+  let parent_operation = Q.Table.column parent_table "operation_name" Q.text in
+  let child col = Q.Scope.column (Q.Scope.left Q.Scope.self) col in
+  let parent col = Q.Scope.column Q.Scope.right col in
+  let on = Q.Expr.(and_
+    (eq_col (child Spans.trace_id) (parent parent_trace))
+    (eq_expr (col (child Spans.parent_span_id))
+      (col (Q.Scope.nullable_column Q.Scope.right parent_span)))) in
+  let source = Q.Source.(join ~on parent_table (from Spans.table)) in
+  let ids = Q.Select.(
+    from_source source Q.Projection.(one (child Spans.id))
+    |> where (Q.Expr.like ~escape:'\\' (parent parent_operation)
+      (literal_like_pattern operation))
+    |> compile) in
+  Q.Expr.in_select Spans.id ids
 
-let search_spans (filter : span_search_filter) t =
-  let open Eta.Syntax in
-  let* owner_ids =
-    match filter.attrs with
-    | [] -> Eta.Effect.pure None
-    | attrs ->
-        let* ids = span_owner_ids_for_attrs t.pool attrs in
-        Eta.Effect.pure (Some ids)
-  in
-  match owner_ids with
-  | Some [] -> Eta.Effect.pure empty_page
-  | _ ->
-      let* parent_span_ids =
-        match filter.parent_operation with
-        | None -> Eta.Effect.pure None
-        | Some operation ->
-            let* ids = parent_span_ids_for_operation t.pool ?service:filter.service operation in
-            Eta.Effect.pure (Some (sorted_unique ids))
-      in
-      (match parent_span_ids with
-      | Some [] -> Eta.Effect.pure empty_page
-      | _ ->
-          q_select t.pool
-            Q.Select.(
-              from Spans.table span_projection
-              |> where (span_search_predicate filter owner_ids parent_span_ids)
-              |> order_by ~desc:true Spans.start_time_ns
-              |> order_by ~desc:true Spans.id
-              |> limit (filter.limit + 1))
-          |> Eta.Effect.map
-               (page_of_rows ~limit:filter.limit ~position:span_position))
+let span_search_predicate ?(attr_contains = []) ?min_duration_ms
+    (filter : span_search_filter) =
+  let p = Q.Expr.and_ (span_attrs_predicate ~contains:attr_contains Spans.id filter.attrs)
+      (window_predicate Spans.start_time_ns filter.window) in
+  let p = match filter.service with None -> p | Some x -> Q.Expr.and_ p (Q.Expr.eq Spans.service_name x) in
+  let p = match filter.trace_id with None -> p | Some x -> Q.Expr.and_ p (Q.Expr.eq Spans.trace_id x) in
+  let p = match filter.operation with None -> p | Some x ->
+    Q.Expr.and_ p (Q.Expr.like ~escape:'\\' Spans.operation_name (literal_like_pattern x)) in
+  let p = match filter.parent_operation with None -> p | Some x ->
+    Q.Expr.and_ p (parent_operation_predicate x) in
+  let p = match min_duration_ms with None -> p | Some x ->
+    Q.Expr.and_ p (Q.Expr.ge Spans.duration_ms x) in
+  let p = match filter.status with
+    | None -> p
+    | Some "ok" -> Q.Expr.and_ p Q.Expr.(not_ (eq Spans.status "error"))
+    | Some x -> Q.Expr.and_ p (Q.Expr.eq Spans.status x) in
+  Q.Expr.and_ p (keyset_predicate ~sort_key:Spans.start_time_ns ~tie_breaker:Spans.id filter.cursor)
 
-let trace_summary_search_query (filter : trace_search_filter) trace_ids =
-  let predicate = Q.Expr.true_ in
-  let predicate =
-    match filter.service with
-    | None -> predicate
-    | Some service ->
-        Q.Expr.and_ predicate (Q.Expr.eq Trace_summaries.service_name service)
-  in
-  let predicate =
-    match trace_ids with
-    | None -> predicate
-    | Some ids ->
-        Q.Expr.and_ predicate (Q.Expr.in_values Trace_summaries.trace_id ids)
-  in
-  let predicate =
-    Q.Expr.and_ predicate
-      (window_predicate Trace_summaries.started_at_ns filter.window)
-  in
-  let predicate =
-    Q.Expr.and_ predicate
-      (keyset_predicate ~sort_key:Trace_summaries.started_at_ns
-         ~tie_breaker:Trace_summaries.trace_id filter.cursor)
-  in
-  Q.Select.(
-    from Trace_summaries.table trace_summary_projection
-    |> where predicate
+let ai_span_predicate ?(attr_contains = []) ?min_duration_ms
+    ?model ?provider ?session_id ?function_id ?text
+    (filter : span_search_filter) =
+  let p = Q.Expr.and_ (span_search_predicate ~attr_contains ?min_duration_ms filter)
+    (Q.Expr.eq Spans.is_ai_call true) in
+  let nullable p col = match p with None -> Q.Expr.true_
+    | Some value -> Q.Expr.eq col (Some value) in
+  let p = Q.Expr.and_ p (nullable model Spans.ai_model) in
+  let p = Q.Expr.and_ p (nullable provider Spans.ai_provider) in
+  let p = Q.Expr.and_ p (nullable session_id Spans.ai_session_id) in
+  let p = Q.Expr.and_ p (nullable function_id Spans.ai_function_id) in
+  match text with None -> p | Some needle ->
+    let pattern, escape = Q.Expr.contains_pattern needle in
+    Q.Expr.and_ p (Q.Expr.like ~escape Spans.ai_search_text pattern)
+
+let search_ai_calls ?(attr_contains = []) ?min_duration_ms
+    ?model ?provider ?session_id ?function_id ?text
+    (filter : span_search_filter) t =
+  q_select t.pool Q.Select.(from Spans.table span_projection
+    |> where (ai_span_predicate ~attr_contains ?min_duration_ms
+      ?model ?provider ?session_id ?function_id ?text filter)
+    |> order_by ~desc:true Spans.start_time_ns
+    |> order_by ~desc:true Spans.id
+    |> limit (filter.limit + 1))
+  |> Eta.Effect.map (page_of_rows ~limit:filter.limit ~position:span_position)
+
+let search_spans ?(attr_contains = []) ?min_duration_ms (filter : span_search_filter) t =
+  q_select t.pool Q.Select.(
+    from Spans.table span_projection
+    |> where (span_search_predicate ~attr_contains ?min_duration_ms filter)
+    |> order_by ~desc:true Spans.start_time_ns
+    |> order_by ~desc:true Spans.id
+    |> limit (filter.limit + 1))
+  |> Eta.Effect.map (page_of_rows ~limit:filter.limit ~position:span_position)
+
+let ai_content_keys = [
+  "ai.prompt"; "ai.response"; "ai.tool.input"; "ai.tool.output";
+  "ai.telemetry.prompt"; "ai.telemetry.response";
+  "gen_ai.prompt"; "gen_ai.completion";
+  "gen_ai.input.messages"; "gen_ai.output.messages";
+  "gen_ai.tool.call.arguments"; "gen_ai.tool.call.result";
+]
+
+let ai_text_trace_predicate text =
+  let owners = Q.Select.(
+    from Span_attributes.table Q.Projection.(one Span_attributes.owner_id)
+    |> where Q.Expr.(and_
+         (in_values Span_attributes.key ai_content_keys)
+         (like ~escape:'\\' Span_attributes.value (literal_like_pattern text)))
+    |> compile) in
+  let traces = Q.Select.(
+    from Spans.table Q.Projection.(one Spans.trace_id)
+    |> where Q.Expr.(and_ (eq Spans.is_ai_call true) (in_select Spans.id owners))
+    |> compile) in
+  Q.Expr.in_select Trace_summaries.trace_id traces
+
+let trace_summary_predicate ?(attr_contains = []) ?min_duration_ms ?text
+    (filter : trace_search_filter) =
+  let p = Q.Expr.and_ (window_predicate Trace_summaries.started_at_ns filter.window)
+      (keyset_predicate ~sort_key:Trace_summaries.started_at_ns ~tie_breaker:Trace_summaries.trace_id filter.cursor) in
+  let p = match filter.service with None -> p | Some x -> Q.Expr.and_ p (trace_service_predicate Trace_summaries.trace_id x) in
+  let p = match filter.status with
+    | None -> p
+    | Some "error" -> Q.Expr.and_ p (Q.Expr.gt Trace_summaries.error_count 0)
+    | Some "ok" -> Q.Expr.and_ p (Q.Expr.eq Trace_summaries.error_count 0)
+    | Some _ -> p in
+  let p = match min_duration_ms with None -> p | Some x ->
+    Q.Expr.and_ p (Q.Expr.ge Trace_summaries.duration_ms x) in
+  let p = match text with None -> p | Some x ->
+    Q.Expr.and_ p (ai_text_trace_predicate x) in
+  if Option.is_none filter.operation && filter.attrs = [] && attr_contains = [] then p
+  else
+    let span_p = Q.Expr.and_ (window_predicate Spans.start_time_ns filter.window)
+        (span_attrs_predicate ~contains:attr_contains Spans.id filter.attrs) in
+    let span_p = match filter.operation with None -> span_p | Some x ->
+      Q.Expr.and_ span_p (Q.Expr.like ~escape:'\\' Spans.operation_name (literal_like_pattern x)) in
+    let matching = Q.Select.(from Spans.table Q.Projection.(one Spans.trace_id)
+      |> where span_p |> compile) in
+    Q.Expr.and_ p (Q.Expr.in_select Trace_summaries.trace_id matching)
+
+let trace_summary_search_query ?(attr_contains = []) ?min_duration_ms ?text
+    (filter : trace_search_filter) =
+  Q.Select.(from Trace_summaries.table trace_summary_projection
+    |> where (trace_summary_predicate ~attr_contains ?min_duration_ms ?text filter)
     |> order_by ~desc:true Trace_summaries.started_at_ns
     |> order_by ~desc:true Trace_summaries.trace_id
     |> limit (filter.limit + 1))
 
-let search_traces (filter : trace_search_filter) t =
-  let needs_span_filter =
-    Option.is_some filter.operation || Option.is_some filter.status
-    || filter.attrs <> []
-  in
-  if not needs_span_filter then
-    q_select t.pool (trace_summary_search_query filter None)
-    |> Eta.Effect.map
-         (page_of_rows ~limit:filter.limit ~position:trace_position)
-  else
-    let open Eta.Syntax in
-    let span_filter =
-      {
-        service = filter.service;
-        trace_id = None;
-        operation = filter.operation;
-        parent_operation = None;
-        status = filter.status;
-        attrs = filter.attrs;
-        window = filter.window;
-        cursor = None;
-        limit = 10_000;
-      }
-    in
-    let* spans_page = search_spans span_filter t in
-    let trace_ids =
-      spans_page.items
-      |> List.map (fun (span : Model.span) -> span.trace_id)
-      |> sorted_unique
-    in
-    match trace_ids with
-    | [] -> Eta.Effect.pure empty_page
-    | trace_ids ->
-        q_select t.pool (trace_summary_search_query filter (Some trace_ids))
-        |> Eta.Effect.map
-             (page_of_rows ~limit:filter.limit ~position:trace_position)
+let search_traces ?(attr_contains = []) ?min_duration_ms ?text
+    (filter : trace_search_filter) t =
+  q_select t.pool (trace_summary_search_query ~attr_contains ?min_duration_ms ?text filter)
+  |> Eta.Effect.map (page_of_rows ~limit:filter.limit ~position:trace_position)
 
-let log_predicate (filter : log_filter) =
+let severity_predicate ?min_severity severity =
+  let p = match severity with None -> Q.Expr.true_ | Some x ->
+    Q.Expr.eq Logs.severity_normalized (String.uppercase_ascii x) in
+  match min_severity with
+  | None -> p
+  | Some minimum ->
+      let text_levels =
+        [ (1, [ "TRACE"; "TRACE2"; "TRACE3"; "TRACE4" ]);
+          (5, [ "DEBUG"; "DEBUG2"; "DEBUG3"; "DEBUG4" ]);
+          (9, [ "INFO"; "INFO2"; "INFO3"; "INFO4" ]);
+          (13, [ "WARN"; "WARNING"; "WARN2"; "WARN3"; "WARN4" ]);
+          (17, [ "ERROR"; "ERROR2"; "ERROR3"; "ERROR4" ]);
+          (21, [ "FATAL"; "FATAL2"; "FATAL3"; "FATAL4" ]) ]
+        |> List.filter_map (fun (level, names) ->
+             if level >= minimum then Some names else None)
+        |> List.concat in
+      Q.Expr.and_ p Q.Expr.(or_
+        (ge Logs.severity_number (Some minimum))
+        (and_ (is_null Logs.severity_number)
+          (in_values Logs.severity_normalized text_levels)))
+
+let log_predicate ?min_severity (filter : log_filter) =
   let predicate = Q.Expr.true_ in
   let predicate =
     match filter.service with
@@ -1974,14 +2045,15 @@ let log_predicate (filter : log_filter) =
   let predicate =
     match filter.severity with
     | None -> predicate
-    | Some severity -> Q.Expr.and_ predicate (Q.Expr.eq Logs.severity_text severity)
+    | Some severity -> Q.Expr.and_ predicate (severity_predicate (Some severity))
   in
   let predicate =
     match filter.contains with
     | None -> predicate
     | Some contains ->
-        Q.Expr.and_ predicate (Q.Expr.like Logs.body ("%" ^ contains ^ "%"))
+        Q.Expr.and_ predicate (Q.Expr.like ~escape:'\\' Logs.body (literal_like_pattern contains))
   in
+  let predicate = Q.Expr.and_ predicate (severity_predicate ?min_severity None) in
   let predicate =
     Q.Expr.and_ predicate (window_predicate Logs.timestamp_ns filter.window)
   in
@@ -1989,315 +2061,399 @@ let log_predicate (filter : log_filter) =
     (keyset_predicate ~sort_key:Logs.timestamp_ns ~tie_breaker:Logs.id
        filter.cursor)
 
-let list_logs (filter : log_filter) t =
+let list_logs ?min_severity (filter : log_filter) t =
   q_select t.pool
     Q.Select.(
       from Logs.table log_projection
-      |> where (log_predicate filter)
+      |> where (log_predicate ?min_severity filter)
       |> order_by ~desc:true Logs.timestamp_ns
       |> order_by ~desc:true Logs.id
       |> limit (filter.limit + 1))
   |> Eta.Effect.map (page_of_rows ~limit:filter.limit ~position:log_position)
 
-let log_search_predicate (filter : log_search_filter) owner_ids =
-  let predicate = Q.Expr.true_ in
-  let predicate =
-    match filter.service with
-    | None -> predicate
-    | Some service -> Q.Expr.and_ predicate (Q.Expr.eq Logs.service_name service)
-  in
-  let predicate =
-    match filter.trace_id with
-    | None -> predicate
-    | Some trace_id ->
-        Q.Expr.and_ predicate (Q.Expr.eq Logs.trace_id (Some trace_id))
-  in
-  let predicate =
-    match filter.span_id with
-    | None -> predicate
-    | Some span_id -> Q.Expr.and_ predicate (Q.Expr.eq Logs.span_id (Some span_id))
-  in
-  let predicate =
-    match filter.severity with
-    | None -> predicate
-    | Some severity -> Q.Expr.and_ predicate (Q.Expr.eq Logs.severity_text severity)
-  in
-  let predicate =
-    match filter.body with
-    | None -> predicate
-    | Some body -> Q.Expr.and_ predicate (Q.Expr.like Logs.body ("%" ^ body ^ "%"))
-  in
-  let predicate =
-    match owner_ids with
-    | None -> predicate
-    | Some ids -> Q.Expr.and_ predicate (Q.Expr.in_values Logs.id ids)
-  in
-  let predicate =
-    Q.Expr.and_ predicate (window_predicate Logs.timestamp_ns filter.window)
-  in
-  Q.Expr.and_ predicate
-    (keyset_predicate ~sort_key:Logs.timestamp_ns ~tie_breaker:Logs.id
-       filter.cursor)
+let log_search_predicate ?(attr_contains = []) ?min_severity
+    (filter : log_search_filter) =
+  let p = Q.Expr.and_ (window_predicate Logs.timestamp_ns filter.window)
+      (log_attrs_predicate ~contains:attr_contains Logs.id filter.attrs) in
+  let p = match filter.service with None -> p | Some x -> Q.Expr.and_ p (Q.Expr.eq Logs.service_name x) in
+  let p = match filter.trace_id with None -> p | Some x -> Q.Expr.and_ p (Q.Expr.eq Logs.trace_id (Some x)) in
+  let p = match filter.span_id with None -> p | Some x -> Q.Expr.and_ p (Q.Expr.eq Logs.span_id (Some x)) in
+  let p = Q.Expr.and_ p (severity_predicate ?min_severity filter.severity) in
+  let p = match filter.body with None -> p | Some x -> Q.Expr.and_ p (Q.Expr.like ~escape:'\\' Logs.body (literal_like_pattern x)) in
+  Q.Expr.and_ p (keyset_predicate ~sort_key:Logs.timestamp_ns ~tie_breaker:Logs.id filter.cursor)
 
-let search_logs (filter : log_search_filter) t =
+let search_logs ?(attr_contains = []) ?min_severity (filter : log_search_filter) t =
+  q_select t.pool Q.Select.(from Logs.table log_projection
+    |> where (log_search_predicate ~attr_contains ?min_severity filter)
+    |> order_by ~desc:true Logs.timestamp_ns
+    |> order_by ~desc:true Logs.id
+    |> limit (filter.limit + 1))
+  |> Eta.Effect.map (page_of_rows ~limit:filter.limit ~position:log_position)
+
+module Ranked_trace_duration = struct
+  module T = Q.Table.Make (struct let name = "ranked_trace_duration" end)
+  include T
+  let duration_ms = column "duration_ms" Q.float
+  let rank = column "rank" Q.int
+end
+
+module Trace_stat_pairs = struct
+  module T = Q.Table.Make (struct let name = "trace_stat_pairs" end)
+  include T
+  let owner_id = column "owner_id" Q.text
+  let value = column "value" Q.text
+end
+
+module Trace_stat_rows = struct
+  module T = Q.Table.Make (struct let name = "trace_stat_rows" end)
+  include T
+  let value = column "value" Q.text
+  let duration_ms = column "duration_ms" Q.float
+  let error_flag = column "error_flag" Q.int
+end
+
+let trace_stats ?(attr_contains = []) ?min_duration_ms (filter : trace_stats_filter) t =
   let open Eta.Syntax in
-  let* owner_ids =
-    match filter.attrs with
-    | [] -> Eta.Effect.pure None
-    | attrs ->
-        let* ids = log_owner_ids_for_attrs t.pool attrs in
-        Eta.Effect.pure (Some ids)
-  in
-  match owner_ids with
-  | Some [] -> Eta.Effect.pure empty_page
-  | _ ->
-      q_select t.pool
-        Q.Select.(
-          from Logs.table log_projection
-          |> where (log_search_predicate filter owner_ids)
-          |> order_by ~desc:true Logs.timestamp_ns
-          |> order_by ~desc:true Logs.id
-          |> limit (filter.limit + 1))
-      |> Eta.Effect.map
-           (page_of_rows ~limit:filter.limit ~position:log_position)
+  let search_filter : trace_search_filter = {
+    service = filter.service; operation = filter.operation;
+    status = filter.status; attrs = filter.attrs;
+    window = filter.window; cursor = None; limit = filter.limit;
+  } in
+  let predicate = trace_summary_predicate ~attr_contains ?min_duration_ms search_filter in
+  let stat_for_group group count avg error_count group_pred =
+    let* value =
+      if filter.agg <> "p95_duration" || count = 0 then
+        Eta.Effect.pure (match filter.agg with
+          | "avg_duration" -> Option.value avg ~default:0.
+          | "error_rate" -> float_of_int error_count /. float_of_int (max 1 count)
+          | _ -> float_of_int count)
+      else
+        (* The CTE projects only durations; SQLite computes ROW_NUMBER over the
+           complete filtered group, never a sampled span page (acc-7kkc). *)
+        let ranked = Q.Select.(
+          from Trace_summaries.table Q.Projection.(t2
+            (one Trace_summaries.duration_ms)
+            (row_number ~as_:"rank" ~order_by:Trace_summaries.duration_ms ()))
+          |> where Q.Expr.(and_ predicate (group_pred ()))
+          |> compile) in
+        let wanted = int_of_float (ceil (0.95 *. float_of_int count)) in
+        let* durations = q_select t.pool Q.Select.(
+          from Ranked_trace_duration.table Q.Projection.(one Ranked_trace_duration.duration_ms)
+          |> with_cte ~name:"ranked_trace_duration" ranked
+          |> where Q.Expr.(eq Ranked_trace_duration.rank wanted)) in
+        Eta.Effect.pure ((match durations with duration :: _ -> duration | [] -> 0.)) in
+    Eta.Effect.pure { Model.group; value; count } in
+  let summaries col =
+    q_select t.pool Q.Select.(
+      from Trace_summaries.table Q.Projection.(t3
+        (one col) (count ()) (avg Q.Numeric.float Trace_summaries.duration_ms))
+      |> where predicate |> group_by col) in
+  let errors col =
+    q_select t.pool Q.Select.(
+      from Trace_summaries.table Q.Projection.(t2 (one col) (count ()))
+      |> where Q.Expr.(and_ predicate (gt Trace_summaries.error_count 0))
+      |> group_by col) in
+  let by_column col =
+    let* groups = summaries col in
+    let* error_groups = if filter.agg = "error_rate" then errors col
+      else Eta.Effect.pure [] in
+    let error_counts = Hashtbl.create (List.length error_groups) in
+    List.iter (fun (group, count) -> Hashtbl.replace error_counts group count) error_groups;
+    let rec collect = function
+      | [] -> Eta.Effect.pure []
+      | (group, count, avg) :: rest ->
+          let* item = stat_for_group group count avg
+            (Option.value (Hashtbl.find_opt error_counts group) ~default:0)
+            (fun () -> Q.Expr.eq col group) in
+          let* others = collect rest in
+          Eta.Effect.pure (item :: others) in
+    let* items = collect groups in
+    Eta.Effect.pure (sort_stat_items filter.limit items) in
+  match filter.group_by with
+  | "service" -> by_column Trace_summaries.service_name
+  | "operation" -> by_column Trace_summaries.root_operation_name
+  | "status" ->
+      let per_status group status_pred =
+        let group_pred = Q.Expr.and_ predicate status_pred in
+        let* counts = q_select t.pool Q.Select.(
+          from Trace_summaries.table Q.Projection.(t2
+            (count ()) (avg Q.Numeric.float Trace_summaries.duration_ms))
+          |> where group_pred) in
+        let count, avg = List.hd counts in
+        if count = 0 then Eta.Effect.pure None else
+        let* item = stat_for_group group count avg
+          (if group = "error" then count else 0) (fun () -> status_pred) in
+        Eta.Effect.pure (Some item) in
+      let* ok = per_status "ok" Q.Expr.(eq Trace_summaries.error_count 0) in
+      let* error = per_status "error" Q.Expr.(gt Trace_summaries.error_count 0) in
+      Eta.Effect.pure (sort_stat_items filter.limit (List.filter_map Fun.id [ok; error]))
+  | group_by -> (match attr_group_key group_by with
+      | None -> Eta.Effect.pure []
+      | Some key ->
+          let filtered_trace_ids = Q.Select.(
+            from Trace_summaries.table Q.Projection.(one Trace_summaries.trace_id)
+            |> where predicate |> compile) in
+          let left col = Q.Scope.column (Q.Scope.left Q.Scope.self) col in
+          let right col = Q.Scope.column Q.Scope.right col in
+          let source = Q.Source.(join Spans.table
+            ~on:Q.Expr.(eq_col (left Span_attributes.owner_id) (right Spans.id))
+            (from Span_attributes.table)) in
+          let base_pred = Q.Expr.(and_
+            (eq (left Span_attributes.key) key)
+            (in_select (right Spans.trace_id) filtered_trace_ids)) in
+           (* Distinct (trace, value) pairs prevent duplicate span attributes
+              from multiplying trace totals. Group counts and errors in SQL;
+              only exact p95 reads durations per group (acc-1ccu). *)
+           let pairs = Q.Select.(
+             from_source source Q.Projection.(t2
+               (expr ~as_:"owner_id" Q.Expr.(col (right Spans.trace_id)))
+               (expr ~as_:"value" Q.Expr.(col (left Span_attributes.value))))
+             |> where base_pred |> distinct |> compile) in
+           let pair_left col = Q.Scope.column (Q.Scope.left Q.Scope.self) col in
+           let summary_right col = Q.Scope.column Q.Scope.right col in
+           let pair_source = Q.Source.(join Trace_summaries.table
+             ~on:Q.Expr.(eq_col (pair_left Trace_stat_pairs.owner_id)
+               (summary_right Trace_summaries.trace_id))
+             (from Trace_stat_pairs.table)) in
+           let rows = Q.Select.(
+             from_source pair_source Q.Projection.(t3
+               (expr ~as_:"value" Q.Expr.(col (pair_left Trace_stat_pairs.value)))
+               (expr ~as_:"duration_ms"
+                 Q.Expr.(col (summary_right Trace_summaries.duration_ms)))
+               (expr ~as_:"error_flag" Q.Expr.(case
+                 [gt (summary_right Trace_summaries.error_count) 0, int_lit 1]
+                 ~default:(int_lit 0))))
+             |> with_cte ~name:"trace_stat_pairs" pairs |> compile) in
+           let* groups = q_select t.pool Q.Select.(
+             from Trace_stat_rows.table Q.Projection.(t4
+               (one Trace_stat_rows.value) (count ())
+               (avg Q.Numeric.float Trace_stat_rows.duration_ms)
+               (sum_int Trace_stat_rows.error_flag))
+             |> with_cte ~name:"trace_stat_rows" rows
+             |> group_by Trace_stat_rows.value) in
+           let rec collect = function
+             | [] -> Eta.Effect.pure []
+             | (value, count, avg, error_count) :: rest ->
+                  let group_pred () =
+                    let matching_trace_ids = Q.Select.(
+                      from_source source Q.Projection.(one (right Spans.trace_id))
+                      |> where Q.Expr.(and_ base_pred
+                        (eq (left Span_attributes.value) value))
+                      |> compile) in
+                    Q.Expr.(in_select
+                      Trace_summaries.trace_id matching_trace_ids) in
+                 let* item = stat_for_group value count avg
+                   (Option.value error_count ~default:0) group_pred in
+                 let* tail = collect rest in
+                 Eta.Effect.pure (item :: tail) in
+           let* items = collect groups in
+           Eta.Effect.pure (sort_stat_items filter.limit items))
 
-let trace_attr_lookup t trace_ids key =
+let ai_stats ?(attr_contains = []) ?min_duration_ms
+    ?model ?provider ?session_id ?function_id ?text
+    ~group_by ~agg (filter : span_search_filter) t =
   let open Eta.Syntax in
-  let trace_id_set = String_set.of_list trace_ids in
-  let* rows = span_attr_values_for_key t.pool key in
-  let table = Hashtbl.create 16 in
-  List.iter
-    (fun (owner_id, value) ->
-      let trace_id = owner_trace_id owner_id in
-      if
-        String_set.mem trace_id trace_id_set
-        && not (Hashtbl.mem table trace_id)
-      then Hashtbl.add table trace_id value)
-    rows;
-  Eta.Effect.pure table
+  let predicate = ai_span_predicate ~attr_contains ?min_duration_ms
+    ?model ?provider ?session_id ?function_id ?text filter in
+  let p95 count group_pred =
+    let ranked = Q.Select.(
+      from Spans.table Q.Projection.(t2 (one Spans.duration_ms)
+        (row_number ~as_:"rank" ~order_by:Spans.duration_ms ()))
+      |> where Q.Expr.(and_ predicate group_pred) |> compile) in
+    let rank = int_of_float (ceil (0.95 *. float_of_int count)) in
+    let* durations = q_select t.pool Q.Select.(
+      from Ranked_trace_duration.table Q.Projection.(one Ranked_trace_duration.duration_ms)
+      |> with_cte ~name:"ranked_trace_duration" ranked
+      |> where Q.Expr.(eq Ranked_trace_duration.rank rank)) in
+    Eta.Effect.pure (match durations with duration :: _ -> duration | [] -> 0.) in
+  let by_column label col =
+    let* groups = q_select t.pool Q.Select.(
+      from Spans.table Q.Projection.(t2
+        (t3 (one col) (count ()) (avg Q.Numeric.float Spans.duration_ms))
+        (t2 (sum_int Spans.ai_input_tokens) (sum_int Spans.ai_output_tokens)))
+      |> where predicate |> group_by col) in
+    let rec collect = function
+      | [] -> Eta.Effect.pure []
+      | ((key, count, avg), (input_tokens, output_tokens)) :: rest ->
+          let group = label key in
+          let* value = match agg with
+            | "avg_duration" -> Eta.Effect.pure (Option.value avg ~default:0.)
+            | "p95_duration" -> p95 count (Q.Expr.eq col key)
+            | "total_input_tokens" -> Eta.Effect.pure
+                (float_of_int (Option.value input_tokens ~default:0))
+            | "total_output_tokens" -> Eta.Effect.pure
+                (float_of_int (Option.value output_tokens ~default:0))
+            | _ -> Eta.Effect.pure (float_of_int count) in
+          let* tail = collect rest in
+          Eta.Effect.pure ({ Model.group; value; count } :: tail) in
+    let* items = collect groups in
+    Eta.Effect.pure (sort_stat_items filter.limit items) in
+  let nullable = Option.value ~default:"unknown" in
+  match group_by with
+  | "model" -> by_column nullable Spans.ai_model
+  | "provider" -> by_column nullable Spans.ai_provider
+  | "sessionId" -> by_column nullable Spans.ai_session_id
+  | "functionId" -> by_column nullable Spans.ai_function_id
+  | "status" -> by_column Fun.id Spans.status
+  | _ -> by_column (fun _ -> "unknown") Spans.is_ai_call
 
-let trace_stats (filter : trace_stats_filter) t =
+let log_stats ?(attr_contains = []) ?min_severity
+    (filter : log_stats_filter) t =
   let open Eta.Syntax in
-  let* summaries_page =
-    search_traces
-      {
-        service = filter.service;
-        operation = filter.operation;
-        status = filter.status;
-        attrs = filter.attrs;
-        window = filter.window;
-        cursor = None;
-        limit = 10_000;
-      }
-      t
-  in
-  let summaries = summaries_page.items in
-  let trace_ids =
-    summaries
-    |> List.map (fun (summary : Model.trace_summary) -> summary.trace_id)
-    |> sorted_unique
-  in
-  let* attr_lookup =
-    match attr_group_key filter.group_by with
-    | None -> Eta.Effect.pure None
-    | Some key ->
-        let* lookup = trace_attr_lookup t trace_ids key in
-        Eta.Effect.pure (Some lookup)
-  in
-  let buckets = Hashtbl.create 16 in
-  let group_for_summary (summary : Model.trace_summary) =
-    match filter.group_by with
-    | "service" -> summary.service_name
-    | "operation" -> summary.root_operation_name
-    | "status" -> if summary.error_count > 0 then "error" else "ok"
-    | group_by -> (
-        match (attr_group_key group_by, attr_lookup) with
-        | Some _, Some lookup ->
-            Option.value (Hashtbl.find_opt lookup summary.trace_id)
-              ~default:"unknown"
-        | _ -> "unknown")
-  in
-  List.iter
-    (fun (summary : Model.trace_summary) ->
-      let group = group_for_summary summary in
-      let bucket =
-        match Hashtbl.find_opt buckets group with
-        | Some bucket -> bucket
-        | None ->
-            let bucket =
-              {
-                stat_count = 0;
-                total_duration_ms = 0.0;
-                durations_ms = [];
-                error_traces = 0;
-              }
-            in
-            Hashtbl.add buckets group bucket;
-            bucket
-      in
-      bucket.stat_count <- bucket.stat_count + 1;
-      bucket.total_duration_ms <- bucket.total_duration_ms +. summary.duration_ms;
-      bucket.durations_ms <- summary.duration_ms :: bucket.durations_ms;
-      if summary.error_count > 0 then
-        bucket.error_traces <- bucket.error_traces + 1)
-    summaries;
-  let items =
-    Hashtbl.fold
-      (fun group bucket acc ->
-        let count = bucket.stat_count in
-        let value =
-          match filter.agg with
-          | "count" -> float_of_int count
-          | "avg_duration" ->
-              bucket.total_duration_ms /. float_of_int (max 1 count)
-          | "p95_duration" -> percentile 0.95 bucket.durations_ms
-          | "error_rate" ->
-              float_of_int bucket.error_traces /. float_of_int (max 1 count)
-          | _ -> float_of_int count
-        in
-        { Model.group; value; count } :: acc)
-      buckets []
-  in
-  Eta.Effect.pure (sort_stat_items filter.limit items)
+  let search_filter : log_search_filter = {
+    service = filter.service; trace_id = filter.trace_id;
+    span_id = filter.span_id; severity = filter.severity;
+    body = filter.body; attrs = filter.attrs;
+    window = filter.window; cursor = None; limit = filter.limit;
+  } in
+  let predicate = log_search_predicate ~attr_contains ?min_severity search_filter in
+  let as_items groups =
+    groups |> List.map (fun (group, count) ->
+      { Model.group; count; value = float_of_int count })
+    |> sort_stat_items filter.limit in
+  let by_column col =
+    let* groups = q_select t.pool Q.Select.(
+      from Logs.table Q.Projection.(t2 (one col) (count ()))
+      |> where predicate |> group_by col) in
+    Eta.Effect.pure (as_items groups) in
+  match filter.group_by with
+  | "service" -> by_column Logs.service_name
+  | "severity" -> by_column Logs.severity_text
+  | "scope" ->
+      let* groups = q_select t.pool Q.Select.(
+        from Logs.table Q.Projection.(t2 (one Logs.scope_name) (count ()))
+        |> where predicate |> group_by Logs.scope_name) in
+      Eta.Effect.pure (as_items (List.map (fun (name,count) ->
+        (Option.value name ~default:"unknown", count)) groups))
+  | group_by ->
+      (match attr_group_key group_by with
+      | None ->
+          let* count = q_select t.pool Q.Select.(
+            from Logs.table Q.Projection.(count ()) |> where predicate) in
+          Eta.Effect.pure (as_items ["unknown", List.hd count])
+      | Some key ->
+          let filtered_ids = Q.Select.(
+            from Logs.table Q.Projection.(one Logs.id)
+            |> where predicate |> compile) in
+          let left col = Q.Scope.column (Q.Scope.left Q.Scope.self) col in
+          let right col = Q.Scope.column Q.Scope.right col in
+          let source = Q.Source.(join Logs.table
+            ~on:Q.Expr.(eq_col (left Log_attributes.owner_id) (right Logs.id))
+            (from Log_attributes.table)) in
+          let* groups = q_select t.pool Q.Select.(
+            from_source source Q.Projection.(t2
+              (one (left Log_attributes.value)) (count ()))
+            |> where Q.Expr.(and_ (eq (left Log_attributes.key) key)
+              (in_select (right Logs.id) filtered_ids))
+            |> group_by (left Log_attributes.value)) in
+          Eta.Effect.pure (as_items groups))
 
-let log_stats (filter : log_stats_filter) t =
-  let open Eta.Syntax in
-  let* logs_page =
-    search_logs
-      {
-        service = filter.service;
-        trace_id = filter.trace_id;
-        span_id = filter.span_id;
-        severity = filter.severity;
-        body = filter.body;
-        attrs = filter.attrs;
-        window = filter.window;
-        cursor = None;
-        limit = 10_000;
-      }
-      t
-  in
-  let logs = logs_page.items in
-  let groups = Hashtbl.create 16 in
-  let group_for_log (log : Model.log_record) =
-    match filter.group_by with
-    | "service" -> log.service_name
-    | "severity" -> log.severity_text
-    | "scope" -> Option.value log.scope_name ~default:"unknown"
-    | group_by -> (
-        match attr_group_key group_by with
-        | Some key ->
-            Option.value
-              (match attr_value key log.attributes with
-              | Some _ as value -> value
-              | None -> attr_value key log.resource)
-              ~default:"unknown"
-        | None -> "unknown")
-  in
-  List.iter (fun log -> add_count groups (group_for_log log)) logs;
-  let items =
-    Hashtbl.fold
-      (fun group count acc ->
-        { Model.group; value = float_of_int count; count } :: acc)
-      groups []
-  in
-  Eta.Effect.pure (sort_stat_items filter.limit items)
-
-let count_span_facets spans field key =
-  let counts = Hashtbl.create 16 in
-  let count_attrs attrs =
-    match field with
-    | "attribute_keys" -> List.iter (fun (key, _) -> add_count counts key) attrs
-    | "attribute_values" -> (
-        match key with
-        | None -> ()
-        | Some wanted ->
-            List.iter
-              (fun (key, value) ->
-                if String.equal key wanted then add_count counts (Model.attr_string_value value))
-              attrs)
-    | _ -> ()
-  in
-  List.iter
-    (fun (span : Model.span) ->
-      match field with
-      | "service" -> add_count counts span.service_name
-      | "operation" -> add_count counts span.operation_name
-      | "status" -> add_count counts (Model.span_status_to_string span.status)
-      | "attribute_keys" | "attribute_values" ->
-          count_attrs (span.resource @ span.attributes)
-      | _ -> ())
-    spans;
-  counts
-
-let count_log_facets logs field key =
-  let counts = Hashtbl.create 16 in
-  let count_attrs attrs =
-    match field with
-    | "attribute_keys" -> List.iter (fun (key, _) -> add_count counts key) attrs
-    | "attribute_values" -> (
-        match key with
-        | None -> ()
-        | Some wanted ->
-            List.iter
-              (fun (key, value) ->
-                if String.equal key wanted then add_count counts (Model.attr_string_value value))
-              attrs)
-    | _ -> ()
-  in
-  List.iter
-    (fun (log : Model.log_record) ->
-      match field with
-      | "service" -> add_count counts log.service_name
-      | "severity" -> add_count counts log.severity_text
-      | "scope" -> add_count counts (Option.value log.scope_name ~default:"unknown")
-      | "attribute_keys" | "attribute_values" ->
-          count_attrs (log.resource @ log.attributes)
-      | _ -> ())
-    logs;
-  counts
+module Facet_pairs = struct
+  module T = Q.Table.Make (struct let name = "facet_pairs" end)
+  include T
+  let owner_id = column "owner_id" Q.text
+  let value = column "value" Q.text
+end
 
 let facets (filter : facet_filter) t =
   let open Eta.Syntax in
-  match filter.kind with
-  | "traces" ->
-      let* spans_page =
-        search_spans
-          {
-            service = filter.service;
-            trace_id = None;
-            operation = None;
-            parent_operation = None;
-            status = None;
-            attrs = [];
-            window = filter.window;
-            cursor = None;
-            limit = 10_000;
-          }
-          t
-      in
-      Eta.Effect.pure
-        (facet_items_from_counts filter.limit
-           (count_span_facets spans_page.items filter.field filter.key))
-  | "logs" ->
-      let* logs_page =
-        search_logs
-          {
-            service = filter.service;
-            trace_id = None;
-            span_id = None;
-            severity = None;
-            body = None;
-            attrs = [];
-            window = filter.window;
-            cursor = None;
-            limit = 10_000;
-          }
-          t
-      in
-      Eta.Effect.pure
-        (facet_items_from_counts filter.limit
-           (count_log_facets logs_page.items filter.field filter.key))
+  let to_items ?(short_values = false) rows =
+    rows
+    |> List.filter (fun (value, _) ->
+         not short_values || String.length value <= 512)
+    |> List.map (fun (value, count) -> { Model.value; count })
+    |> List.sort (fun (a : Model.facet_item) b ->
+         let n = compare b.count a.count in
+         if n <> 0 then n else String.compare a.value b.value)
+    |> take filter.limit in
+  let trace_predicate =
+    let p = window_predicate Trace_summaries.started_at_ns filter.window in
+    match filter.service with None -> p | Some service ->
+      Q.Expr.and_ p (trace_service_predicate Trace_summaries.trace_id service) in
+  let log_predicate =
+    let p = window_predicate Logs.timestamp_ns filter.window in
+    match filter.service with None -> p | Some service ->
+      Q.Expr.and_ p (Q.Expr.eq Logs.service_name service) in
+  let trace_col col = q_select t.pool Q.Select.(
+    from Trace_summaries.table Q.Projection.(t2 (one col) (count ()))
+    |> where trace_predicate |> group_by col) in
+  let log_col col = q_select t.pool Q.Select.(
+    from Logs.table Q.Projection.(t2 (one col) (count ()))
+    |> where log_predicate |> group_by col) in
+  let grouped_pairs pairs =
+    q_select t.pool Q.Select.(
+      from Facet_pairs.table Q.Projection.(t2 (one Facet_pairs.value) (count ()))
+      |> with_cte ~name:"facet_pairs" pairs
+      |> group_by Facet_pairs.value) in
+  let trace_attributes () =
+    let trace_ids = Q.Select.(
+      from Trace_summaries.table Q.Projection.(one Trace_summaries.trace_id)
+      |> where trace_predicate |> compile) in
+    let left col = Q.Scope.column (Q.Scope.left Q.Scope.self) col in
+    let right col = Q.Scope.column Q.Scope.right col in
+    let source = Q.Source.(join Spans.table
+      ~on:Q.Expr.(eq_col (left Span_attributes.owner_id) (right Spans.id))
+      (from Span_attributes.table)) in
+    let attr_value = match filter.field with
+      | "attribute_keys" -> left Span_attributes.key
+      | _ -> left Span_attributes.value in
+    let attr_predicate = match filter.field, filter.key with
+      | "attribute_values", Some key -> Q.Expr.eq (left Span_attributes.key) key
+      | _ -> Q.Expr.true_ in
+    let pairs = Q.Select.(
+      from_source source Q.Projection.(t2
+        (expr ~as_:"owner_id" Q.Expr.(col (right Spans.trace_id)))
+        (expr ~as_:"value" Q.Expr.(col attr_value)))
+      |> where Q.Expr.(and_ attr_predicate
+        (in_select (right Spans.trace_id) trace_ids))
+      |> distinct |> compile) in
+    grouped_pairs pairs in
+  let log_attributes () =
+    let log_ids = Q.Select.(
+      from Logs.table Q.Projection.(one Logs.id)
+      |> where log_predicate |> compile) in
+    let attr_value = match filter.field with
+      | "attribute_keys" -> Log_attributes.key
+      | _ -> Log_attributes.value in
+    let attr_predicate = match filter.field, filter.key with
+      | "attribute_values", Some key -> Q.Expr.eq Log_attributes.key key
+      | _ -> Q.Expr.true_ in
+    let pairs = Q.Select.(
+      from Log_attributes.table Q.Projection.(t2
+        (expr ~as_:"owner_id" Q.Expr.(col Log_attributes.owner_id))
+        (expr ~as_:"value" Q.Expr.(col attr_value)))
+      |> where Q.Expr.(and_ attr_predicate
+        (in_select Log_attributes.owner_id log_ids))
+      |> distinct |> compile) in
+    grouped_pairs pairs in
+  match filter.kind, filter.field with
+  | "traces", "service" ->
+      let* rows = trace_col Trace_summaries.service_name in
+      Eta.Effect.pure (to_items rows)
+  | "traces", "operation" ->
+      let* rows = trace_col Trace_summaries.root_operation_name in
+      Eta.Effect.pure (to_items rows)
+  | "traces", "status" ->
+      let count pred = q_select t.pool Q.Select.(
+        from Trace_summaries.table Q.Projection.(count ())
+        |> where Q.Expr.(and_ trace_predicate pred)) in
+      let* ok = count Q.Expr.(eq Trace_summaries.error_count 0) in
+      let* error = count Q.Expr.(gt Trace_summaries.error_count 0) in
+      Eta.Effect.pure (to_items ["ok", List.hd ok; "error", List.hd error]
+        |> List.filter (fun item -> item.Model.count > 0))
+  | "logs", "service" ->
+      let* rows = log_col Logs.service_name in Eta.Effect.pure (to_items rows)
+  | "logs", "severity" ->
+      let* rows = log_col Logs.severity_text in Eta.Effect.pure (to_items rows)
+  | "logs", "scope" ->
+      let* rows = log_col Logs.scope_name in
+      Eta.Effect.pure (to_items (List.map (fun (v,n) ->
+        Option.value v ~default:"unknown", n) rows))
+  | ("traces" | "logs"), ("attribute_keys" | "attribute_values")
+      when filter.field <> "attribute_values" || Option.is_some filter.key ->
+      let* rows = if filter.kind = "traces" then trace_attributes ()
+        else log_attributes () in
+      Eta.Effect.pure (to_items ~short_values:(filter.field = "attribute_values") rows)
   | _ -> Eta.Effect.pure []
 
 let metric_predicate (filter : metric_filter) =

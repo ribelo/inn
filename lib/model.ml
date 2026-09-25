@@ -140,6 +140,59 @@ let attr_string_value = function
   | `Null -> ""
   | value -> Yojson.Safe.to_string value
 
+let is_ai_span (span : span) =
+  let attrs = span.resource @ span.attributes in
+  List.exists
+    (fun (key, _) ->
+      String.starts_with ~prefix:"ai." key
+      || String.starts_with ~prefix:"gen_ai." key)
+    attrs
+  ||
+  let operation = String.lowercase_ascii span.operation_name in
+  List.exists
+    (fun needle ->
+      let needle = String.lowercase_ascii needle in
+      let length = String.length needle in
+      let rec search index =
+        if index + length > String.length operation then false
+        else if String.sub operation index length = needle then true
+        else search (index + 1)
+      in
+      search 0)
+    [ "generateText"; "streamText"; "generateObject"; "streamObject" ]
+
+let ai_value keys (span : span) =
+  let attrs = span.resource @ span.attributes in
+  List.find_map (fun key ->
+    Option.map attr_string_value (List.assoc_opt key attrs)) keys
+
+let ai_model span = ai_value
+  ["ai.model.id"; "ai.model"; "gen_ai.request.model"; "gen_ai.response.model"] span
+let ai_provider span = ai_value
+  ["ai.model.provider"; "ai.provider"; "gen_ai.system";
+   "gen_ai.provider.name"] span
+let ai_session_id span = ai_value
+  ["ai.telemetry.metadata.sessionId"; "ai.session.id"; "session.id"] span
+let ai_function_id span = ai_value
+  ["ai.telemetry.functionId"; "ai.function.id"; "function.id"] span
+let ai_input_tokens span =
+  Option.bind (ai_value ["ai.usage.inputTokens"; "ai.usage.promptTokens";
+    "gen_ai.usage.input_tokens"; "gen_ai.usage.prompt_tokens"] span) int_of_string_opt
+let ai_output_tokens span =
+  Option.bind (ai_value ["ai.usage.outputTokens"; "ai.usage.completionTokens";
+    "gen_ai.usage.output_tokens"; "gen_ai.usage.completion_tokens"] span) int_of_string_opt
+let ai_search_text (span : span) =
+  let content_key key = List.exists (fun prefix ->
+    String.starts_with ~prefix key)
+    [ "ai.prompt"; "ai.response"; "ai.tool";
+      "gen_ai.input"; "gen_ai.output"; "gen_ai.prompt";
+      "gen_ai.tool"; "gen_ai.response.content" ] in
+  let attributes attrs = attrs |> List.filter_map (fun (key, value) ->
+    if content_key key then Some (attr_string_value value) else None) in
+  let events = span.events |> List.concat_map (fun (event : span_event) ->
+    attributes event.attributes) in
+  String.concat "\n" (attributes (span.resource @ span.attributes) @ events)
+
 let span_kind_to_string = function
   | Internal -> "internal" | Server -> "server" | Client -> "client"
   | Producer -> "producer" | Consumer -> "consumer"

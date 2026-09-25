@@ -54,6 +54,15 @@ let mcp_attributes_property =
       ("additionalProperties", `Assoc [ ("type", `String "string") ]);
     ]
 
+let mcp_attribute_contains_property =
+  `Assoc [
+    ("type", `String "object");
+    ("description", `String "Literal case-insensitive substring matches by attribute key.");
+    ("additionalProperties", `Assoc [ ("type", `String "string") ]) ]
+
+let mcp_number_property description =
+  `Assoc [ ("type", `String "number"); ("description", `String description) ]
+
 let mcp_schema ?(required = []) properties =
   `Assoc
     [
@@ -84,6 +93,9 @@ let mcp_tools =
         ("operation", mcp_string_property "Span operation name");
         ("status", mcp_string_property "ok or error");
         ("attributes", mcp_attributes_property);
+        ("attributeContains", mcp_attribute_contains_property);
+        ("minDurationMs", mcp_number_property "Minimum duration in milliseconds");
+        ("text", mcp_string_property "AI prompt or response substring");
         ("lookback", mcp_lookback_property);
         ("cursor", mcp_cursor_property);
         ("limit", mcp_int_property "Maximum number of traces");
@@ -103,6 +115,7 @@ let mcp_tools =
       "Fetch logs correlated with one trace."
       [
         ("traceId", mcp_string_property "32-character trace id");
+        ("attributeContains", mcp_attribute_contains_property);
         ("lookback", mcp_lookback_property);
         ("cursor", mcp_cursor_property);
         ("limit", mcp_int_property "Maximum number of logs");
@@ -117,6 +130,8 @@ let mcp_tools =
         ("parentOperation", mcp_string_property "Parent span operation name");
         ("status", mcp_string_property "ok or error");
         ("attributes", mcp_attributes_property);
+        ("attributeContains", mcp_attribute_contains_property);
+        ("minDurationMs", mcp_number_property "Minimum duration in milliseconds");
         ("lookback", mcp_lookback_property);
         ("cursor", mcp_cursor_property);
         ("limit", mcp_int_property "Maximum number of spans");
@@ -127,6 +142,7 @@ let mcp_tools =
       "Fetch logs correlated with one span."
       [
         ("spanId", mcp_string_property "16-character span id");
+        ("attributeContains", mcp_attribute_contains_property);
         ("lookback", mcp_lookback_property);
         ("cursor", mcp_cursor_property);
         ("limit", mcp_int_property "Maximum number of logs");
@@ -141,6 +157,8 @@ let mcp_tools =
         ("spanId", mcp_string_property "Span id");
         ("body", mcp_string_property "Body substring");
         ("attributes", mcp_attributes_property);
+        ("attributeContains", mcp_attribute_contains_property);
+        ("minSeverity", mcp_string_property "Minimum OTLP severity level");
         ("lookback", mcp_lookback_property);
         ("cursor", mcp_cursor_property);
         ("limit", mcp_int_property "Maximum number of logs");
@@ -157,6 +175,8 @@ let mcp_tools =
         ("operation", mcp_string_property "Span operation name");
         ("status", mcp_string_property "ok or error");
         ("attributes", mcp_attributes_property);
+        ("attributeContains", mcp_attribute_contains_property);
+        ("minDurationMs", mcp_number_property "Minimum duration in milliseconds");
         ("lookback", mcp_lookback_property);
         ("limit", mcp_int_property "Maximum number of rows");
       ];
@@ -171,6 +191,8 @@ let mcp_tools =
         ("spanId", mcp_string_property "Span id");
         ("body", mcp_string_property "Body substring");
         ("attributes", mcp_attributes_property);
+        ("attributeContains", mcp_attribute_contains_property);
+        ("minSeverity", mcp_string_property "Minimum OTLP severity level");
         ("lookback", mcp_lookback_property);
         ("limit", mcp_int_property "Maximum number of rows");
       ];
@@ -201,6 +223,7 @@ let mcp_tools =
         ("status", mcp_string_property "ok or error");
         ( "text",
           mcp_string_property "Text contained in AI span attributes/events" );
+        ("minDurationMs", mcp_number_property "Minimum duration in milliseconds");
         ("lookback", mcp_lookback_property);
         ("cursor", mcp_cursor_property);
         ("limit", mcp_int_property "Maximum number of calls");
@@ -229,6 +252,7 @@ let mcp_tools =
         ("status", mcp_string_property "ok or error");
         ( "text",
           mcp_string_property "Text contained in AI span attributes/events" );
+        ("minDurationMs", mcp_number_property "Minimum duration in milliseconds");
         ("lookback", mcp_lookback_property);
         ("limit", mcp_int_property "Maximum number of rows");
       ];
@@ -269,19 +293,28 @@ let json_required_string name json =
   | Some value -> Ok value
   | None -> Error (Printf.sprintf "missing required string argument %s" name)
 
-let json_attributes_arg json =
-  match json_member "attributes" json with
+let json_attribute_pairs name prefix json =
+  match json_member name json with
   | Some (`Assoc attrs) ->
-      List.filter_map
-        (fun (key, value) ->
-          match value with
-          | `String value -> Some ("attr." ^ key, Some value)
-          | `Int value -> Some ("attr." ^ key, Some (string_of_int value))
-          | `Float value -> Some ("attr." ^ key, Some (string_of_float value))
-          | `Bool value -> Some ("attr." ^ key, Some (string_of_bool value))
-          | _ -> None)
-        attrs
+      List.filter_map (fun (key, value) ->
+        let value = match value with
+          | `String value -> Some value
+          | `Int value -> Some (string_of_int value)
+          | `Float value -> Some (string_of_float value)
+          | `Bool value -> Some (string_of_bool value)
+          | _ -> None in
+        Option.map (fun value -> (prefix ^ key, Some value)) value) attrs
   | _ -> []
+
+let json_attributes_arg json = json_attribute_pairs "attributes" "attr." json
+let json_attributes_contains_arg json =
+  json_attribute_pairs "attributeContains" "attrContains." json
+
+let json_number_arg name json = match json_member name json with
+  | Some (`Int n) -> Some (string_of_int n)
+  | Some (`Float n) -> Some (string_of_float n)
+  | Some (`String n) -> Some n
+  | _ -> None
 
 let json_limit_arg ?(default = 100) json =
   Some (string_of_int (Option.value (json_int_arg "limit" json) ~default))
@@ -316,11 +349,14 @@ let tool_call ~request ~status ~base_url name args =
                optional_arg "service" "service" args;
                optional_arg "operation" "operation" args;
                optional_arg "status" "status" args;
+               optional_arg "text" "text" args;
+                ("minDurationMs", json_number_arg "minDurationMs" args);
                optional_arg "lookback" "lookback" args;
                optional_arg "cursor" "cursor" args;
                ("limit", json_limit_arg args);
              ]
-            @ json_attributes_arg args))
+            @ json_attributes_arg args
+             @ json_attributes_contains_arg args))
   | "inn_get_trace" -> (
       match json_required_string "traceId" args with
       | Ok trace_id ->
@@ -344,11 +380,12 @@ let tool_call ~request ~status ~base_url name args =
           http_tool ~request ~base_url
             ("/traces/" ^ percent_encode trace_id ^ "/logs"
             ^ query
-                [
+                ([
                   optional_arg "lookback" "lookback" args;
                   optional_arg "cursor" "cursor" args;
                   ("limit", json_limit_arg args);
-                ])
+                ] @ json_attributes_arg args
+                  @ json_attributes_contains_arg args))
       | Error message -> Error message)
   | "inn_search_spans" ->
       http_tool ~request ~base_url
@@ -360,11 +397,13 @@ let tool_call ~request ~status ~base_url name args =
                optional_arg "operation" "operation" args;
                optional_arg "parentOperation" "parentOperation" args;
                optional_arg "status" "status" args;
+                ("minDurationMs", json_number_arg "minDurationMs" args);
                optional_arg "lookback" "lookback" args;
                optional_arg "cursor" "cursor" args;
                ("limit", json_limit_arg args);
              ]
-            @ json_attributes_arg args))
+            @ json_attributes_arg args
+             @ json_attributes_contains_arg args))
   | "inn_get_span" -> (
       match json_required_string "spanId" args with
       | Ok span_id ->
@@ -376,11 +415,12 @@ let tool_call ~request ~status ~base_url name args =
           http_tool ~request ~base_url
             ("/spans/" ^ percent_encode span_id ^ "/logs"
             ^ query
-                [
+                ([
                   optional_arg "lookback" "lookback" args;
                   optional_arg "cursor" "cursor" args;
                   ("limit", json_limit_arg args);
-                ])
+                ] @ json_attributes_arg args
+                  @ json_attributes_contains_arg args))
       | Error message -> Error message)
   | "inn_search_logs" ->
       http_tool ~request ~base_url
@@ -392,11 +432,13 @@ let tool_call ~request ~status ~base_url name args =
                optional_arg "traceId" "traceId" args;
                optional_arg "spanId" "spanId" args;
                optional_arg "body" "body" args;
+                optional_arg "minSeverity" "minSeverity" args;
                optional_arg "lookback" "lookback" args;
                optional_arg "cursor" "cursor" args;
                ("limit", json_limit_arg args);
              ]
-            @ json_attributes_arg args))
+            @ json_attributes_arg args
+             @ json_attributes_contains_arg args))
   | "inn_trace_stats" -> (
       match
         (json_required_string "groupBy" args, json_required_string "agg" args)
@@ -411,10 +453,12 @@ let tool_call ~request ~status ~base_url name args =
                    optional_arg "service" "service" args;
                    optional_arg "operation" "operation" args;
                    optional_arg "status" "status" args;
+                ("minDurationMs", json_number_arg "minDurationMs" args);
                    optional_arg "lookback" "lookback" args;
                    ("limit", json_limit_arg ~default:20 args);
                  ]
-                @ json_attributes_arg args))
+                @ json_attributes_arg args
+             @ json_attributes_contains_arg args))
       | Error message, _ | _, Error message -> Error message)
   | "inn_log_stats" -> (
       match json_required_string "groupBy" args with
@@ -430,10 +474,12 @@ let tool_call ~request ~status ~base_url name args =
                    optional_arg "traceId" "traceId" args;
                    optional_arg "spanId" "spanId" args;
                    optional_arg "body" "body" args;
+                optional_arg "minSeverity" "minSeverity" args;
                    optional_arg "lookback" "lookback" args;
                    ("limit", json_limit_arg ~default:20 args);
                  ]
-                @ json_attributes_arg args))
+                @ json_attributes_arg args
+             @ json_attributes_contains_arg args))
       | Error message -> Error message)
   | "inn_facets" -> (
       match
@@ -466,6 +512,7 @@ let tool_call ~request ~status ~base_url name args =
               optional_arg "operation" "operation" args;
               optional_arg "status" "status" args;
               optional_arg "text" "text" args;
+                ("minDurationMs", json_number_arg "minDurationMs" args);
               optional_arg "lookback" "lookback" args;
               optional_arg "cursor" "cursor" args;
               ("limit", json_limit_arg args);
@@ -495,6 +542,7 @@ let tool_call ~request ~status ~base_url name args =
                   optional_arg "operation" "operation" args;
                   optional_arg "status" "status" args;
                   optional_arg "text" "text" args;
+                ("minDurationMs", json_number_arg "minDurationMs" args);
                   optional_arg "lookback" "lookback" args;
                   ("limit", json_limit_arg ~default:20 args);
                 ])

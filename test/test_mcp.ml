@@ -91,7 +91,7 @@ let test_catalogue () =
     ]
 
 let test_window_arguments_in_schemas () =
-  (* win-2olw: the MCP schemas advertise the window and cursor arguments. *)
+  (* win-2olw, srch-reld: schemas advertise every matching filter. *)
   let tools = tools () in
   let check name expected =
     match List.find_opt (fun tool -> member "name" tool = Some (`String name)) tools with
@@ -108,17 +108,17 @@ let test_window_arguments_in_schemas () =
           expected
   in
   check "inn_services" [ "lookback" ];
-  check "inn_search_traces" [ "lookback"; "cursor" ];
+  check "inn_search_traces" [ "lookback"; "cursor"; "text"; "minDurationMs"; "attributeContains" ];
   check "inn_get_trace_spans" [ "lookback"; "cursor"; "limit" ];
-  check "inn_get_trace_logs" [ "lookback"; "cursor"; "limit" ];
-  check "inn_search_spans" [ "lookback"; "cursor" ];
-  check "inn_get_span_logs" [ "lookback"; "cursor"; "limit" ];
-  check "inn_search_logs" [ "lookback"; "cursor" ];
-  check "inn_trace_stats" [ "lookback" ];
-  check "inn_log_stats" [ "lookback" ];
+  check "inn_get_trace_logs" [ "lookback"; "cursor"; "limit"; "attributeContains" ];
+  check "inn_search_spans" [ "lookback"; "cursor"; "minDurationMs"; "attributeContains" ];
+  check "inn_get_span_logs" [ "lookback"; "cursor"; "limit"; "attributeContains" ];
+  check "inn_search_logs" [ "lookback"; "cursor"; "minSeverity"; "attributeContains" ];
+  check "inn_trace_stats" [ "lookback"; "minDurationMs"; "attributeContains" ];
+  check "inn_log_stats" [ "lookback"; "minSeverity"; "attributeContains" ];
   check "inn_facets" [ "lookback" ];
-  check "inn_search_ai_calls" [ "lookback"; "cursor" ];
-  check "inn_ai_stats" [ "lookback" ];
+  check "inn_search_ai_calls" [ "lookback"; "cursor"; "minDurationMs" ];
+  check "inn_ai_stats" [ "lookback"; "minDurationMs" ];
   check "inn_metrics" [ "lookback"; "cursor" ];
   check "inn_stats" [ "lookback" ]
 
@@ -147,6 +147,8 @@ let test_window_arguments_reach_http () =
         ("lookback", `String "15m");
         ("cursor", `String "abc-def");
         ("limit", `Int 5);
+        ("minSeverity", `String "warn");
+        ("attributeContains", `Assoc [ ("tag", `String "50%") ]);
       ]);
   call "inn_services" (`Assoc [ ("lookback", `String "2h") ]);
   let stats_text =
@@ -159,6 +161,10 @@ let test_window_arguments_reach_http () =
     (contains stats_text "retention");
   call "inn_search_ai_calls"
     (`Assoc [ ("lookback", `String "all"); ("cursor", `String "xyz") ]);
+  call "inn_search_traces"
+    (`Assoc [ ("text", `String "100%_conversation");
+      ("minDurationMs", `Float 5.);
+      ("attributeContains", `Assoc [ ("tag", `String "50%") ]) ]);
   let paths = List.rev !paths in
   let check_contains index fragment =
     match List.nth_opt paths index with
@@ -171,6 +177,8 @@ let test_window_arguments_reach_http () =
   check_contains 0 "lookback=15m";
   check_contains 0 "cursor=abc-def";
   check_contains 0 "limit=5";
+  check_contains 0 "minSeverity=warn";
+  check_contains 0 "attrContains.tag=50%25";
   check_contains 0 "/logs/search";
   check_contains 1 "/services?lookback=2h";
   (* inn_stats proxies GET /stats, so the retention section is reachable from
@@ -180,7 +188,11 @@ let test_window_arguments_reach_http () =
     (List.nth_opt paths 2);
   check_contains 3 "lookback=all";
   check_contains 3 "cursor=xyz";
-  check_contains 3 "/ai/calls"
+  check_contains 3 "/ai/calls";
+  check_contains 4 "/traces/search";
+  check_contains 4 "text=100%25_conversation";
+  check_contains 4 "minDurationMs=5";
+  check_contains 4 "attrContains.tag=50%25"
 
 let test_down_server () =
   (* mcp-j7lb: connection errors stay tool results, not protocol errors. *)
@@ -250,9 +262,9 @@ let () =
           Alcotest.test_case "mcp-592g mcp-zxs5 version negotiation" `Quick
             test_versions;
           Alcotest.test_case "mcp-gurs tools catalogue" `Quick test_catalogue;
-          Alcotest.test_case "window arguments in schemas (win-2olw)" `Quick
+          Alcotest.test_case "window and filter arguments in schemas (win-2olw, srch-reld)" `Quick
             test_window_arguments_in_schemas;
-          Alcotest.test_case "window arguments reach HTTP (win-2olw, ret-eeb1)"
+          Alcotest.test_case "window and filter arguments reach HTTP (win-2olw, srch-reld)"
             `Quick test_window_arguments_reach_http;
           Alcotest.test_case "mcp-j7lb server down" `Quick test_down_server;
           Alcotest.test_case "mcp-i9qo mcp-v9fl errors notifications" `Quick

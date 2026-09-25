@@ -568,10 +568,10 @@ let wait_until ~clock ~timeout_seconds predicate =
 
 (* Recorded together with [Store.schema_version]: change one and you must
    change the other (schm-hnis). *)
-let recorded_schema_fingerprint = "cb40fcdc494a82f1ad013f025fd7cb2c"
+let recorded_schema_fingerprint = "b5e45540023c5e505c6ab5d0b0784786"
 
 let test_schema_fingerprint_matches_version () =
-  Alcotest.(check int) "schema version" 3 Store.schema_version;
+  Alcotest.(check int) "schema version" 4 Store.schema_version;
   Alcotest.(check string)
     "schema fingerprint (schm-hnis)" recorded_schema_fingerprint
     Store.schema_fingerprint
@@ -1945,10 +1945,10 @@ let test_query_windows () =
         "metrics honour lookback=all (win-m4ld)" 4
         (count "/metrics?lookback=all" "metrics");
       Alcotest.(check int)
-        "services default to the whole history (win-3ghy)" 12
+        "services default to the whole history (win-3ghy, acc-itfo)" 8
         (count "/services" "services");
       Alcotest.(check int)
-        "services accept a window (win-3ghy)" 6
+        "services accept a window (win-3ghy, acc-itfo)" 4
         (count "/services?lookback=1h" "services");
       Alcotest.(check int)
         "facet queries default to the whole history (win-jee9)" 4
@@ -2241,6 +2241,298 @@ let test_pagination_endpoints () =
         (server_get config store ("/logs?lookback=all&cursor=" ^ trace_cursor))
         "cursor")
 
+let test_exact_queries_above_old_caps () =
+  (* acc-879n, acc-laac, acc-whoa, acc-gkoz, acc-efzp. *)
+  let config = temp_config () in
+  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let store = run_store (Store.open_ ~now_ms:(fun () -> base_time) config) in
+  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  let span_count = 12_050 and log_count = 188_025 in
+  let spans = List.init span_count (fun i ->
+    let ai = i <= 100 in
+    let span = test_span ~trace_id:(Printf.sprintf "%032x" (i + 1))
+      ~span_id:(Printf.sprintf "%016x" (i + 1))
+      ~timestamp_ms:(base_time - 20_000 + i)
+      ~operation_name:(if ai then "generateText" else "work")
+      ~attributes:(["http.method", "GET";
+         "partition", Printf.sprintf "bucket-%03d" (i mod 200)] @
+        if i = 0 then ["ai.model", "old-model"; "ai.prompt", "needle-old-call"]
+        else if ai then ["ai.model", "wide-model"] else []) () in
+    let duration = if ai then i + 1 else 1 in
+    { span with duration_ms = float_of_int duration;
+      end_time_ns = span.start_time_ns + duration * 1_000_000 }) in
+  let logs = List.init log_count (fun i ->
+    test_log ~timestamp_ms:(base_time - 60_000 + i)
+      ~body:(Printf.sprintf "row %d" i)
+      ~attributes:["http.method", "GET"] ()) in
+  let rec batches size rows =
+    let rec take n acc = function
+      | rest when n = 0 -> List.rev acc, rest
+      | [] -> List.rev acc, []
+      | head :: tail -> take (n - 1) (head :: acc) tail in
+    match rows with [] -> [] | _ ->
+      let batch, rest = take size [] rows in
+      batch :: batches size rest in
+  List.iter (fun batch -> ignore (run_store (Store.ingest_traces store batch)))
+    (batches 500 spans);
+  List.iter (fun batch -> ignore (run_store (Store.ingest_logs store batch)))
+    (batches 1_000 logs);
+  let response path field = json_list field (server_json config store path) in
+  let count_group rows group expected =
+    Alcotest.(check bool) (group ^ " exact count") true
+      (List.exists (fun row -> json_member "group" row = `String group
+        && json_member "count" row = `Int expected) rows) in
+  let count_facet rows value expected =
+    Alcotest.(check bool) (value ^ " exact facet count") true
+      (List.exists (fun row -> json_member "value" row = `String value
+        && json_member "count" row = `Int expected) rows) in
+  (* acc-1ccu: 200,075 rows. Time bounded SQL queries, not fixture ingest.
+     Thirty seconds leaves ample room for slower CI hosts. *)
+  let query_started = Unix.gettimeofday () in
+  Alcotest.(check int) "acc-gkoz old AI call beyond 10k newer spans" 1
+    (List.length (response "/ai/calls?lookback=all&model=old-model" "calls"));
+  Alcotest.(check int) "acc-879n old trace beyond 10k spans" 1
+    (List.length (response
+      "/traces/search?lookback=all&text=needle-old-call&attr.http.method=GET"
+      "traces"));
+  count_group (response "/traces/stats?lookback=all&groupBy=service&agg=count"
+    "stats") "svc" span_count;
+  let partition_stats = response
+    "/traces/stats?lookback=all&groupBy=attr.partition&agg=count&limit=200" "stats" in
+  Alcotest.(check int) "acc-1ccu single SQL grouping for 200 attribute values"
+    200 (List.length partition_stats);
+  count_group partition_stats "bucket-000" 61;
+  let ai_stats = response
+    "/ai/stats?lookback=all&groupBy=status&agg=p95_duration" "stats" in
+  Alcotest.(check bool) "acc-7kkc nearest-rank of 101 AI durations" true
+    (List.exists (fun row -> json_member "group" row = `String "ok"
+      && json_member "count" row = `Int 101
+      && json_member "value" row = `Float 96.) ai_stats);
+  Alcotest.(check int) "acc-whoa 188k matching log attributes avoid SQL variables"
+    1 (List.length (response
+      "/logs/search?lookback=all&attr.http.method=GET&limit=1" "logs"));
+  count_group (response "/logs/stats?lookback=all&groupBy=service"
+    "stats") "svc" log_count;
+  count_facet (response "/facets?lookback=all&type=traces&field=service"
+    "facets") "svc" span_count;
+  count_facet (response
+    "/facets?lookback=all&type=traces&field=attribute_values&key=http.method"
+    "facets") "GET" span_count;
+  count_facet (response "/facets?lookback=all&type=logs&field=service"
+    "facets") "svc" log_count;
+  count_facet (response
+    "/facets?lookback=all&type=logs&field=attribute_values&key=http.method"
+    "facets") "GET" log_count;
+  Alcotest.(check bool) "acc-1ccu 200k-row queries finish within 30 seconds"
+    true (Unix.gettimeofday () -. query_started < 30.)
+
+let test_search_filters_and_exact_stats () =
+  (* sf-*, acc-*: literal filters, typed joins, complete aggregates. *)
+  let config = temp_config () in
+  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let store = run_store (Store.open_ ~now_ms:(fun () -> base_time) config) in
+  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  let trace_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in
+  let trace_b = "cccccccccccccccccccccccccccccccc" in
+  let root = test_span ~trace_id:trace_a ~span_id:"1111111111111111"
+    ~service_name:"backend" ~operation_name:"root"
+    ~attributes:["tag", "A%_\\B"] () in
+  let root = { root with end_time_ns = root.start_time_ns + 20_000_000;
+    duration_ms = 20. } in
+  let child = test_span ~trace_id:trace_a ~span_id:"2222222222222222"
+    ~parent_span_id:(Some root.span_id) ~service_name:"frontend"
+    ~operation_name:"query" ~status:"error"
+    ~attributes:["tag", "A%_\\B";
+      "ai.model", "model-x"; "ai.prompt", "Special%_\\Text";
+      "ai.response", "ResponseContent"; "ai.tool.output", "ToolContent";
+      "ai.usage.inputTokens", "7"] () in
+  let child = { child with duration_ms = 10.;
+    end_time_ns = child.start_time_ns + 10_000_000 } in
+  let other = test_span ~trace_id:trace_b ~span_id:"3333333333333333"
+    ~service_name:"backend" ~operation_name:"query"
+    ~attributes:["tag", "ordinary"; "ai.model", "model-y"] () in
+  let log_a = { (test_log ~attributes:["tag", "A%_\\B"] ()) with
+    trace_id = Some trace_a; span_id = Some child.span_id } in
+  let log_b = { (test_log ~body:"other" ()) with
+    trace_id = Some trace_b; severity_text = "INFO"; severity_number = Some 9 } in
+  let log_c = { (test_log ~body:"100%_\\Case" ()) with
+    severity_text = "wArN"; severity_number = None } in
+  let log_d = { (test_log ~body:"case fourth" ()) with
+    severity_text = "error"; severity_number = Some 17 } in
+  ignore (run_store (let open Eta.Syntax in
+    let* _ = Store.ingest_traces store [root; child; other] in
+    let* _ = Store.ingest_logs store [log_a; log_b; log_c; log_d] in
+    Eta.Effect.pure ()));
+  let n path field = List.length (json_list field (server_json config store path)) in
+  Alcotest.(check int) "sf literal wildcards in spans" 2
+    (n "/spans/search?lookback=all&attrContains.tag=%25_%5CB" "spans");
+  Alcotest.(check int) "srch-k254 error is trace health" 1
+    (n "/traces/search?lookback=all&status=error" "traces");
+  Alcotest.(check int) "srch-k254 ok excludes mixed-status trace" 1
+    (n "/traces/search?lookback=all&status=ok" "traces");
+  Alcotest.(check int) "acc-km90 trace search includes participating child service" 1
+    (n "/traces/search?lookback=all&service=frontend" "traces");
+  Alcotest.(check int) "acc-km90 trace list includes participating child service" 1
+    (n "/traces?lookback=all&service=frontend" "traces");
+  Alcotest.(check int) "sf parent operation joins spans" 1
+    (n "/spans/search?lookback=all&parentOperation=root" "spans");
+  Alcotest.(check int) "sf duration applies in SQL" 2
+    (n "/spans/search?lookback=all&minDurationMs=5" "spans");
+  Alcotest.(check int) "sf log severity cutoff" 2
+    (n "/logs/search?lookback=all&minSeverity=ERROR" "logs");
+  Alcotest.(check int) "srch-odnn log list attribute substring" 1
+    (n "/logs?lookback=all&attrContains.tag=%25_%5CB" "logs");
+  (* Every route is exercised rather than merely listing the filter in a schema. *)
+  let check story expected path field =
+    Alcotest.(check int) story expected (n path field) in
+  check "srch-sjbi operation substring case fold on spans" 2
+    "/spans/search?lookback=all&operation=QuErY" "spans";
+  check "srch-sjbi operation substring reaches child traces" 2
+    "/traces/search?lookback=all&operation=QuErY" "traces";
+  check "srch-ypr2 actual parent operation case fold" 1
+    "/spans/search?lookback=all&parentOperation=ROot" "spans";
+  check "srch-ypr2 no parent from other trace" 0
+    "/spans/search?lookback=all&parentOperation=QuErY" "spans";
+  check "srch-zjff body matches literal wildcards" 1
+    "/logs/search?lookback=all&body=100%25_%5Ccase" "logs";
+  check "srch-zjff contains aliases body" 1
+    "/logs?lookback=all&contains=100%25_%5Ccase" "logs";
+  List.iter (fun (route, field, expected) ->
+    check "srch-odnn attrContains route" expected route field)
+    [ "/traces/search?lookback=all&attrContains.tag=%25_%5C", "traces", 1;
+      "/spans/search?lookback=all&attrContains.tag=%25_%5C", "spans", 2;
+      "/logs/search?lookback=all&attrContains.tag=%25_%5C", "logs", 1;
+      "/traces/" ^ trace_a ^ "/logs?lookback=all&attrContains.tag=%25_%5C", "logs", 1;
+      "/spans/" ^ child.span_id ^ "/logs?lookback=all&attrContains.tag=%25_%5C", "logs", 1 ];
+  check "srch-ynd1 exact and substring on same trace" 1
+    "/traces/search?lookback=all&attr.tag=A%25_%5CB&attrContains.ai.prompt=special" "traces";
+  check "srch-ynd1 exact and substring reject mismatched trace" 0
+    "/spans/search?lookback=all&attr.tag=ordinary&attrContains.ai.prompt=special" "spans";
+  check "srch-ynd1 several substring keys combine with AND" 1
+    "/spans/search?lookback=all&attrContains.tag=%25&attrContains.ai.prompt=Special" "spans";
+  check "srch-ynd1 repeated exact keys are AND" 0
+    "/spans/search?lookback=all&attr.tag=ordinary&attr.tag=A%25_%5CB" "spans";
+  check "srch-w4sn duration trace search" 1
+    "/traces/search?lookback=all&minDurationMs=5" "traces";
+  check "srch-w4sn duration AI call search" 1
+    "/ai/calls?lookback=all&minDurationMs=5" "calls";
+  check "srch-sh8y ok excludes error span" 2
+    "/spans/search?lookback=all&status=ok" "spans";
+  check "srch-sh8y error is individual span" 1
+    "/spans/search?lookback=all&status=error" "spans";
+  check "srch-pxq5 severity ignores case" 2
+    "/logs/search?lookback=all&severity=ErRoR" "logs";
+  check "srch-qplh warn uses number or fallback text" 3
+    "/logs?lookback=all&minSeverity=warn" "logs";
+  check "srch-qplh stats threshold by severity" 1
+    "/logs/stats?lookback=all&groupBy=service&minSeverity=warn" "stats";
+  Alcotest.(check int) "acc AI prompt literal substring" 1
+    (n "/ai/calls?lookback=all&text=%25_%5C" "calls");
+  Alcotest.(check int) "srch-oylo text excludes model metadata" 0
+    (n "/traces/search?lookback=all&text=model-x" "traces");
+  Alcotest.(check int) "srch-oylo trace text finds child AI prompt" 1
+    (n "/traces/search?lookback=all&text=Special%25_%5C" "traces");
+  check "srch-oylo text finds AI response" 1
+    "/traces/search?lookback=all&text=responsecontent" "traces";
+  check "srch-oylo text finds AI tool result" 1
+    "/traces/search?lookback=all&text=TOOLCONTENT" "traces";
+  let stat story path expected_group expected_count expected_value =
+    let rows = json_list "stats" (server_json config store path) in
+    Alcotest.(check bool) story true (List.exists (fun row ->
+      json_member "group" row = `String expected_group
+      && json_member "count" row = `Int expected_count
+      && json_member "value" row = `Float expected_value) rows) in
+  let grouped_traces = json_list "stats" (server_json config store
+    "/traces/stats?groupBy=attr.tag&agg=count&lookback=all") in
+  Alcotest.(check int) "sf trace attr groups" 2 (List.length grouped_traces);
+  Alcotest.(check bool) "acc-lh84 same value on two spans counts one trace"
+    true (List.exists (fun row -> json_member "group" row =
+      `String "A%_\\B" && json_member "count" row = `Int 1) grouped_traces);
+  stat "srch-k254 trace stats error uses whole trace health"
+    "/traces/stats?groupBy=service&agg=count&lookback=all&status=error"
+    "backend" 1 1.;
+  stat "srch-odnn attrContains trace stats"
+    "/traces/stats?groupBy=service&agg=count&lookback=all&attrContains.tag=%25_%5C"
+    "backend" 1 1.;
+  stat "srch-odnn attrContains log stats"
+    "/logs/stats?groupBy=service&lookback=all&attrContains.tag=%25_%5C"
+    "svc" 1 1.;
+  stat "srch-w4sn minDuration trace stats"
+    "/traces/stats?groupBy=service&agg=count&lookback=all&minDurationMs=5"
+    "backend" 1 1.;
+  stat "srch-w4sn minDuration AI stats"
+    "/ai/stats?groupBy=model&agg=count&lookback=all&minDurationMs=5"
+    "model-x" 1 1.;
+  stat "srch-qplh minSeverity fallback counted"
+    "/logs/stats?groupBy=service&lookback=all&minSeverity=warn"
+    "svc" 3 3.;
+  stat "acc-1ccu grouped trace attribute error rate"
+    "/traces/stats?groupBy=attr.tag&agg=error_rate&lookback=all"
+    "A%_\\B" 1 1.;
+  stat "acc-1ccu grouped trace attribute average"
+    "/traces/stats?groupBy=attr.tag&agg=avg_duration&lookback=all"
+    "A%_\\B" 1 20.;
+  stat "acc-1ccu grouped trace attribute p95"
+    "/traces/stats?groupBy=attr.tag&agg=p95_duration&lookback=all"
+    "A%_\\B" 1 20.;
+  let facets = json_list "facets" (server_json config store
+    "/facets?type=traces&field=attribute_values&key=tag") in
+  Alcotest.(check bool) "acc-lh84 duplicate span attributes count one trace" true
+    (List.exists (fun facet -> json_member "value" facet = `String "A%_\\B"
+      && json_member "count" facet = `Int 1) facets);
+  let facet story field value expected =
+    let items = json_list "facets" (server_json config store
+      ("/facets?type=traces&field=" ^ field)) in
+    Alcotest.(check bool) story true (List.exists (fun item ->
+      json_member "value" item = `String value
+      && json_member "count" item = `Int expected) items) in
+  facet "acc-jjlo root service facet counts distinct traces"
+    "service" "backend" 2;
+  facet "acc-jjlo root operation excludes child operation"
+    "operation" "root" 1;
+  facet "acc-jjlo trace health facet error" "status" "error" 1;
+  facet "acc-jjlo trace health facet ok" "status" "ok" 1;
+  let ai_stats = json_list "stats" (server_json config store
+    "/ai/stats?groupBy=model&agg=p95_duration&lookback=all") in
+  Alcotest.(check bool) "acc-7kkc exact nearest-rank p95" true
+    (List.exists (fun row -> json_member "group" row = `String "model-x"
+      && json_member "value" row = `Float 10.) ai_stats);
+  check_invalid_query "srch-jk2v nonnumeric duration" (server_get config store
+    "/spans/search?minDurationMs=abc") "minDurationMs";
+  check_invalid_query "srch-jk2v negative duration" (server_get config store
+    "/spans/search?minDurationMs=-1") "minDurationMs";
+  check_invalid_query "srch-jk2v unknown severity" (server_get config store
+    "/logs/search?minSeverity=BOGUS") "minSeverity";
+  List.iter (fun path ->
+    let meta = json_member "meta" (server_json config store path) in
+    Alcotest.(check bool) "acc-g6qx no approximate flag without a safety cap"
+      true (json_member "approximate" meta = `Null))
+    [ "/traces/stats?groupBy=service&agg=count";
+      "/logs/stats?groupBy=service";
+      "/ai/stats?groupBy=model&agg=count";
+      "/facets?type=traces&field=service" ];
+  let inventory = json_list "endpoints" (server_json config store "/endpoints") in
+  let trace_route = List.find_opt (fun endpoint ->
+    json_member "path" endpoint = `String "/traces/search") inventory in
+  let route = match trace_route with Some route -> route
+    | None -> Alcotest.fail "trace search missing from inventory" in
+  let filters = json_list "filters" route in
+  Alcotest.(check bool) "srch-z5cu inventory exposes filters" true
+    (List.mem (`String "attrContains.<key>") filters
+      && List.mem (`String "text") filters);
+  let api = server_json config store "/openapi.json" in
+  let operation = json_member "get"
+    (json_member "/traces/search" (json_member "paths" api)) in
+  let params = json_list "parameters" operation in
+  Alcotest.(check bool) "srch-z5cu OpenAPI exposes typed duration" true
+    (List.exists (fun param ->
+      json_member "name" param = `String "minDurationMs"
+      && json_member "type" (json_member "schema" param) = `String "number") params);
+  Alcotest.(check bool) "srch-z5cu OpenAPI exposes dynamic keys" true
+    (List.mem (`String "attrContains.<key>")
+      (json_list "x-inn-query-prefixes" operation))
+
+
 let () =
   Alcotest.run "inn"
     [
@@ -2315,6 +2607,11 @@ let () =
           Alcotest.test_case "cursor pagination on every long list (win-5hgv, win-ggl7, win-7xet, win-xl30)"
             `Quick test_pagination_endpoints;
         ] );
+      ( "search",
+        [ Alcotest.test_case "literal filters and SQL aggregates (sf-*, acc-*)"
+            `Quick test_search_filters_and_exact_stats;
+          Alcotest.test_case "complete 12k spans and 188k logs (acc-*)"
+            `Slow test_exact_queries_above_old_caps ] );
       ( "server",
         [
           Alcotest.test_case "handler ingests and queries services" `Quick

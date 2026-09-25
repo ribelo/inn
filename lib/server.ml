@@ -62,12 +62,49 @@ let health config =
        ]
       @ instance_id))
 
+let query_filters path =
+  let attributes = [ "attr.<key>"; "attrContains.<key>" ] in
+  let paged = [ "lookback"; "limit"; "cursor" ] in
+  let summary = [ "lookback"; "limit" ] in
+  match path with
+  | "/services" -> [ "lookback"; "signal" ]
+  | "/traces" -> paged @ [ "service" ]
+  | "/traces/search" -> paged @ attributes @
+      [ "service"; "operation"; "status"; "text"; "minDurationMs" ]
+  | "/traces/stats" -> summary @ attributes @
+      [ "groupBy"; "agg"; "service"; "operation"; "status"; "minDurationMs" ]
+  | "/traces/{traceId}/spans" -> paged
+  | "/traces/{traceId}/logs" | "/spans/{spanId}/logs" -> paged @ attributes
+  | "/spans/search" -> paged @ attributes @
+      [ "service"; "traceId"; "operation"; "parentOperation";
+        "status"; "minDurationMs" ]
+  | "/logs" -> paged @ attributes @
+      [ "service"; "severity"; "contains"; "minSeverity" ]
+  | "/logs/search" -> paged @ attributes @
+      [ "service"; "traceId"; "spanId"; "severity"; "body";
+        "contains"; "minSeverity" ]
+  | "/logs/stats" -> summary @ attributes @
+      [ "groupBy"; "agg"; "service"; "traceId"; "spanId";
+        "severity"; "body"; "contains"; "minSeverity" ]
+  | "/ai/calls" -> paged @
+      [ "service"; "traceId"; "sessionId"; "functionId"; "provider";
+        "model"; "operation"; "status"; "text"; "minDurationMs" ]
+  | "/ai/stats" -> summary @
+      [ "groupBy"; "agg"; "service"; "traceId"; "sessionId";
+        "functionId"; "provider"; "model"; "operation"; "status";
+        "text"; "minDurationMs" ]
+  | "/metrics" -> paged @ [ "service"; "name" ]
+  | "/facets" -> summary @ [ "type"; "field"; "key"; "service" ]
+  | "/stats" -> [ "lookback" ]
+  | _ -> []
+
 let endpoint method_ path description =
   `Assoc
     [
       ("method", `String method_);
       ("path", `String path);
       ("description", `String description);
+      ("filters", `List (List.map (fun name -> `String name) (query_filters path)));
     ]
 
 let endpoint_inventory =
@@ -143,7 +180,7 @@ Query API:
        config.base_url config.base_url config.base_url config.base_url
        config.base_url config.base_url config.base_url config.base_url)
 
-let path_item method_ summary =
+let path_item method_ summary path =
   let otlp_ingest = String.equal method_ "POST" in
   let responses =
     if otlp_ingest then
@@ -154,11 +191,26 @@ let path_item method_ summary =
         ("503", "Store unavailable; retry after one second") ]
     else [ ("200", "OK") ]
   in
+  let filters = query_filters path in
+  let prefixes = List.filter
+    (fun name -> name = "attr.<key>" || name = "attrContains.<key>") filters in
+  let parameters = List.filter_map (fun name ->
+    if List.mem name prefixes then None else
+    let kind = match name with
+      | "minDurationMs" -> "number"
+      | "limit" -> "integer"
+      | _ -> "string" in
+    Some (`Assoc [ ("name", `String name); ("in", `String "query");
+      ("required", `Bool false);
+      ("schema", `Assoc [ ("type", `String kind) ]) ])) filters in
   `Assoc
     [
       (String.lowercase_ascii method_,
-       `Assoc
-         ([ ("summary", `String summary);
+        `Assoc
+          ([ ("summary", `String summary);
+             ("parameters", `List parameters);
+             ("x-inn-query-prefixes", `List (List.map (fun name ->
+               `String name) prefixes));
             ("responses", `Assoc (List.map (fun (code, description) ->
               code, `Assoc [ ("description", `String description) ]) responses)) ]
           @ if otlp_ingest then
@@ -186,8 +238,8 @@ let openapi config =
               | Some (`String value) -> value
               | _ -> path
             in
-            (path, path_item method_ description)
-        | _ -> ("/", path_item "GET" "Inn endpoint"))
+            (path, path_item method_ description path)
+        | _ -> ("/", path_item "GET" "Inn endpoint" "/"))
       endpoint_inventory
   in
   json_response
@@ -260,6 +312,53 @@ let attr_filters params =
       else None)
     params
 
+let attr_contains_filters params =
+  let prefix = "attrContains." in
+  List.filter_map (fun (key, value) ->
+    if String.starts_with ~prefix key then
+      Some (String.sub key (String.length prefix)
+        (String.length key - String.length prefix), value)
+    else None) params
+
+let valid_attr_contains params =
+  let prefix = "attrContains." in
+  if List.exists (fun (key, _) -> String.equal key prefix) params then
+    Error "attrContains. requires an attribute key"
+  else Ok (attr_contains_filters params)
+
+let parse_min_duration params =
+  match param "minDurationMs" params with
+  | None -> Ok None
+  | Some value ->
+      (match float_of_string_opt value with
+       | Some number when Float.is_finite number && number >= 0. ->
+           Ok (Some number)
+       | _ -> Error "minDurationMs must be a finite non-negative number")
+
+let parse_min_severity params =
+  match param "minSeverity" params with
+  | None -> Ok None
+  | Some value ->
+      match String.lowercase_ascii value with
+      | "trace" -> Ok (Some 1)
+      | "debug" -> Ok (Some 5)
+      | "info" -> Ok (Some 9)
+      | "warn" -> Ok (Some 13)
+      | "error" -> Ok (Some 17)
+      | "fatal" -> Ok (Some 21)
+      | _ -> Error "minSeverity must be trace, debug, info, warn, error, or fatal"
+
+let with_search_filters ?(duration = false) ?(severity = false)
+    ?(contains = false) params f =
+  let durations = if duration then parse_min_duration params else Ok None in
+  let severities = if severity then parse_min_severity params else Ok None in
+  let attrs = if contains then valid_attr_contains params else Ok [] in
+  match durations, severities, attrs with
+  | Ok min_duration_ms, Ok min_severity, Ok attr_contains ->
+      f min_duration_ms min_severity attr_contains
+  | Error message, _, _ | _, Error message, _ | _, _, Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+
 let valid_trace_agg = function
   | "count" | "avg_duration" | "p95_duration" | "error_rate" -> true
   | _ -> false
@@ -328,7 +427,11 @@ let services store req =
   | Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
   | Ok (window, lookback) ->
-      store_json (Store.list_services ~window store) (fun services ->
+      let signal = param "signal" params in
+      if signal <> None && signal <> Some "metrics" then
+        Eta.Effect.pure (error_response 400 "invalid_query" "signal must be metrics")
+      else store_json (Store.list_services ~window
+        ~include_metrics:(signal = Some "metrics") store) (fun services ->
           `Assoc
             [
               ("services", `List (List.map (fun service -> `String service) services));
@@ -404,9 +507,13 @@ let trace_logs store trace_id req =
   | Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
   | Ok policy ->
-      store_json
-        (Store.list_trace_logs store ~window:policy.List_policy.window
-           ?cursor:policy.cursor ~limit:policy.limit trace_id)
+      with_search_filters ~contains:true params @@ fun _ _ attr_contains ->
+      let filter : Store.log_search_filter = {
+        service = None; trace_id = Some trace_id; span_id = None;
+        severity = None; body = None; attrs = attr_filters params;
+        window = policy.window; cursor = policy.cursor; limit = policy.limit;
+      } in
+      store_json (Store.search_logs ~attr_contains filter store)
         (page_json "logs" Model.log_to_json policy)
 
 let span_logs store span_id req =
@@ -418,9 +525,13 @@ let span_logs store span_id req =
   | Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
   | Ok policy ->
-      store_json
-        (Store.list_span_logs store ~window:policy.List_policy.window
-           ?cursor:policy.cursor ~limit:policy.limit span_id)
+      with_search_filters ~contains:true params @@ fun _ _ attr_contains ->
+      let filter : Store.log_search_filter = {
+        service = None; trace_id = None; span_id = Some span_id;
+        severity = None; body = None; attrs = attr_filters params;
+        window = policy.window; cursor = policy.cursor; limit = policy.limit;
+      } in
+      store_json (Store.search_logs ~attr_contains filter store)
         (page_json "logs" Model.log_to_json policy)
 
 let has_prefix prefix text = String.starts_with ~prefix text
@@ -512,15 +623,7 @@ let ai_output_tokens attrs =
     ]
     attrs
 
-let is_ai_span (span : Model.span) =
-  let attrs = span_all_attrs span in
-  List.exists
-    (fun (key, _) -> has_prefix "ai." key || has_prefix "gen_ai." key)
-    attrs
-  || contains_substring ~needle:"generateText" span.operation_name
-  || contains_substring ~needle:"streamText" span.operation_name
-  || contains_substring ~needle:"generateObject" span.operation_name
-  || contains_substring ~needle:"streamObject" span.operation_name
+let is_ai_span = Model.is_ai_span
 
 let span_search_text (span : Model.span) =
   let attrs = span_all_attrs span in
@@ -598,58 +701,28 @@ let ai_span_filter policy params cursor limit =
     limit;
   }
 
-(* The AI-call test runs in memory, so walk raw span pages until the page is
-   full or the raw result set is exhausted. The cursor is the position of the
-   last returned AI call, so pages repeat nothing and skip nothing even when
-   new spans arrive between requests (win-5hgv, win-edze). *)
+(* AI call identity and all filters are indexed at ingestion and pushed to SQL.
+   Paging does not scan unrelated spans, even beyond the old 10,000 cap. *)
 let ai_calls store req =
   with_query req @@ fun params ->
-  match
-    List_policy.list_request ~kind:List_policy.Ai_call
-      ~now_ms:(Store.now_ms store) params
-  with
-  | Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  match List_policy.list_request ~kind:List_policy.Ai_call
+    ~now_ms:(Store.now_ms store) params with
+  | Error message -> Eta.Effect.pure (error_response 400 "invalid_query" message)
   | Ok policy ->
-      let open Eta.Syntax in
-      let batch = max (policy.List_policy.limit + 1) 1000 in
-      let rec collect position acc =
-        let* page = Store.search_spans (ai_span_filter policy params position batch) store in
-        let matched =
-          page.Store.items
-          |> List.filter is_ai_span
-          |> List.filter (ai_call_matches params)
-        in
-        let acc = acc @ matched in
-        if List.length acc > policy.List_policy.limit then
-          let items = take policy.limit acc in
-          Eta.Effect.pure
-            (items, Some (Store.span_position (List.nth items (policy.limit - 1))))
-        else
-          match page.next with
-          | None -> Eta.Effect.pure (acc, None)
-          | Some next -> collect (Some next) acc
-      in
-      let* result =
-        Eta.Effect.fold ~ok:(fun value -> Ok value)
-          ~error:(fun error -> Error error)
-          (collect policy.cursor [])
-      in
-      (match result with
-      | Error error ->
-          Eta.Effect.pure
-            (error_response 500 "store_error" (store_error_message error))
-      | Ok (calls, next) ->
-          let returned = List.length calls in
-          Eta.Effect.pure
-            (json_response
-               (`Assoc
-                 [
-                   ("calls", `List (List.map ai_call_to_json calls));
-                   ( "meta",
-                     List_policy.meta_json policy ~returned
-                       ~truncated:(Option.is_some next) ~next );
-                 ])))
+      with_search_filters ~duration:true ~contains:true params @@
+      fun min_duration_ms _ attr_contains ->
+      store_json (Store.search_ai_calls ~attr_contains ?min_duration_ms
+        ?model:(param "model" params) ?provider:(param "provider" params)
+        ?session_id:(param "sessionId" params)
+        ?function_id:(param "functionId" params)
+        ?text:(param "text" params)
+        (ai_span_filter policy params policy.cursor policy.limit) store)
+        (fun page ->
+          let returned = List.length page.Store.items in
+          `Assoc [
+            ("calls", `List (List.map ai_call_to_json page.items));
+            ("meta", List_policy.meta_json policy ~returned
+              ~truncated:(Option.is_some page.next) ~next:page.next) ])
 
 let ai_call store span_id _req =
   let open Eta.Syntax in
@@ -690,122 +763,29 @@ let ai_call store span_id _req =
 
 let ai_stats store req =
   with_query req @@ fun params ->
-  match
-    ( param "groupBy" params,
-      param "agg" params,
-      List_policy.summary_request ~now_ms:(Store.now_ms store) params )
-  with
-  | None, _, _ ->
-      Eta.Effect.pure
-        (error_response 400 "invalid_query" "groupBy is required")
-  | _, None, _ ->
-      Eta.Effect.pure (error_response 400 "invalid_query" "agg is required")
-  | _, _, Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Some _group_by, Some agg, Ok _policy when not (valid_ai_agg agg) ->
-      Eta.Effect.pure
-        (error_response 400 "invalid_query"
-           "agg must be count, avg_duration, p95_duration, total_input_tokens, or total_output_tokens")
-  | Some group_by, Some agg, Ok policy -> (
-      let open Eta.Syntax in
-      let* result =
-        Eta.Effect.fold ~ok:(fun value -> Ok value)
-          ~error:(fun error -> Error error)
-          (Store.search_spans (ai_span_filter policy params None 10_000) store)
-      in
-      (match result with
-                  | Error error ->
-                      Eta.Effect.pure
-                        (error_response 500 "store_error" (store_error_message error))
-                  | Ok page ->
-                      let spans = page.Store.items in
-                      let groups = Hashtbl.create 16 in
-                      let bucket group span =
-                        let count, total, durations, input_tokens, output_tokens =
-                          Option.value (Hashtbl.find_opt groups group)
-                            ~default:(0, 0.0, [], 0, 0)
-                        in
-                        let attrs = span_all_attrs span in
-                        Hashtbl.replace groups group
-                          ( count + 1,
-                            total +. span.Model.duration_ms,
-                            span.duration_ms :: durations,
-                            input_tokens
-                            + Option.value (ai_input_tokens attrs) ~default:0,
-                            output_tokens
-                            + Option.value (ai_output_tokens attrs) ~default:0 )
-                      in
-                      let group_for span =
-                        let attrs = span_all_attrs span in
-                        match group_by with
-                        | "provider" ->
-                            Option.value (ai_provider attrs) ~default:"unknown"
-                        | "model" -> Option.value (ai_model attrs) ~default:"unknown"
-                        | "functionId" ->
-                            Option.value (ai_function_id attrs) ~default:"unknown"
-                        | "sessionId" ->
-                            Option.value (ai_session_id attrs) ~default:"unknown"
-                        | "status" -> Model.span_status_to_string span.Model.status
-                        | _ -> "unknown"
-                      in
-                      spans
-                      |> List.filter is_ai_span
-                      |> List.filter (ai_call_matches params)
-                      |> List.iter (fun span -> bucket (group_for span) span);
-                      let rows =
-                        Hashtbl.fold
-                          (fun group (count, total, durations, input_tokens, output_tokens) acc ->
-                            let value =
-                              match agg with
-                              | "count" -> float_of_int count
-                              | "avg_duration" -> total /. float_of_int (max 1 count)
-                              | "p95_duration" ->
-                                  let sorted = List.sort Float.compare durations in
-                                  let len = List.length sorted in
-                                  if len = 0 then 0.0
-                                  else
-                                    let index =
-                                      max 0
-                                        (min (len - 1)
-                                           (int_of_float
-                                              (ceil
-                                                 ((float_of_int len *. 0.95)
-                                                -. 1.0))))
-                                    in
-                                    List.nth sorted index
-                              | "total_input_tokens" -> float_of_int input_tokens
-                              | "total_output_tokens" -> float_of_int output_tokens
-                              | _ -> float_of_int count
-                            in
-                            `Assoc
-                              [
-                                ("group", `String group);
-                                ("value", `Float value);
-                                ("count", `Int count);
-                              ]
-                            :: acc)
-                          groups []
-                        |> List.sort (fun left right ->
-                               let value = function
-                                 | `Assoc fields -> (
-                                     match List.assoc_opt "value" fields with
-                                     | Some (`Float value) -> value
-                                     | Some (`Int value) -> float_of_int value
-                                     | _ -> 0.0)
-                                 | _ -> 0.0
-                               in
-                               Float.compare (value right) (value left))
-                      in
-                      Eta.Effect.pure
-                        (json_response
-                           (`Assoc
-                             [
-                               ("stats", `List (take policy.List_policy.limit rows));
-                               ( "meta",
-                                 List_policy.stats_meta
-                                   ~lookback:policy.List_policy.lookback
-                                   ~limit:policy.limit );
-                             ]))))
+  match (param "groupBy" params, param "agg" params,
+    List_policy.summary_request ~now_ms:(Store.now_ms store) params) with
+  | None, _, _ -> Eta.Effect.pure
+      (error_response 400 "invalid_query" "groupBy is required")
+  | _, None, _ -> Eta.Effect.pure
+      (error_response 400 "invalid_query" "agg is required")
+  | _, _, Error message -> Eta.Effect.pure
+      (error_response 400 "invalid_query" message)
+  | Some _, Some agg, Ok _ when not (valid_ai_agg agg) ->
+      Eta.Effect.pure (error_response 400 "invalid_query"
+        "agg must be count, avg_duration, p95_duration, total_input_tokens, or total_output_tokens")
+  | Some group_by, Some agg, Ok policy ->
+      with_search_filters ~duration:true ~contains:true params @@
+      fun min_duration_ms _ attr_contains ->
+      store_json (Store.ai_stats ~attr_contains ?min_duration_ms
+        ?model:(param "model" params) ?provider:(param "provider" params)
+        ?session_id:(param "sessionId" params)
+        ?function_id:(param "functionId" params) ?text:(param "text" params)
+        ~group_by ~agg (ai_span_filter policy params None policy.limit) store)
+        (fun stats -> `Assoc [
+          ("stats", `List (List.map Model.stat_item_to_json stats));
+          ("meta", List_policy.stats_meta
+            ~lookback:policy.lookback ~limit:policy.limit) ])
 
 let search_spans store req =
   with_query req @@ fun params ->
@@ -816,6 +796,8 @@ let search_spans store req =
   | Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
   | Ok policy ->
+      with_search_filters ~duration:true ~contains:true params @@
+      fun min_duration_ms _ attr_contains ->
       let filter =
         {
           Store.service = param "service" params;
@@ -829,7 +811,7 @@ let search_spans store req =
           limit = policy.limit;
         }
       in
-      store_json (Store.search_spans filter store)
+      store_json (Store.search_spans ~attr_contains ?min_duration_ms filter store)
         (page_json "spans" Model.span_to_json policy)
 
 let search_traces store req =
@@ -841,6 +823,8 @@ let search_traces store req =
   | Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
   | Ok policy ->
+      with_search_filters ~duration:true ~contains:true params @@
+      fun min_duration_ms _ attr_contains ->
       let filter =
         {
           Store.service = param "service" params;
@@ -852,7 +836,8 @@ let search_traces store req =
           limit = policy.limit;
         }
       in
-      store_json (Store.search_traces filter store)
+      store_json (Store.search_traces ~attr_contains ?min_duration_ms
+        ?text:(param "text" params) filter store)
         (page_json "traces" Model.trace_summary_to_json policy)
 
 let trace_stats store req =
@@ -870,6 +855,8 @@ let trace_stats store req =
   | _, _, Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
   | Some group_by, Some agg, Ok policy when valid_trace_agg agg ->
+      with_search_filters ~duration:true ~contains:true params @@
+      fun min_duration_ms _ attr_contains ->
       let filter =
         {
           Store.group_by;
@@ -882,7 +869,7 @@ let trace_stats store req =
           limit = policy.limit;
         }
       in
-      store_json (Store.trace_stats filter store)
+      store_json (Store.trace_stats ~attr_contains ?min_duration_ms filter store)
         (summary_json "stats" Model.stat_item_to_json policy)
   | _, Some _, Ok _ ->
       Eta.Effect.pure
@@ -898,17 +885,16 @@ let logs store req =
   | Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
   | Ok policy ->
-      let filter =
-        {
-          Store.service = param "service" params;
-          severity = param "severity" params;
-          contains = param "contains" params;
-          window = policy.List_policy.window;
-          cursor = policy.cursor;
-          limit = policy.limit;
-        }
-      in
-      store_json (Store.list_logs filter store)
+      with_search_filters ~severity:true ~contains:true params @@
+      fun _ min_severity attr_contains ->
+      let filter : Store.log_search_filter = {
+        service = param "service" params;
+        trace_id = None; span_id = None;
+        severity = param "severity" params;
+        body = param "contains" params; attrs = attr_filters params;
+        window = policy.window; cursor = policy.cursor; limit = policy.limit;
+      } in
+      store_json (Store.search_logs ~attr_contains ?min_severity filter store)
         (page_json "logs" Model.log_to_json policy)
 
 let search_logs store req =
@@ -920,6 +906,8 @@ let search_logs store req =
   | Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
   | Ok policy ->
+      with_search_filters ~severity:true ~contains:true params @@
+      fun _ min_severity attr_contains ->
       let body =
         match param "body" params with
         | Some _ as value -> value
@@ -938,7 +926,7 @@ let search_logs store req =
           limit = policy.limit;
         }
       in
-      store_json (Store.search_logs filter store)
+      store_json (Store.search_logs ~attr_contains ?min_severity filter store)
         (page_json "logs" Model.log_to_json policy)
 
 let log_stats store req =
@@ -957,6 +945,8 @@ let log_stats store req =
   | _, _, Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
   | Some group_by, _, Ok policy ->
+      with_search_filters ~severity:true ~contains:true params @@
+      fun _ min_severity attr_contains ->
       let body =
         match param "body" params with
         | Some _ as value -> value
@@ -975,7 +965,7 @@ let log_stats store req =
           limit = policy.limit;
         }
       in
-      store_json (Store.log_stats filter store)
+      store_json (Store.log_stats ~attr_contains ?min_severity filter store)
         (summary_json "stats" Model.stat_item_to_json policy)
 
 let facets store req =

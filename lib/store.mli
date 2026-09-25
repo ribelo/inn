@@ -150,7 +150,7 @@ val ingest_logs : t -> Model.log_record list -> (int, error) Eta.Effect.t
 val ingest_metrics : t -> Model.metric_point list -> (int, error) Eta.Effect.t
 
 val list_services :
-  ?window:Model.window -> t -> (string list, error) Eta.Effect.t
+  ?window:Model.window -> ?include_metrics:bool -> t -> (string list, error) Eta.Effect.t
 val list_trace_summaries :
   ?service:string ->
   window:Model.window ->
@@ -182,17 +182,29 @@ val list_span_logs :
   string ->
   (Model.log_record page, error) Eta.Effect.t
 val list_logs :
-  log_filter -> t -> (Model.log_record page, error) Eta.Effect.t
+  ?min_severity:int -> log_filter -> t -> (Model.log_record page, error) Eta.Effect.t
+val search_ai_calls :
+  ?attr_contains:(string * string) list -> ?min_duration_ms:float ->
+  ?model:string -> ?provider:string -> ?session_id:string ->
+  ?function_id:string -> ?text:string -> span_search_filter -> t ->
+  (Model.span page, error) Eta.Effect.t
 val search_spans :
-  span_search_filter -> t -> (Model.span page, error) Eta.Effect.t
+  ?attr_contains:(string * string) list -> ?min_duration_ms:float -> span_search_filter -> t -> (Model.span page, error) Eta.Effect.t
 val search_traces :
+  ?attr_contains:(string * string) list -> ?min_duration_ms:float -> ?text:string ->
   trace_search_filter -> t -> (Model.trace_summary page, error) Eta.Effect.t
 val search_logs :
-  log_search_filter -> t -> (Model.log_record page, error) Eta.Effect.t
+  ?attr_contains:(string * string) list -> ?min_severity:int -> log_search_filter -> t -> (Model.log_record page, error) Eta.Effect.t
 val trace_stats :
-  trace_stats_filter -> t -> (Model.stat_item list, error) Eta.Effect.t
+  ?attr_contains:(string * string) list -> ?min_duration_ms:float -> trace_stats_filter -> t -> (Model.stat_item list, error) Eta.Effect.t
+val ai_stats :
+  ?attr_contains:(string * string) list -> ?min_duration_ms:float ->
+  ?model:string -> ?provider:string -> ?session_id:string ->
+  ?function_id:string -> ?text:string ->
+  group_by:string -> agg:string -> span_search_filter -> t ->
+  (Model.stat_item list, error) Eta.Effect.t
 val log_stats :
-  log_stats_filter -> t -> (Model.stat_item list, error) Eta.Effect.t
+  ?attr_contains:(string * string) list -> ?min_severity:int -> log_stats_filter -> t -> (Model.stat_item list, error) Eta.Effect.t
 val facets : facet_filter -> t -> (Model.facet_item list, error) Eta.Effect.t
 val list_metric_points :
   metric_filter -> t -> (Model.metric_point page, error) Eta.Effect.t

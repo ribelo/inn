@@ -131,6 +131,14 @@ type facet_item = {
   count : int;
 }
 
+val is_ai_span : span -> bool
+val ai_model : span -> string option
+val ai_provider : span -> string option
+val ai_session_id : span -> string option
+val ai_function_id : span -> string option
+val ai_input_tokens : span -> int option
+val ai_output_tokens : span -> int option
+val ai_search_text : span -> string
 val attr_string_value : Yojson.Safe.t -> string
 val span_kind_to_string : span_kind -> string
 val span_kind_of_string : string -> span_kind option

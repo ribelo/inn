@@ -148,6 +148,7 @@ let query params =
              params)
 
 let attr_param (key, value) = ("attr." ^ key, Some value)
+let attr_contains_param (key, value) = ("attrContains." ^ key, Some value)
 
 let contains_substring ~needle text =
   let text = String.lowercase_ascii text in
@@ -530,128 +531,80 @@ let trace_spans trace_id lookback cursor limit config =
         ])
     config
 
-let trace_logs trace_id lookback cursor limit config =
-  get
-    ("/traces/" ^ percent_encode trace_id ^ "/logs"
-    ^ query
-        [
-          ("lookback", lookback);
-          ("cursor", cursor);
-          ("limit", Some (string_of_int limit));
-        ])
-    config
+let trace_logs trace_id lookback cursor attrs attr_contains limit config =
+  get ("/traces/" ^ percent_encode trace_id ^ "/logs" ^ query
+    ([ ("lookback", lookback); ("cursor", cursor);
+       ("limit", Some (string_of_int limit)) ]
+     @ List.map attr_param attrs
+     @ List.map attr_contains_param attr_contains)) config
 
-let span_logs span_id lookback cursor limit config =
-  get
-    ("/spans/" ^ percent_encode span_id ^ "/logs"
-    ^ query
-        [
-          ("lookback", lookback);
-          ("cursor", cursor);
-          ("limit", Some (string_of_int limit));
-        ])
-    config
+let span_logs span_id lookback cursor attrs attr_contains limit config =
+  get ("/spans/" ^ percent_encode span_id ^ "/logs" ^ query
+    ([ ("lookback", lookback); ("cursor", cursor);
+       ("limit", Some (string_of_int limit)) ]
+     @ List.map attr_param attrs
+     @ List.map attr_contains_param attr_contains)) config
 
 let search_spans service trace_id operation parent_operation status lookback
-    cursor attrs limit config =
-  get
-    ("/spans/search"
-    ^ query
-        ([
-           ("service", service);
-           ("traceId", trace_id);
-           ("operation", operation);
-           ("parentOperation", parent_operation);
-           ("status", status);
-           ("lookback", lookback);
-           ("cursor", cursor);
-           ("limit", Some (string_of_int limit));
-         ]
-        @ List.map attr_param attrs))
-    config
+    cursor attrs attr_contains min_duration limit config =
+  get ("/spans/search" ^ query
+    ([ ("service", service); ("traceId", trace_id);
+       ("operation", operation); ("parentOperation", parent_operation);
+       ("status", status); ("lookback", lookback); ("cursor", cursor);
+       ("minDurationMs", Option.map string_of_float min_duration);
+       ("limit", Some (string_of_int limit)) ]
+     @ List.map attr_param attrs
+     @ List.map attr_contains_param attr_contains)) config
 
-let search_traces service operation status lookback cursor attrs limit config =
-  get
-    ("/traces/search"
-    ^ query
-        ([
-           ("service", service);
-           ("operation", operation);
-           ("status", status);
-           ("lookback", lookback);
-           ("cursor", cursor);
-           ("limit", Some (string_of_int limit));
-         ]
-        @ List.map attr_param attrs))
-    config
+let search_traces service operation status lookback cursor attrs attr_contains
+    min_duration text limit config =
+  get ("/traces/search" ^ query
+    ([ ("service", service); ("operation", operation); ("status", status);
+       ("lookback", lookback); ("cursor", cursor); ("text", text);
+       ("minDurationMs", Option.map string_of_float min_duration);
+       ("limit", Some (string_of_int limit)) ]
+     @ List.map attr_param attrs
+     @ List.map attr_contains_param attr_contains)) config
 
-let logs service severity contains lookback cursor limit config =
-  get
-    ("/logs"
-    ^ query
-        [
-          ("service", service);
-          ("severity", severity);
-          ("contains", contains);
-          ("lookback", lookback);
-          ("cursor", cursor);
-          ("limit", Some (string_of_int limit));
-        ])
-    config
+let logs service severity contains lookback cursor attrs attr_contains
+    min_severity limit config =
+  get ("/logs" ^ query
+    ([ ("service", service); ("severity", severity);
+       ("contains", contains); ("lookback", lookback); ("cursor", cursor);
+       ("minSeverity", min_severity); ("limit", Some (string_of_int limit)) ]
+     @ List.map attr_param attrs
+     @ List.map attr_contains_param attr_contains)) config
 
-let search_logs service trace_id span_id severity body lookback cursor attrs limit
-    config =
-  get
-    ("/logs/search"
-    ^ query
-        ([
-           ("service", service);
-           ("traceId", trace_id);
-           ("spanId", span_id);
-           ("severity", severity);
-           ("body", body);
-           ("lookback", lookback);
-           ("cursor", cursor);
-           ("limit", Some (string_of_int limit));
-         ]
-        @ List.map attr_param attrs))
-    config
+let search_logs service trace_id span_id severity body lookback cursor attrs
+    attr_contains min_severity limit config =
+  get ("/logs/search" ^ query
+    ([ ("service", service); ("traceId", trace_id); ("spanId", span_id);
+       ("severity", severity); ("body", body); ("lookback", lookback);
+       ("cursor", cursor); ("minSeverity", min_severity);
+       ("limit", Some (string_of_int limit)) ]
+     @ List.map attr_param attrs
+     @ List.map attr_contains_param attr_contains)) config
 
-let trace_stats_query group_by agg service operation status lookback attrs limit
-    config =
-  get
-    ("/traces/stats"
-    ^ query
-        ([
-           ("groupBy", Some group_by);
-           ("agg", Some agg);
-           ("service", service);
-           ("operation", operation);
-           ("status", status);
-           ("lookback", lookback);
-           ("limit", Some (string_of_int limit));
-         ]
-        @ List.map attr_param attrs))
-    config
+let trace_stats_query group_by agg service operation status lookback attrs
+    attr_contains min_duration limit config =
+  get ("/traces/stats" ^ query
+    ([ ("groupBy", Some group_by); ("agg", Some agg); ("service", service);
+       ("operation", operation); ("status", status); ("lookback", lookback);
+       ("minDurationMs", Option.map string_of_float min_duration);
+       ("limit", Some (string_of_int limit)) ]
+     @ List.map attr_param attrs
+     @ List.map attr_contains_param attr_contains)) config
 
-let log_stats_query group_by service trace_id span_id severity body lookback attrs
-    limit config =
-  get
-    ("/logs/stats"
-    ^ query
-        ([
-           ("groupBy", Some group_by);
-           ("agg", Some "count");
-           ("service", service);
-           ("traceId", trace_id);
-           ("spanId", span_id);
-           ("severity", severity);
-           ("body", body);
-           ("lookback", lookback);
-           ("limit", Some (string_of_int limit));
-         ]
-        @ List.map attr_param attrs))
-    config
+let log_stats_query group_by service trace_id span_id severity body lookback
+    attrs attr_contains min_severity limit config =
+  get ("/logs/stats" ^ query
+    ([ ("groupBy", Some group_by); ("agg", Some "count");
+       ("service", service); ("traceId", trace_id); ("spanId", span_id);
+       ("severity", severity); ("body", body); ("lookback", lookback);
+       ("minSeverity", min_severity);
+       ("limit", Some (string_of_int limit)) ]
+     @ List.map attr_param attrs
+     @ List.map attr_contains_param attr_contains)) config
 
 let facets kind field key service lookback limit config =
   get
@@ -668,7 +621,7 @@ let facets kind field key service lookback limit config =
     config
 
 let ai_calls service trace_id session_id function_id provider model operation
-    status text lookback cursor limit config =
+    status text lookback cursor min_duration limit config =
   get
     ("/ai/calls"
     ^ query
@@ -682,6 +635,7 @@ let ai_calls service trace_id session_id function_id provider model operation
           ("operation", operation);
           ("status", status);
           ("text", text);
+           ("minDurationMs", Option.map string_of_float min_duration);
           ("lookback", lookback);
           ("cursor", cursor);
           ("limit", Some (string_of_int limit));
@@ -692,7 +646,7 @@ let ai_call span_id config =
   get ("/ai/calls/" ^ percent_encode span_id) config
 
 let ai_stats group_by agg service trace_id session_id function_id provider model
-    operation status text lookback limit config =
+    operation status text lookback min_duration limit config =
   get
     ("/ai/stats"
     ^ query
@@ -708,6 +662,7 @@ let ai_stats group_by agg service trace_id session_id function_id provider model
           ("operation", operation);
           ("status", status);
           ("text", text);
+           ("minDurationMs", Option.map string_of_float min_duration);
           ("lookback", lookback);
           ("limit", Some (string_of_int limit));
         ])
@@ -859,11 +814,21 @@ let attr_pair =
   Arg.conv (parse, print)
 
 let attrs_t =
-  Arg.(
-    value
-    & opt_all attr_pair []
-    & info [ "attr" ] ~docv:"KEY=VALUE"
-        ~doc:"Require an exact attribute key/value match. May be repeated.")
+  Arg.(value & opt_all attr_pair [] & info [ "attr" ] ~docv:"KEY=VALUE"
+    ~doc:"Require an exact attribute key/value match. May be repeated.")
+
+let attr_contains_t =
+  Arg.(value & opt_all attr_pair [] & info [ "attr-contains" ]
+    ~docv:"KEY=TEXT"
+    ~doc:"Require a literal, case-insensitive substring within an attribute. May be repeated.")
+
+let min_duration_t =
+  Arg.(value & opt (some float) None & info [ "min-duration-ms" ]
+    ~docv:"MILLISECONDS" ~doc:"Require at least this duration in milliseconds.")
+
+let min_severity_t =
+  Arg.(value & opt (some string) None & info [ "min-severity" ]
+    ~docv:"LEVEL" ~doc:"Minimum OTLP severity (trace, debug, info, warn, error, fatal).")
 
 let group_by_t =
   Arg.(required & pos 0 (some string) None & info [] ~docv:"GROUP_BY")
@@ -933,49 +898,51 @@ let trace_spans_cmd =
 
 let trace_logs_cmd =
   cmd "trace-logs" "List logs correlated with a trace."
-    Term.(const trace_logs $ trace_id_t $ lookback_t $ cursor_t $ limit_t $ config_t)
+    Term.(const trace_logs $ trace_id_t $ lookback_t $ cursor_t $ attrs_t
+       $ attr_contains_t $ limit_t $ config_t)
 
 let span_logs_cmd =
   cmd "span-logs" "List logs correlated with a span."
-    Term.(const span_logs $ span_id_t $ lookback_t $ cursor_t $ limit_t $ config_t)
+    Term.(const span_logs $ span_id_t $ lookback_t $ cursor_t $ attrs_t
+       $ attr_contains_t $ limit_t $ config_t)
 
 let search_spans_cmd =
   cmd "search-spans" "Search spans by service, operation, status, and attributes."
-    Term.(
-      const search_spans $ service_t $ trace_id_filter_t $ operation_t
-      $ parent_operation_t $ status_t $ lookback_t $ cursor_t $ attrs_t $ limit_t
-      $ config_t)
+    Term.(const search_spans $ service_t $ trace_id_filter_t $ operation_t
+      $ parent_operation_t $ status_t $ lookback_t $ cursor_t $ attrs_t
+      $ attr_contains_t $ min_duration_t $ limit_t $ config_t)
 
 let search_traces_cmd =
   cmd "search-traces" "Search trace summaries by span filters."
-    Term.(
-      const search_traces $ service_t $ operation_t $ status_t $ lookback_t
-      $ cursor_t $ attrs_t $ limit_t $ config_t)
+    Term.(const search_traces $ service_t $ operation_t $ status_t $ lookback_t
+      $ cursor_t $ attrs_t $ attr_contains_t $ min_duration_t $ text_t
+      $ limit_t $ config_t)
 
 let logs_cmd =
   cmd "logs" "List logs."
-    Term.(
-      const logs $ service_t $ severity_t $ contains_t $ lookback_t $ cursor_t
+    Term.(const logs $ service_t $ severity_t $ contains_t $ lookback_t
+      $ cursor_t $ attrs_t $ attr_contains_t $ min_severity_t
       $ limit_t $ config_t)
 
 let search_logs_cmd =
   cmd "search-logs" "Search logs by service, correlation ids, body, and attributes."
     Term.(
       const search_logs $ service_t $ trace_id_filter_t $ span_id_filter_t
-      $ severity_t $ body_t $ lookback_t $ cursor_t $ attrs_t $ limit_t $ config_t)
+      $ severity_t $ body_t $ lookback_t $ cursor_t $ attrs_t
+       $ attr_contains_t $ min_severity_t $ limit_t $ config_t)
 
 let trace_stats_cmd =
   cmd "trace-stats" "Aggregate trace statistics."
     Term.(
       const trace_stats_query $ group_by_t $ agg_t $ service_t $ operation_t
-      $ status_t $ lookback_t $ attrs_t $ limit_t $ config_t)
+      $ status_t $ lookback_t $ attrs_t $ attr_contains_t $ min_duration_t
+       $ limit_t $ config_t)
 
 let log_stats_cmd =
   cmd "log-stats" "Aggregate log counts."
-    Term.(
-      const log_stats_query $ group_by_t $ service_t $ trace_id_filter_t
-      $ span_id_filter_t $ severity_t $ body_t $ lookback_t $ attrs_t $ limit_t
-      $ config_t)
+    Term.(const log_stats_query $ group_by_t $ service_t $ trace_id_filter_t
+      $ span_id_filter_t $ severity_t $ body_t $ lookback_t $ attrs_t
+      $ attr_contains_t $ min_severity_t $ limit_t $ config_t)
 
 let facets_cmd =
   cmd "facets" "List trace or log facet values."
@@ -988,7 +955,7 @@ let ai_calls_cmd =
     Term.(
       const ai_calls $ service_t $ trace_id_filter_t $ session_id_t
       $ function_id_t $ provider_t $ model_t $ operation_t $ status_t $ text_t
-      $ lookback_t $ cursor_t $ limit_t $ config_t)
+      $ lookback_t $ cursor_t $ min_duration_t $ limit_t $ config_t)
 
 let ai_call_cmd =
   cmd "ai-call" "Read one AI call by span id."
@@ -999,7 +966,8 @@ let ai_stats_cmd =
     Term.(
       const ai_stats $ group_by_t $ agg_t $ service_t $ trace_id_filter_t
       $ session_id_t $ function_id_t $ provider_t $ model_t $ operation_t
-      $ status_t $ text_t $ lookback_t $ limit_t $ config_t)
+      $ status_t $ text_t $ lookback_t $ min_duration_t $ limit_t
+       $ config_t)
 
 let metrics_cmd =
   cmd "metrics" "List metric points."

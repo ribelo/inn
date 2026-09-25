@@ -158,6 +158,39 @@ GET /openapi.json
 
 The `/api/...` prefix is accepted as an alias for query endpoints.
 
+### Search filters and exact results
+
+`operation` and `parentOperation` match a case-insensitive substring; a parent
+must belong to the candidate span in the same trace. Log `body`/`contains` and AI
+`text` are also literal, case-insensitive substrings. This means `%`, `_`, and
+backslashes are characters, not SQL wildcards. Repeated `attr.<key>` filters require
+exact attribute values, while `attrContains.<key>` requires a literal substring
+of the string form of an attribute value. Different filters combine with AND.
+These attribute filters work on trace/span searches, log list/search, trace/log
+stats, and trace/span correlated log lists.
+
+`minDurationMs` (nonnegative number) applies to trace search/stats, span
+search, and AI call search/stats. `minSeverity` accepts
+`trace`, `debug`, `info`, `warn`, `error`, or `fatal` on log
+lists/search/stats. It compares OTLP severity numbers, falling back to text
+when no number is present. Exact `severity` comparisons ignore case.
+Trace `status` describes the entire trace: `error` means any span failed,
+and `ok` means none failed. Span status remains span-specific.
+
+Trace search `text` matches AI prompt/response content in a trace, even if
+the matching AI span is not its root. Searches and aggregates run in SQL over
+the complete selected window rather than sampling a result page. p95 duration
+uses the exact nearest-rank percentile. No sampling or safety cap remains on
+aggregate inputs: these responses are exact, not approximate. Trace service filters match any service
+participating in the trace while the summary still displays its root service.
+Trace facets describe root service/operation, whole-trace health, and distinct
+traces for attribute values. By default `/services` includes span/log
+services; add `signal=metrics` to include metrics-only services.
+
+`/endpoints` lists supported `filters` per route and `/openapi.json`
+publishes typed query parameters; `x-inn-query-prefixes` describes the
+dynamic `attr.<key>` and `attrContains.<key>` keys.
+
 ### Windows and cursors
 
 Every list, search, stats, facet, services, and store-stats query takes a
@@ -199,7 +232,7 @@ inn status
 inn health
 inn services
 inn traces --service api
-inn search-traces --service api --operation GET --status error --attr route=/users
+inn search-traces --service api --operation users --status error --attr-contains route=/users --min-duration-ms 5 --text checkout
 inn trace aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 inn trace-spans aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 inn trace-logs aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -207,7 +240,7 @@ inn search-spans --service api --operation GET --attr route=/users
 inn span bbbbbbbbbbbbbbbb
 inn span-logs bbbbbbbbbbbbbbbb
 inn logs --service api --severity ERROR --contains timeout
-inn search-logs --service api --body timeout --attr route=/users
+inn search-logs --service api --body timeout --attr-contains route=/users --min-severity warn
 inn trace-stats operation count --service api
 inn log-stats severity --service api
 inn facets traces attribute_keys --service api
