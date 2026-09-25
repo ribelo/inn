@@ -10,11 +10,11 @@ Each spec's frontmatter carries its status. Story IDs are cited by tests.
 | 3 | [schema-versioning](schema-versioning/01-recreate-on-mismatch.md) | done (4faa31e) |
 | 4 | [retention](retention/01-per-signal-retention.md) | done (4faa31e) |
 | 5 | [otlp-ingest](otlp-ingest/01-otlp-json-conformance.md) | done (3a13813) |
-| 6 | [query-windows](query-windows/01-lookback-and-cursors.md) | done |
-| 7 | [search-filters](search-filters/01-search-filters.md) | ready |
-| 8 | [query-accuracy](query-accuracy/01-exact-bounded-queries.md) | ready |
-| 9 | [trace-tree](trace-tree/01-trace-tree-view.md) | ready |
-| 10 | [ai-calls](ai-calls/01-ai-call-insight.md) | ready |
+| 6 | [query-windows](query-windows/01-lookback-and-cursors.md) | done (da7ed14) |
+| 7 | [search-filters](search-filters/01-search-filters.md) | done (6154c60) |
+| 8 | [query-accuracy](query-accuracy/01-exact-bounded-queries.md) | done (6154c60) |
+| 9 | [trace-tree](trace-tree/01-trace-tree-view.md) | in progress |
+| 10 | [ai-calls](ai-calls/01-ai-call-insight.md) | in progress |
 | 11 | [self-description](self-description/01-openapi-and-guides.md) | ready |
 | 12 | [systemd-service](systemd-service/01-service-runs.md) | ready (runs last) |
 
@@ -27,7 +27,9 @@ tool, which proxies `GET /stats`; it landed with the query-windows slice.
 Eta issues opened from this work (in the Eta repository):
 
 - `docs/issues/sql-heterogeneous-column-lists`: done (Eta 5a24b687)
-- `docs/issues/sql-notadb-spin`: done (Eta 54e48e79)
+- `docs/issues/sql-notadb-spin`: done (Eta 54e48e79, 13749175)
+- `docs/issues/sql-like-escape`: done (Eta 426d7f33)
+- `docs/issues/changelog-audit-breaks`: done (Eta d00ed4c7)
 
 Deliberately out of scope: the TUI, web UI, HTML trace page, Scalar docs UI,
 OTLP protobuf/gzip/gRPC (the only clients are Effect and eta_otel, both JSON),
