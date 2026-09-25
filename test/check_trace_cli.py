@@ -1,4 +1,5 @@
 """tree-d24c: inn trace prints an indented tree by default and JSON with --json.
+desc-85u9: inn docs lists the guides and prints one as Markdown.
 
 The check runs a real server on a free port, ingests one nested trace through
 the OTLP/HTTP JSON endpoint, and reads it back with the CLI.
@@ -130,6 +131,34 @@ try:
     assert spans[1]["parentOperationName"] == "GET /tree", spans[1]
     assert spans[1]["rootOperationName"] == "GET /tree", spans[1]
     assert body["summary"]["warningCount"] == 0, body["summary"]
+
+    docs = subprocess.run(
+        [exe, "docs"], env=env, text=True, capture_output=True, timeout=20
+    )
+    assert docs.returncode == 0, (docs.returncode, docs.stderr)
+    index = json.loads(docs.stdout)
+    names = [guide["name"] for guide in index["guides"]]
+    assert names == ["debug", "effect", "eta"], index
+    assert all(
+        guide["path"] == "/docs/%s" % guide["name"]
+        and guide["title"]
+        for guide in index["guides"]
+    ), index
+
+    guide = subprocess.run(
+        [exe, "docs", "debug"], env=env, text=True, capture_output=True, timeout=20
+    )
+    assert guide.returncode == 0, (guide.returncode, guide.stderr)
+    assert guide.stdout.startswith("# "), guide.stdout[:80]
+    assert "/traces/search" in guide.stdout, guide.stdout[:200]
+    assert "lookback" in guide.stdout, guide.stdout[:200]
+
+    missing = subprocess.run(
+        [exe, "docs", "nope"], env=env, text=True, capture_output=True, timeout=20
+    )
+    assert missing.returncode == 1, missing.returncode
+    assert "nope" in missing.stderr, missing.stderr
+    assert "debug" in missing.stderr, missing.stderr
 finally:
     server.terminate()
     try:
@@ -139,3 +168,4 @@ finally:
     shutil.rmtree(state, ignore_errors=True)
 
 print("tree-d24c: inn trace prints a tree and --json, against a live server")
+print("desc-85u9: inn docs lists, reads, and fails loudly on an unknown name")

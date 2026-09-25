@@ -1,4 +1,20 @@
 (rule
+ (targets docs_data.ml)
+ (deps
+  ../tools/gen_docs/gen_docs.exe
+  ../docs/guides/debug.md
+  ../docs/guides/effect.md
+  ../docs/guides/eta.md)
+ (action
+  (with-stdout-to
+   docs_data.ml
+   (run
+    %{dep:../tools/gen_docs/gen_docs.exe}
+    debug:../docs/guides/debug.md
+    effect:../docs/guides/effect.md
+    eta:../docs/guides/eta.md))))
+
+(rule
  (targets version.ml)
  (action (with-stdout-to %{targets} (echo "let value = \"%{version:inn}\""))))
 

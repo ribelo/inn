@@ -96,10 +96,26 @@ Core HTTP query endpoints:
 - `GET /facets`
 - `GET /stats`
 - `GET /instructions`
+- `GET /docs`
+- `GET /docs/<name>`
 - `GET /endpoints`
 - `GET /openapi.json`
 
-The `/api/...` aliases exist for query/discovery endpoints.
+The `/api/...` alias exists for every route, ingest included.
+
+The endpoint inventory and the OpenAPI 3.1 document are rendered from the same
+declarations the router registers and the query parser validates against: method,
+path, parameters with type, default, allowed values, and description, request
+body, and response schemas. An undeclared, missing, or wrongly typed query
+parameter is a `400` before the handler runs, so the documented parameter set is
+the enforced one. `/health` and `/healthz` report the build version, the ISO
+8601 start time, and the uptime; `/ready` answers `200` while the store
+answers a metadata read and `503` otherwise.
+
+The guides are Markdown files under `docs/guides` compiled into the binary at
+build time (`debug`, `effect`, `eta`); `/docs` indexes them and
+`/docs/<name>` serves one, with a `404` that lists the available names.
+`/instructions` points at them and at the OpenAPI document.
 
 List, search, stats, facet, services, and store-stats queries take a relative
 `lookback` window (`Nm`, `Nh`, `Nd`, or `all`). Lists and searches default to
@@ -156,6 +172,7 @@ Core CLI commands:
 - `inn endpoints`
 - `inn instructions`
 - `inn openapi`
+- `inn docs [NAME]`
 - `inn mcp`
 
 The MCP server is a stdio JSON-RPC/MCP surface. It advertises read-only tools

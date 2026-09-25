@@ -1461,7 +1461,7 @@ let test_server_handler_ingests_and_queries_services () =
       Alcotest.(check int)
         "endpoints status" 200 (Eta_http.Server.Response.status endpoints);
       Alcotest.(check int)
-        "endpoint inventory is present" 26
+        "endpoint inventory is present" (List.length Inn.Endpoint.all)
         (endpoints |> response_json |> json_list_length "endpoints");
       let stats =
         run_server_effect
@@ -3536,6 +3536,545 @@ let test_ai_field_provenance_documented () =
       "gen_ai.operation.name=execute_tool";
     ]
 
+(* Self-description ---------------------------------------------------- *)
+
+let endpoint_declarations = Inn.Endpoint.all
+
+let replace_once ~pattern ~with_ text =
+  let pattern_length = String.length pattern in
+  let rec search index =
+    if index + pattern_length > String.length text then None
+    else if String.equal (String.sub text index pattern_length) pattern then
+      Some index
+    else search (index + 1)
+  in
+  match search 0 with
+  | None -> text
+  | Some index ->
+      String.sub text 0 index ^ with_
+      ^ String.sub text (index + pattern_length)
+          (String.length text - index - pattern_length)
+
+(* The concrete request target of a declaration, with placeholder ids. *)
+let concrete_path (endpoint : Inn.Endpoint.t) =
+  List.fold_left
+    (fun path (pattern, value) -> replace_once ~pattern ~with_:value path)
+    endpoint.path
+    [
+      ("{traceId}", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+      ("{spanId}", "bbbbbbbbbbbbbbbb");
+      ("{name}", "debug");
+    ]
+
+let declared_request config store (endpoint : Inn.Endpoint.t) target =
+  run_server_effect
+    (Inn.Server.handler config store
+       (request ~method_:(Inn.Endpoint.method_to_string endpoint.method_)
+          ~target ()))
+
+let json_scalar_string = function
+  | `String value -> value
+  | `Int value -> string_of_int value
+  | `Float value -> string_of_float value
+  | `Bool value -> string_of_bool value
+  | json -> Yojson.Safe.to_string json
+
+let location_string (endpoint : Inn.Endpoint.t) (param : Inn.Endpoint.param) =
+  match param.location with
+  | Inn.Endpoint.Query -> "query"
+  | Inn.Endpoint.Path -> "path"
+
+let required_parameter param =
+  param.Inn.Endpoint.name ^ "="
+  ^ (match param.Inn.Endpoint.allowed with
+    | value :: _ -> value
+    | [] -> "required")
+
+let response_content_type (response : Inn.Endpoint.response) =
+  response.Inn.Endpoint.content_type
+
+let response_status (response : Inn.Endpoint.response) =
+  response.Inn.Endpoint.status
+
+let response_schema (response : Inn.Endpoint.response) =
+  response.Inn.Endpoint.schema
+
+let declared_response (endpoint : Inn.Endpoint.t) status =
+  List.find_opt
+    (fun (response : Inn.Endpoint.response) -> response_status response = status)
+    endpoint.Inn.Endpoint.responses
+
+let test_declarations_drive_the_router () =
+  (* desc-iduq, desc-de6o: one declaration list is the router, the /endpoints
+     inventory, and the OpenAPI document. *)
+  let config = temp_config () in
+  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let store = run_store (Store.open_ config) in
+  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  let inventory =
+    json_list "endpoints" (server_json config store "/endpoints")
+  in
+  let openapi = server_json config store "/openapi.json" in
+  let paths = json_member "paths" openapi in
+  Alcotest.(check int)
+    "every declaration is in the inventory"
+    (List.length endpoint_declarations)
+    (List.length inventory);
+  List.iter
+    (fun (endpoint : Inn.Endpoint.t) ->
+      let method_ = Inn.Endpoint.method_to_string endpoint.method_ in
+      let method_key = Inn.Endpoint.method_to_lowercase endpoint.method_ in
+      let entry =
+        match
+          List.find_opt
+            (fun item ->
+              json_string_field "method" item = method_
+              && json_string_field "path" item = endpoint.path)
+            inventory
+        with
+        | Some entry -> entry
+        | None ->
+            Alcotest.failf "%s %s is missing from /endpoints" method_ endpoint.path
+      in
+      let declared_query =
+        List.map
+          (fun (param : Inn.Endpoint.param) -> param.name)
+          (Inn.Endpoint.query_params endpoint)
+      in
+      Alcotest.(check (list string))
+        (endpoint.path ^ " filters")
+        declared_query
+        (List.map json_scalar_string (json_list "filters" entry));
+      let all_names =
+        List.map
+          (fun (param : Inn.Endpoint.param) -> param.name)
+          endpoint.params
+      in
+      let inventory_params = json_list "parameters" entry in
+      Alcotest.(check (list string))
+        (endpoint.path ^ " inventory parameters")
+        all_names
+        (List.map (fun item -> json_string_field "name" item) inventory_params);
+      let operation = json_member method_key (json_member endpoint.path paths) in
+      Alcotest.(check bool)
+        (method_ ^ " " ^ endpoint.path ^ " is in OpenAPI")
+        true
+        (operation <> `Null);
+      let openapi_params = json_list "parameters" operation in
+      Alcotest.(check (list string))
+        (endpoint.path ^ " OpenAPI parameters")
+        all_names
+        (List.map (fun item -> json_string_field "name" item) openapi_params);
+      List.iter
+        (fun (param : Inn.Endpoint.param) ->
+          let label = endpoint.path ^ " " ^ param.name in
+          let inventory_param =
+            match
+              List.find_opt
+                (fun item -> json_string_field "name" item = param.name)
+                inventory_params
+            with
+            | Some item -> item
+            | None -> Alcotest.failf "%s is missing from the inventory" label
+          in
+          let openapi_param =
+            match
+              List.find_opt
+                (fun item -> json_string_field "name" item = param.name)
+                openapi_params
+            with
+            | Some item -> item
+            | None -> Alcotest.failf "%s is missing from OpenAPI" label
+          in
+          Alcotest.(check string)
+            (label ^ " location")
+            (location_string endpoint param)
+            (json_string_field "in" inventory_param);
+          Alcotest.(check string)
+            (label ^ " location in OpenAPI")
+            (location_string endpoint param)
+            (json_string_field "in" openapi_param);
+          Alcotest.(check bool)
+            (label ^ " required")
+            param.required
+            (json_member "required" inventory_param = `Bool true);
+          Alcotest.(check string)
+            (label ^ " type")
+            (Inn.Endpoint.kind_to_string param.kind)
+            (json_string_field "type" inventory_param);
+          let schema = json_member "schema" openapi_param in
+          Alcotest.(check string)
+            (label ^ " type in OpenAPI")
+            (Inn.Endpoint.kind_to_string param.kind)
+            (json_string_field "type" schema);
+          (match param.default with
+          | None ->
+              Alcotest.(check bool)
+                (label ^ " has no default")
+                true
+                (json_member "default" inventory_param = `Null);
+              Alcotest.(check bool)
+                (label ^ " has no default in OpenAPI")
+                true
+                (json_member "default" schema = `Null)
+          | Some value ->
+              Alcotest.(check string)
+                (label ^ " default")
+                value
+                (json_scalar_string (json_member "default" inventory_param));
+              Alcotest.(check string)
+                (label ^ " default in OpenAPI")
+                value
+                (json_scalar_string (json_member "default" schema)));
+          Alcotest.(check (list string))
+            (label ^ " allowed values")
+            param.allowed
+            (List.map json_scalar_string (json_list "allowed" inventory_param));
+          Alcotest.(check (list string))
+            (label ^ " allowed values in OpenAPI")
+            param.allowed
+            (match json_member "enum" schema with
+            | `List values -> List.map json_scalar_string values
+            | _ -> []))
+        endpoint.params;
+      let responses = json_member "responses" operation in
+      List.iter
+        (fun (response : Inn.Endpoint.response) ->
+          let declared =
+            json_member (string_of_int (response_status response)) responses
+          in
+          let label = endpoint.path ^ " " ^ string_of_int (response_status response) in
+          Alcotest.(check bool) (label ^ " is described") true (declared <> `Null);
+          Alcotest.(check bool)
+            (label ^ " documents " ^ response_content_type response)
+            true
+            (json_member (response_content_type response)
+               (json_member "content" declared)
+            <> `Null))
+        endpoint.responses;
+      Alcotest.(check string)
+        (endpoint.path ^ " alias")
+        (Inn.Endpoint.alias_path endpoint)
+        (json_string_field "alias" entry);
+      Alcotest.(check bool)
+        (endpoint.path ^ " alias path is in OpenAPI")
+        true
+        (json_member (Inn.Endpoint.alias_path endpoint) paths <> `Null);
+      (* The router really serves the declaration: the endpoint-not-found
+         body and a 405 are the two ways a declaration could be missing. *)
+      let target = concrete_path endpoint in
+      let response = declared_request config store endpoint target in
+      Alcotest.(check bool)
+        (method_ ^ " " ^ target ^ " is registered")
+        true
+        (Eta_http.Server.Response.status response <> 405);
+      (match
+         Eta_http.Core.Header.get "content-type"
+           (Eta_http.Server.Response.headers response)
+       with
+      | Some content_type when contains content_type "application/json" ->
+          Alcotest.(check bool)
+            (method_ ^ " " ^ target ^ " is routed")
+            true
+            (json_member "error" (response_json response) <> `String "not_found")
+      | _ -> ()))
+    endpoint_declarations
+
+let test_declared_responses_match_handlers () =
+  (* desc-iduq: the declared response schema covers what the handler returns,
+     and an undeclared query parameter is rejected with the supported list. *)
+  let config = temp_config () in
+  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let store = run_store (Store.open_ config) in
+  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  List.iter
+    (fun (endpoint : Inn.Endpoint.t) ->
+      let required =
+        List.filter_map
+          (fun (param : Inn.Endpoint.param) ->
+            if param.required then Some (required_parameter param) else None)
+          (Inn.Endpoint.query_params endpoint)
+      in
+      let target =
+        concrete_path endpoint
+        ^ (if required = [] then "" else "?" ^ String.concat "&" required)
+      in
+      let response = declared_request config store endpoint target in
+      let status = Eta_http.Server.Response.status response in
+      match declared_response endpoint status with
+      | None ->
+          Alcotest.failf "%s %s answered %d, which the declaration does not carry"
+            (Inn.Endpoint.method_to_string endpoint.method_)
+            target status
+      | Some declared ->
+          if
+            String.equal (response_content_type declared) "application/json"
+          then begin
+            let body = response_json response in
+            (match json_member "properties" (response_schema declared) with
+            | `Assoc properties ->
+                let keys =
+                  match body with `Assoc fields -> List.map fst fields | _ -> []
+                in
+                List.iter
+                  (fun key ->
+                    Alcotest.(check bool)
+                      (target ^ " documents " ^ key)
+                      true
+                      (List.mem_assoc key properties))
+                  keys
+            | _ -> ())
+          end
+          else
+            Alcotest.(check bool)
+              (target ^ " returns a " ^ response_content_type declared ^ " body")
+              true
+              (String.length (response_body_string response) > 0))
+    endpoint_declarations;
+  (* The declared parameter set is the enforced one (desc-de6o). *)
+  let undeclared = server_get config store "/traces?nope=1" in
+  check_invalid_query "an undeclared parameter" undeclared "nope";
+  Alcotest.(check bool)
+    "the error lists the supported parameters" true
+    (contains
+       (json_string_field "message" (response_json undeclared))
+       "lookback");
+  let typed = server_get config store "/traces?limit=abc" in
+  check_invalid_query "a wrongly typed parameter" typed "limit must be an integer"
+
+let test_hidden_routes_are_documented () =
+  (* desc-dmuw: nothing the server serves stays out of the inventory. *)
+  let config = temp_config () in
+  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let store = run_store (Store.open_ config) in
+  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  let inventory =
+    json_list "endpoints" (server_json config store "/endpoints")
+  in
+  let openapi = server_json config store "/openapi.json" in
+  let paths = json_member "paths" openapi in
+  let documented method_ path =
+    (List.exists
+       (fun item ->
+         json_string_field "method" item = method_
+         && json_string_field "path" item = path)
+       inventory)
+    && json_member (String.lowercase_ascii method_)
+         (json_member path paths)
+       <> `Null
+  in
+  List.iter
+    (fun (method_, path) ->
+      Alcotest.(check bool) (method_ ^ " " ^ path ^ " is documented") true
+        (documented method_ path))
+    [ ("POST", "/v1/metrics"); ("GET", "/healthz"); ("GET", "/ready") ];
+  Alcotest.(check string)
+    "the inventory publishes the alias policy" "/api"
+    (json_string_field "prefix" (json_member "aliasPolicy"
+       (server_json config store "/endpoints")));
+  Alcotest.(check string)
+    "OpenAPI publishes the alias policy" "/api"
+    (json_string_field "prefix" (json_member "x-inn-alias-policy" openapi));
+  List.iter
+    (fun path ->
+      Alcotest.(check int) ("the " ^ path ^ " alias answers") 200
+        (Eta_http.Server.Response.status (server_get config store path)))
+    [ "/api/healthz"; "/api/ready"; "/api/docs" ];
+  Alcotest.(check int) "the /api ingest alias answers" 200
+    (Eta_http.Server.Response.status
+       (run_server_effect
+          (Inn.Server.handler config store
+             (request ~method_:"POST" ~target:"/api/v1/metrics" ()))))
+
+let test_docs_endpoints () =
+  (* desc-bqwh, desc-7wwz *)
+  let config = temp_config () in
+  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let store = run_store (Store.open_ config) in
+  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  let guides = json_list "guides" (server_json config store "/docs") in
+  Alcotest.(check int)
+    "the index lists every guide" (List.length Inn.Docs.guides)
+    (List.length guides);
+  List.iter
+    (fun (guide : Inn.Docs.guide) ->
+      let entry =
+        match
+          List.find_opt
+            (fun item -> json_string_field "name" item = guide.name)
+            guides
+        with
+        | Some entry -> entry
+        | None -> Alcotest.failf "guide %s is not listed" guide.name
+      in
+      Alcotest.(check string)
+        (guide.name ^ " title") guide.title
+        (json_string_field "title" entry);
+      Alcotest.(check string)
+        (guide.name ^ " path") ("/docs/" ^ guide.name)
+        (json_string_field "path" entry);
+      let response = server_get config store ("/docs/" ^ guide.name) in
+      Alcotest.(check int)
+        (guide.name ^ " status") 200
+        (Eta_http.Server.Response.status response);
+      Alcotest.(check bool)
+        (guide.name ^ " is served as Markdown")
+        true
+        (match
+           Eta_http.Core.Header.get "content-type"
+             (Eta_http.Server.Response.headers response)
+         with
+        | Some value -> contains value "text/markdown"
+        | None -> false);
+      Alcotest.(check string)
+        (guide.name ^ " content") guide.content
+        (response_body_string response))
+    Inn.Docs.guides;
+  let unknown = server_get config store "/docs/nope" in
+  Alcotest.(check int)
+    "an unknown guide is a 404" 404
+    (Eta_http.Server.Response.status unknown);
+  let body = response_json unknown in
+  Alcotest.(check string)
+    "the unknown guide code" "doc_not_found" (json_string_field "error" body);
+  Alcotest.(check (list string))
+    "the 404 lists the available names"
+    (List.map (fun (guide : Inn.Docs.guide) -> guide.name) Inn.Docs.guides)
+    (List.map json_scalar_string (json_list "available" body));
+  List.iter
+    (fun path ->
+      Alcotest.(check int)
+        (path ^ " alias") 200
+        (Eta_http.Server.Response.status (server_get config store path)))
+    [ "/api/docs"; "/api/docs/debug" ]
+
+let test_guide_content () =
+  (* desc-wy48, desc-od3y, desc-62du: the guides are substantive and name the
+     configuration they describe. *)
+  let guide name =
+    match Inn.Docs.find name with
+    | Some guide -> guide
+    | None -> Alcotest.failf "the %s guide is missing" name
+  in
+  let check (guide : Inn.Docs.guide) fragments =
+    Alcotest.(check bool)
+      (guide.name ^ " is substantive") true
+      (String.length guide.content > 3000);
+    List.iter
+      (fun fragment ->
+        Alcotest.(check bool)
+          (guide.name ^ " mentions " ^ fragment)
+          true
+          (contains guide.content fragment))
+      fragments
+  in
+  check (guide "debug")
+    [
+      "lookback"; "cursor"; "attr."; "attrContains."; "minDurationMs";
+      "minSeverity"; "/services"; "/traces/search"; "/spans/search";
+      "/logs/search"; "/traces/{traceId}"; "depth"; "warnings";
+      "isRunning"; "/ai/calls"; "/ai/calls/{spanId}"; "/ai/stats";
+      "/traces/stats"; "/logs/stats"; "/facets"; "/stats";
+      "/docs"; "/docs/debug"; "/openapi.json"; "/endpoints";
+      "inn_docs_index"; "inn_get_doc"; "inn_search_traces"; "inn_get_trace";
+      "inn_search_ai_calls"; "inn_ai_stats"; "inn trace"; "inn docs";
+    ];
+  check (guide "effect")
+    [
+      "effect/unstable/observability"; "OtlpTracer.layer"; "OtlpLogger.layer";
+      "OtlpMetrics.layer"; "OtlpSerialization.layerJson"; "FetchHttpClient.layer";
+      "serviceName"; "/v1/traces"; "/v1/logs"; "/v1/metrics";
+      "application/json";
+    ];
+  check (guide "eta")
+    [
+      "Eta_otel.create"; "Eta_http.Core.Url.of_string"; "Eta_eio.Runtime.create";
+      "Eta_otel.tracer"; "Eta_otel.logger"; "Eta_otel.meter";
+      "Eta_otel.shutdown"; "~endpoint"; "eta_otel"; "/v1/traces"; "/v1/logs";
+      "/v1/metrics";
+    ]
+
+let test_health_identity () =
+  (* desc-8syr: version, an ISO 8601 start time, and an uptime.
+     desc-lqpr: the same real version everywhere. *)
+  let config = temp_config () in
+  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let store = run_store (Store.open_ config) in
+  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  let health = server_json config store "/health" in
+  let healthz = server_json config store "/healthz" in
+  let started_at = json_string_field "startedAt" health in
+  Alcotest.(check int) "startedAt is ISO 8601" 24 (String.length started_at);
+  Alcotest.(check bool)
+    "startedAt is a UTC timestamp" true
+    (started_at.[4] = '-' && started_at.[7] = '-' && started_at.[10] = 'T'
+    && started_at.[13] = ':' && started_at.[16] = ':' && started_at.[19] = '.'
+    && started_at.[23] = 'Z');
+  let number start length = int_of_string (String.sub started_at start length) in
+  Alcotest.(check bool)
+    "startedAt is a real calendar time" true
+    (number 0 4 >= 2020 && number 0 4 <= 2100 && number 5 2 >= 1
+    && number 5 2 <= 12 && number 8 2 >= 1 && number 8 2 <= 31
+    && number 11 2 <= 23 && number 14 2 <= 59 && number 17 2 <= 60
+    && number 20 3 <= 999);
+  Alcotest.(check string)
+    "health reports the build version" Inn.Version.value
+    (json_string_field "version" health);
+  Alcotest.(check bool)
+    "the version is real, not a placeholder" true
+    ((not (String.equal Inn.Version.value "dev"))
+    && String.length Inn.Version.value > 0);
+  Alcotest.(check string)
+    "healthz reports the same version" Inn.Version.value
+    (json_string_field "version" healthz);
+  Alcotest.(check string)
+    "healthz reports the same start time" started_at
+    (json_string_field "startedAt" healthz);
+  Alcotest.(check int)
+    "health reports this process" (Unix.getpid ())
+    (match json_member "pid" health with `Int pid -> pid | _ -> -1);
+  let uptime json =
+    match json_member "uptimeSeconds" json with
+    | `Float value -> value
+    | `Int value -> float_of_int value
+    | _ -> -1.
+  in
+  let first = uptime health in
+  Alcotest.(check bool)
+    "uptime is a nonnegative number of seconds" true
+    (first >= 0. && first < 86_400.);
+  Unix.sleepf 0.02;
+  let later = server_json config store "/health" in
+  Alcotest.(check string)
+    "the start time does not move" started_at
+    (json_string_field "startedAt" later);
+  Alcotest.(check bool)
+    "uptime does not go backwards" true (uptime later >= first);
+  Alcotest.(check string)
+    "OpenAPI reports the same version" Inn.Version.value
+    (json_string_field "version" (json_member "info" (server_json config store "/openapi.json")));
+  let ready = server_json config store "/ready" in
+  Alcotest.(check bool)
+    "ready reports readiness" true (json_member "ready" ready = `Bool true);
+  Alcotest.(check string)
+    "ready reports the store" "ok" (json_string_field "store" ready)
+
+let test_instructions_point_at_the_docs () =
+  (* desc-qv27 *)
+  let config = temp_config () in
+  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let store = run_store (Store.open_ config) in
+  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  let body = response_body_string (server_get config store "/instructions") in
+  List.iter
+    (fun fragment ->
+      Alcotest.(check bool)
+        ("instructions link " ^ fragment) true
+        (contains body fragment))
+    [
+      "/docs"; "/docs/debug"; "/docs/effect"; "/docs/eta"; "/openapi.json";
+      "/endpoints"; "/v1/traces"; "/v1/logs"; "/v1/metrics";
+    ]
 let () =
   Alcotest.run "inn"
     [
@@ -3646,5 +4185,26 @@ let () =
             `Quick test_ai_call_store_and_handlers;
           Alcotest.test_case "field provenance in the docs (aic-6xrr)" `Quick
             test_ai_field_provenance_documented;
+        ] );
+      ( "self-description",
+        [
+          Alcotest.test_case
+            "declarations drive the router, the inventory, and OpenAPI (desc-iduq, desc-de6o)"
+            `Quick test_declarations_drive_the_router;
+          Alcotest.test_case
+            "declared responses cover handler output (desc-iduq)" `Quick
+            test_declared_responses_match_handlers;
+          Alcotest.test_case "hidden routes and aliases are documented (desc-dmuw)"
+            `Quick test_hidden_routes_are_documented;
+          Alcotest.test_case
+            "docs index, guide content, and the 404 (desc-bqwh, desc-7wwz)"
+            `Quick test_docs_endpoints;
+          Alcotest.test_case "guide instructions (desc-wy48, desc-od3y, desc-62du)"
+            `Quick test_guide_content;
+          Alcotest.test_case "health identity (desc-8syr, desc-lqpr)" `Quick
+            test_health_identity;
+          Alcotest.test_case
+            "instructions link the guides and the OpenAPI document (desc-qv27)"
+            `Quick test_instructions_point_at_the_docs;
         ] );
     ]

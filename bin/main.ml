@@ -504,6 +504,12 @@ let instructions config = get "/instructions" config
 let endpoints config = get "/endpoints" config
 let openapi config = get "/openapi.json" config
 
+(* inn docs lists the guides; inn docs NAME reads one as Markdown. *)
+let docs name config =
+  match name with
+  | None -> get "/docs" config
+  | Some name -> get ("/docs/" ^ percent_encode name) config
+
 let traces service lookback cursor limit config =
   get
     ("/traces"
@@ -1070,6 +1076,16 @@ let openapi_cmd =
   cmd "openapi" "Print the Inn OpenAPI document."
     Term.(const openapi $ config_t)
 
+let docs_name_t =
+  Arg.(
+    value
+    & pos 0 (some string) None
+    & info [] ~docv:"NAME" ~doc:"Guide name: debug, effect, or eta.")
+
+let docs_cmd =
+  cmd "docs" "List the Inn guides, or print one guide as Markdown."
+    Term.(const docs $ docs_name_t $ config_t)
+
 let mcp_cmd =
   cmd "mcp" "Run the Inn MCP stdio server." Term.(const mcp $ config_t)
 
@@ -1107,6 +1123,7 @@ let root =
       instructions_cmd;
       endpoints_cmd;
       openapi_cmd;
+      docs_cmd;
       mcp_cmd;
     ]
 

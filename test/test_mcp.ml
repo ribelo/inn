@@ -74,7 +74,7 @@ let contains haystack needle =
 let test_catalogue () =
   (* mcp-gurs: tools/list advertises the existing read-only HTTP catalogue. *)
   let tools = tools () in
-  Alcotest.(check int) "tool count" 21 (List.length tools);
+  Alcotest.(check int) "tool count" 23 (List.length tools);
   List.iter
     (fun name ->
       Alcotest.(check bool)
@@ -88,6 +88,8 @@ let test_catalogue () =
       "inn_search_traces";
       "inn_stats";
       "inn_openapi";
+      "inn_docs_index";
+      "inn_get_doc";
     ]
 
 let test_window_arguments_in_schemas () =
@@ -124,7 +126,8 @@ let test_window_arguments_in_schemas () =
   check "inn_ai_stats"
     [ "lookback"; "minDurationMs"; "finishReason"; "operation"; "groupBy"; "agg" ];
   check "inn_metrics" [ "lookback"; "cursor" ];
-  check "inn_stats" [ "lookback" ]
+  check "inn_stats" [ "lookback" ];
+  check "inn_get_doc" [ "name" ]
 
 let test_window_arguments_reach_http () =
   (* win-2olw and ret-eeb1: the tool arguments become query parameters. *)
@@ -208,6 +211,33 @@ let test_window_arguments_reach_http () =
   check_contains 5 "finishReason=tool_calls";
   check_contains 5 "operation=chat"
 
+let test_docs_tools () =
+  (* desc-s5j5: inn_docs_index and inn_get_doc read the guides over MCP. *)
+  let paths = ref [] in
+  let request path =
+    paths := path :: !paths;
+    Ok (200, {|{"guides":[{"name":"debug","title":"Debugging with Inn","path":"/docs/debug"}]}|})
+  in
+  let tool_call =
+    Mcp.tool_call ~request ~status:(fun () -> `Assoc [])
+      ~base_url:"http://127.0.0.1:27687"
+  in
+  (match tool_call "inn_docs_index" (`Assoc []) with
+  | Ok text ->
+      Alcotest.(check bool) "the index is returned" true (contains text "debug")
+  | Error message -> Alcotest.fail message);
+  (match tool_call "inn_get_doc" (`Assoc [ ("name", `String "debug") ]) with
+  | Ok _ -> ()
+  | Error message -> Alcotest.fail message);
+  Alcotest.(check (list string))
+    "the docs tools proxy the docs endpoints" [ "/docs"; "/docs/debug" ]
+    (List.rev !paths);
+  match tool_call "inn_get_doc" (`Assoc []) with
+  | Ok _ -> Alcotest.fail "a missing name must be a tool error"
+  | Error message ->
+      Alcotest.(check bool) "the error names the argument" true
+        (contains message "name")
+
 let test_down_server () =
   (* mcp-j7lb: connection errors stay tool results, not protocol errors. *)
   let tool_call =
@@ -280,6 +310,8 @@ let () =
             test_window_arguments_in_schemas;
           Alcotest.test_case "window and filter arguments reach HTTP (win-2olw, srch-reld)"
             `Quick test_window_arguments_reach_http;
+          Alcotest.test_case "desc-s5j5 docs tools reach the docs endpoints"
+            `Quick test_docs_tools;
           Alcotest.test_case "mcp-j7lb server down" `Quick test_down_server;
           Alcotest.test_case "mcp-i9qo mcp-v9fl errors notifications" `Quick
             test_protocol_errors;

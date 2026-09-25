@@ -931,6 +931,16 @@ let close t = Q.Pool.shutdown t.pool |> Eta.Effect.map_error widen_pool_error
    both ingestion and lookback with the same injected time. *)
 let now_ms t = t.now_ms ()
 
+(* A cheap liveness read for GET /ready: one row of the tiny metadata table
+   proves the pool still answers without scanning any telemetry table. *)
+let ping t =
+  q_select t.pool
+    Q.Select.(
+      from Meta.table Q.Projection.(one Meta.value)
+      |> where Q.Expr.(eq Meta.key "schema_version")
+      |> limit 1)
+  |> Eta.Effect.map (fun _ -> ())
+
 let with_db ?now_ms ?report config f =
   Eta.Effect.with_resource
     ~acquire:(open_ ?now_ms ?report config)

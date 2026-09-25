@@ -132,6 +132,8 @@ ingestion time.
 
 ```text
 GET /health
+GET /healthz
+GET /ready
 GET /services
 GET /traces?service=<name>&limit=<n>
 GET /traces/search?service=<name>&operation=<name>&status=<ok|error>&attr.<key>=<value>
@@ -152,11 +154,50 @@ GET /metrics?service=<name>&name=<metric>&limit=<n>
 GET /facets?type=<traces|logs>&field=<field>&key=<attribute-key>
 GET /stats
 GET /instructions
+GET /docs
+GET /docs/<name>
 GET /endpoints
 GET /openapi.json
 ```
 
-The `/api/...` prefix is accepted as an alias for query endpoints.
+The `/api/...` prefix is accepted as an alias for every route, including
+ingest, docs, health, and discovery.
+
+### Documentation and discovery
+
+`GET /docs` lists the guides with name, title, and path; `GET /docs/{name}`
+returns one guide as Markdown. The guides are Markdown files under
+`docs/guides`, compiled into the binary at build time, so the service does not
+depend on a checkout path at run time:
+
+- `debug` — the agent debugging workflow: find the service, narrow the window,
+  search traces and logs, open the trace tree, check AI calls, and use stats and
+  facets.
+- `effect` — point an Effect app's `OtlpTracer`, `OtlpLogger`, and
+  `OtlpMetrics` layers at Inn with JSON serialization.
+- `eta` — point an Eta app's `eta_otel` exporter at Inn.
+
+An unknown name is a `404` whose body lists the available names.
+
+`GET /openapi.json` is an OpenAPI 3.1 document generated from the same endpoint
+declarations the router registers and the query parser validates against. Each
+operation carries its parameters with type, default, allowed values, and
+description, plus its response schemas, and every route also appears under its
+`/api` alias. `GET /endpoints` is the same inventory in a compact JSON form
+(method, path, group, summary, alias, filters, parameters, responses) with the
+alias policy at the top level. An undeclared query parameter, a missing required
+one, or a wrongly typed value is a `400` that names the parameter and lists the
+supported ones.
+
+`GET /instructions` is copy-paste OTLP setup text that also points at the
+guides, `/endpoints`, and `/openapi.json`.
+
+`GET /health` and `GET /healthz` report `version`, `startedAt` (ISO 8601
+UTC), and `uptimeSeconds`, plus the pid, the configured state paths, and the
+managed daemon `instanceId` when one is set. `GET /ready` returns `200` with
+`ready:true` while the store answers a query, and `503` with the store error
+when it does not. `inn --version`, the MCP `serverInfo.version`, `/health`,
+and `info.version` in `/openapi.json` all report the same build version.
 
 ### Search filters and exact results
 
@@ -189,7 +230,8 @@ services; add `signal=metrics` to include metrics-only services.
 
 `/endpoints` lists supported `filters` per route and `/openapi.json`
 publishes typed query parameters; `x-inn-query-prefixes` describes the
-dynamic `attr.<key>` and `attrContains.<key>` keys.
+dynamic `attr.<key>` and `attrContains.<key>` keys. Both are rendered from
+the endpoint declarations and both carry the response schemas.
 
 ### Trace tree
 
@@ -336,6 +378,8 @@ inn stats
 inn endpoints
 inn instructions
 inn openapi
+inn docs
+inn docs debug
 ```
 
 `inn trace` prints one indented line per span by default — the operation, the
@@ -353,6 +397,9 @@ inn traces --lookback 2h
 inn trace-stats operation count --lookback all
 ```
 
+`inn docs` prints the guide index as JSON; `inn docs NAME` prints one guide
+as Markdown and exits 1 with the 404 body for an unknown name.
+
 Use `--base-url` to query a non-default server:
 
 ```sh
@@ -369,7 +416,8 @@ inn mcp
 
 The MCP tools proxy to the configured Inn HTTP API and include status, services,
 trace/span/log search, trace/log stats, store stats, facets, metrics, endpoint
-inventory, AI call search/stats/detail, instructions, and OpenAPI.
+inventory, AI call search/stats/detail, instructions, OpenAPI, and the guides
+(`inn_docs_index`, and `inn_get_doc` with a `name` argument).
 
 `inn_stats` returns the store row counts and the retention section, including
 the last prune report, so the pruner is observable without reading server

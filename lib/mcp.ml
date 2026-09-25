@@ -274,6 +274,10 @@ let mcp_tools =
     mcp_tool "inn_endpoints" "Fetch Inn endpoint inventory." [];
     mcp_tool "inn_instructions" "Fetch OTLP setup instructions." [];
     mcp_tool "inn_openapi" "Fetch Inn OpenAPI JSON." [];
+    mcp_tool "inn_docs_index" "List the available Inn guides." [];
+    mcp_tool ~required:[ "name" ] "inn_get_doc"
+      "Read one Inn guide as Markdown by name (debug, effect, or eta)."
+      [ ("name", mcp_string_property "Guide name from inn_docs_index") ];
   ]
 
 let json_member name = function
@@ -569,6 +573,11 @@ let tool_call ~request ~status ~base_url name args =
   | "inn_endpoints" -> http_tool ~request ~base_url "/endpoints"
   | "inn_instructions" -> http_tool ~request ~base_url "/instructions"
   | "inn_openapi" -> http_tool ~request ~base_url "/openapi.json"
+  | "inn_docs_index" -> http_tool ~request ~base_url "/docs"
+  | "inn_get_doc" -> (
+      match json_required_string "name" args with
+      | Ok name -> http_tool ~request ~base_url ("/docs/" ^ percent_encode name)
+      | Error message -> Error message)
   | _ -> Error ("unknown tool: " ^ name)
 
 let mcp_content text is_error =

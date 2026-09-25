@@ -52,7 +52,8 @@ for command in paginated:
     output = help_text(command)
     assert "--cursor" in output, (command, output)
 
-for command in ["health", "status", "instructions", "endpoints", "openapi", "trace", "span", "ai-call"]:
+"""desc-85u9: inn docs is a plain command: no window or cursor flags."""
+for command in ["health", "status", "instructions", "endpoints", "openapi", "docs", "trace", "span", "ai-call"]:
     output = help_text(command)
     assert "--lookback" not in output, (command, output)
     assert "--cursor" not in output, (command, output)

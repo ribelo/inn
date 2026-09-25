@@ -1,4 +1,4 @@
-"""mcp-gurs, mcp-dgq3, mcp-seqk, mcp-jovg stdio regression."""
+"""mcp-gurs, mcp-dgq3, mcp-seqk, mcp-jovg, desc-s5j5 stdio regression."""
 import json
 import subprocess
 import sys
@@ -20,7 +20,10 @@ assert responses[0]["result"]["protocolVersion"] == "2025-06-18"
 version = subprocess.run([sys.argv[1], "--version"], text=True, capture_output=True, timeout=10)
 assert version.returncode == 0 and version.stderr == "", (version.returncode, version.stderr)
 assert responses[0]["result"]["serverInfo"]["version"] == version.stdout.strip() != "dev"
-assert responses[1]["id"] == 2 and len(responses[1]["result"]["tools"]) == 21
+tools = responses[1]["result"]["tools"]
+assert responses[1]["id"] == 2 and len(tools) == 23, tools
+names = [tool["name"] for tool in tools]
+assert "inn_docs_index" in names and "inn_get_doc" in names, names
 assert responses[2]["id"] is None and responses[2]["error"]["code"] == -32700
 assert responses[3] == {"jsonrpc": "2.0", "id": 3, "result": {}}
-print("mcp-gurs mcp-dgq3 mcp-seqk mcp-jovg: four compact responses, EOF exit 0")
+print("mcp-gurs mcp-dgq3 mcp-seqk mcp-jovg desc-s5j5: four compact responses, EOF exit 0")

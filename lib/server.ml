@@ -51,98 +51,77 @@ let method_not_allowed () =
 
 let not_found () = error_response 404 "not_found" "endpoint not found"
 
-let health config =
+(* The running build's identity. [started_at_ms] is captured when this module
+   loads and refreshed when the server starts, so /health reports the version,
+   the ISO 8601 start time, and the uptime of the running process
+   (desc-8syr, desc-lqpr). *)
+
+let wall_now_ms () = int_of_float (Unix.gettimeofday () *. 1000.)
+
+let started_at_ms = Atomic.make (wall_now_ms ())
+let mark_started () = Atomic.set started_at_ms (wall_now_ms ())
+
+let iso8601_of_ms ms =
+  let seconds = ms / 1000 in
+  let millis = ms mod 1000 in
+  let tm = Unix.gmtime (float_of_int seconds) in
+  Printf.sprintf "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ" (tm.tm_year + 1900)
+    (tm.tm_mon + 1) tm.tm_mday tm.tm_hour tm.tm_min tm.tm_sec millis
+
+let uptime_seconds () =
+  let elapsed = wall_now_ms () - Atomic.get started_at_ms in
+  Float.round (float_of_int elapsed /. 1000. *. 1000.) /. 1000.
+
+let store_error_message error = Format.asprintf "%a" Store.pp_error error
+
+(* One identity body for /health, /healthz, and /ready: the daemon handshake
+   reads pid and instanceId, an agent reads version, startedAt, and
+   uptimeSeconds. *)
+let health_fields config =
   let instance_id =
     match Atomic.get daemon_instance_id with
     | Some value -> [ ("instanceId", `String value) ]
     | None -> []
   in
-  json_response
-    (`Assoc
-      ([
-         ("ok", `Bool true);
-         ("pid", `Int (Unix.getpid ()));
-         ("stateDir", `String config.Config.state_dir);
-         ("dbPath", `String config.db_path);
-         ("baseUrl", `String config.base_url);
-       ]
-      @ instance_id))
-
-let query_filters path =
-  let attributes = [ "attr.<key>"; "attrContains.<key>" ] in
-  let paged = [ "lookback"; "limit"; "cursor" ] in
-  let summary = [ "lookback"; "limit" ] in
-  match path with
-  | "/services" -> [ "lookback"; "signal" ]
-  | "/traces" -> paged @ [ "service" ]
-  | "/traces/search" -> paged @ attributes @
-      [ "service"; "operation"; "status"; "text"; "minDurationMs" ]
-  | "/traces/stats" -> summary @ attributes @
-      [ "groupBy"; "agg"; "service"; "operation"; "status"; "minDurationMs" ]
-  | "/traces/{traceId}/spans" -> paged
-  | "/traces/{traceId}/logs" | "/spans/{spanId}/logs" -> paged @ attributes
-  | "/spans/search" -> paged @ attributes @
-      [ "service"; "traceId"; "operation"; "parentOperation";
-        "status"; "minDurationMs" ]
-  | "/logs" -> paged @ attributes @
-      [ "service"; "severity"; "contains"; "minSeverity" ]
-  | "/logs/search" -> paged @ attributes @
-      [ "service"; "traceId"; "spanId"; "severity"; "body";
-        "contains"; "minSeverity" ]
-  | "/logs/stats" -> summary @ attributes @
-      [ "groupBy"; "agg"; "service"; "traceId"; "spanId";
-        "severity"; "body"; "contains"; "minSeverity" ]
-  | "/ai/calls" -> paged @
-      [ "service"; "traceId"; "sessionId"; "functionId"; "provider";
-        "model"; "operation"; "status"; "finishReason"; "text";
-        "minDurationMs" ]
-  | "/ai/stats" -> summary @
-      [ "groupBy"; "agg"; "service"; "traceId"; "sessionId";
-        "functionId"; "provider"; "model"; "operation"; "status";
-        "finishReason"; "text"; "minDurationMs" ]
-  | "/metrics" -> paged @ [ "service"; "name" ]
-  | "/facets" -> summary @ [ "type"; "field"; "key"; "service" ]
-  | "/stats" -> [ "lookback" ]
-  | _ -> []
-
-let endpoint method_ path description =
-  `Assoc
-    [
-      ("method", `String method_);
-      ("path", `String path);
-      ("description", `String description);
-      ("filters", `List (List.map (fun name -> `String name) (query_filters path)));
-    ]
-
-let endpoint_inventory =
   [
-    endpoint "GET" "/health" "liveness and configured storage paths";
-    endpoint "POST" "/v1/traces" "OTLP/HTTP JSON trace ingest";
-    endpoint "POST" "/v1/logs" "OTLP/HTTP JSON log ingest";
-    endpoint "POST" "/v1/metrics" "OTLP/HTTP JSON metric ingest";
-    endpoint "GET" "/services" "services that have emitted telemetry, optionally in a lookback window";
-    endpoint "GET" "/traces" "recent trace summaries with lookback, limit, and cursor";
-    endpoint "GET" "/traces/search" "search trace summaries by span filters with lookback, limit, and cursor";
-    endpoint "GET" "/traces/stats" "aggregate trace statistics over a lookback window";
-    endpoint "GET" "/traces/{traceId}" "full trace with spans and logs";
-    endpoint "GET" "/traces/{traceId}/spans" "spans for one trace with lookback, limit, and cursor";
-    endpoint "GET" "/traces/{traceId}/logs" "logs correlated with one trace with lookback, limit, and cursor";
-    endpoint "GET" "/spans/search" "search spans with lookback, limit, and cursor";
-    endpoint "GET" "/spans/{spanId}" "single span";
-    endpoint "GET" "/spans/{spanId}/logs" "logs correlated with one span with lookback, limit, and cursor";
-    endpoint "GET" "/logs" "recent logs with lookback, limit, and cursor";
-    endpoint "GET" "/logs/search" "search logs with lookback, limit, and cursor";
-    endpoint "GET" "/logs/stats" "aggregate log counts over a lookback window";
-    endpoint "GET" "/ai/calls" "search AI calls with filters, lookback, limit, and cursor";
-    endpoint "GET" "/ai/calls/{spanId}" "AI call detail with tools, timing, correlated logs, and trace links";
-    endpoint "GET" "/ai/stats" "exact AI call statistics grouped by provider, model, functionId, sessionId, status, operation, or finishReason";
-    endpoint "GET" "/metrics" "recent metric points with lookback, limit, and cursor";
-    endpoint "GET" "/facets" "discover trace and log facet values over a lookback window";
-    endpoint "GET" "/stats" "store row counts over a lookback window";
-    endpoint "GET" "/instructions" "copy-paste OTLP setup instructions";
-    endpoint "GET" "/endpoints" "machine-readable endpoint inventory";
-    endpoint "GET" "/openapi.json" "OpenAPI description";
+    ("ok", `Bool true);
+    ("pid", `Int (Unix.getpid ()));
+    ("stateDir", `String config.Config.state_dir);
+    ("dbPath", `String config.db_path);
+    ("baseUrl", `String config.base_url);
+    ("version", `String Version.value);
+    ("startedAt", `String (iso8601_of_ms (Atomic.get started_at_ms)));
+    ("uptimeSeconds", `Float (uptime_seconds ()));
   ]
+  @ instance_id
+
+let health config = json_response (`Assoc (health_fields config))
+
+(* Readiness is more than liveness: the store must answer (desc-dmuw). *)
+let ready config store =
+  let open Eta.Syntax in
+  let* result =
+    Eta.Effect.fold ~ok:(fun value -> Ok value)
+      ~error:(fun error -> Error error)
+      (Store.ping store)
+  in
+  match result with
+  | Ok () ->
+      Eta.Effect.pure
+        (json_response
+           (`Assoc
+             (health_fields config
+             @ [ ("ready", `Bool true); ("store", `String "ok") ])))
+  | Error error ->
+      Eta.Effect.pure
+        (error_response_with_details 503 "not_ready"
+           ("the store did not answer: " ^ store_error_message error)
+           [ ("ready", `Bool false); ("store", `String "error") ])
+
+(* The inventory and the OpenAPI document are rendered from the same
+   declarations the router registers and the query parser validates against, so
+   neither can drift from behavior (desc-de6o, desc-dmuw). *)
+let endpoint_inventory = Endpoint.all
 
 let endpoints config =
   json_response
@@ -153,10 +132,38 @@ let endpoints config =
         ("logsExporterUrl", `String (config.base_url ^ "/v1/logs"));
         ("metricsExporterUrl", `String (config.base_url ^ "/v1/metrics"));
         ("databasePath", `String config.db_path);
-        ("endpoints", `List endpoint_inventory);
+        ( "aliasPolicy",
+          `Assoc
+            [
+              ("prefix", `String Endpoint.alias_prefix);
+              ("description", `String Endpoint.alias_description);
+            ] );
+        ("endpoints", `List (List.map Endpoint.inventory_json endpoint_inventory));
       ])
 
+let markdown_headers =
+  H.Core.Header.unsafe_of_list [ ("content-type", "text/markdown; charset=utf-8") ]
+
+(* GET /docs and GET /docs/{name} serve the guides embedded at build time
+   (desc-bqwh, desc-7wwz). *)
+let docs_index () = json_response (Docs.index_json ())
+
+let docs_get name =
+  match Docs.find name with
+  | Some guide -> S.Response.text ~headers:markdown_headers guide.Docs.content
+  | None ->
+      error_response_with_details 404 "doc_not_found"
+        (Printf.sprintf "no guide named %s" name)
+        [ ("available", `List (List.map (fun name -> `String name) Docs.names)) ]
+
+let openapi config =
+  json_response
+    (Endpoint.document ~base_url:config.Config.base_url endpoint_inventory)
+
+(* The setup text points at the guides and the OpenAPI document, so an agent
+   that starts here finds the full documentation (desc-qv27). *)
 let instructions config =
+  let url = config.Config.base_url in
   text_response
     (Printf.sprintf
        {|Inn local OpenTelemetry collector
@@ -181,90 +188,24 @@ Query API:
   %s/api/traces?service=<service>
   %s/api/traces/search?service=<service>&operation=<operation>&attr.<key>=<value>
   %s/api/logs/search?service=<service>&body=<text>
-  %s/openapi.json
+  %s/api/ai/calls?model=<model>&lookback=1h
+  %s/api/facets?type=traces&field=attribute_keys
+
+Documentation:
+  %s/docs            guide index (name, title, path)
+  %s/docs/debug      debugging workflow for agents
+  %s/docs/effect     Effect app setup (OtlpTracer, OtlpLogger, OtlpMetrics)
+  %s/docs/eta        Eta app setup (eta_otel)
+  %s/openapi.json    OpenAPI 3.1: every parameter and response schema
+  %s/endpoints       endpoint inventory
 |}
-       config.Config.base_url config.base_url config.base_url config.base_url
-       config.base_url config.base_url config.base_url config.base_url
-       config.base_url config.base_url config.base_url config.base_url)
-
-let path_item method_ summary path =
-  let otlp_ingest = String.equal method_ "POST" in
-  let responses =
-    if otlp_ingest then
-      [ ("200", "OTLP JSON export response: {} or partialSuccess");
-        ("400", "Malformed OTLP JSON (code 3)");
-        ("413", "OTLP JSON body exceeds size limit");
-        ("415", "Only OTLP JSON is supported");
-        ("503", "Store unavailable; retry after one second") ]
-    else [ ("200", "OK") ]
-  in
-  let filters = query_filters path in
-  let prefixes = List.filter
-    (fun name -> name = "attr.<key>" || name = "attrContains.<key>") filters in
-  let parameters = List.filter_map (fun name ->
-    if List.mem name prefixes then None else
-    let kind = match name with
-      | "minDurationMs" -> "number"
-      | "limit" -> "integer"
-      | _ -> "string" in
-    Some (`Assoc [ ("name", `String name); ("in", `String "query");
-      ("required", `Bool false);
-      ("schema", `Assoc [ ("type", `String kind) ]) ])) filters in
-  `Assoc
-    [
-      (String.lowercase_ascii method_,
-        `Assoc
-          ([ ("summary", `String summary);
-             ("parameters", `List parameters);
-             ("x-inn-query-prefixes", `List (List.map (fun name ->
-               `String name) prefixes));
-            ("responses", `Assoc (List.map (fun (code, description) ->
-              code, `Assoc [ ("description", `String description) ]) responses)) ]
-          @ if otlp_ingest then
-              [ ("requestBody", `Assoc [ ("content", `Assoc [ ("application/json", `Assoc []) ]) ]) ]
-            else []));
-    ]
-
-let openapi config =
-  let paths =
-    List.map
-      (function
-        | `Assoc fields ->
-            let method_ =
-              match List.assoc_opt "method" fields with
-              | Some (`String value) -> value
-              | _ -> "GET"
-            in
-            let path =
-              match List.assoc_opt "path" fields with
-              | Some (`String value) -> value
-              | _ -> "/"
-            in
-            let description =
-              match List.assoc_opt "description" fields with
-              | Some (`String value) -> value
-              | _ -> path
-            in
-            (path, path_item method_ description path)
-        | _ -> ("/", path_item "GET" "Inn endpoint" "/"))
-      endpoint_inventory
-  in
-  json_response
-    (`Assoc
-      [
-        ("openapi", `String "3.1.0");
-        ("info", `Assoc [ ("title", `String "Inn API"); ("version", `String "1.0.0") ]);
-        ("servers", `List [ `Assoc [ ("url", `String config.Config.base_url) ] ]);
-        ("paths", `Assoc paths);
-      ])
+       url url url url url url url url url url url url url url url url url url url)
 
 let root_text config =
   text_response
     (Printf.sprintf
-       "inn local telemetry server\n\nPOST /v1/traces\nPOST /v1/logs\nPOST /v1/metrics\nGET /api/services\nGET /api/traces\nGET /api/traces/search\nGET /api/traces/stats\nGET /api/traces/<trace-id>\nGET /api/traces/<trace-id>/spans\nGET /api/traces/<trace-id>/logs\nGET /api/spans/search\nGET /api/spans/<span-id>\nGET /api/spans/<span-id>/logs\nGET /api/logs\nGET /api/logs/search\nGET /api/logs/stats\nGET /api/ai/calls\nGET /api/ai/calls/<span-id>\nGET /api/ai/stats\nGET /api/metrics\nGET /api/facets?type=logs&field=severity\nGET /api/stats\nGET /instructions\nGET /endpoints\nGET /openapi.json\n\nstate: %s\ndatabase: %s\n"
+       "inn local telemetry server\n\nPOST /v1/traces\nPOST /v1/logs\nPOST /v1/metrics\nGET /health\nGET /healthz\nGET /ready\nGET /api/services\nGET /api/traces\nGET /api/traces/search\nGET /api/traces/stats\nGET /api/traces/<trace-id>\nGET /api/traces/<trace-id>/spans\nGET /api/traces/<trace-id>/logs\nGET /api/spans/search\nGET /api/spans/<span-id>\nGET /api/spans/<span-id>/logs\nGET /api/logs\nGET /api/logs/search\nGET /api/logs/stats\nGET /api/ai/calls\nGET /api/ai/calls/<span-id>\nGET /api/ai/stats\nGET /api/metrics\nGET /api/facets?type=logs&field=severity\nGET /api/stats\nGET /docs\nGET /docs/<name>\nGET /instructions\nGET /endpoints\nGET /openapi.json\n\nstate: %s\ndatabase: %s\n"
        config.Config.state_dir config.db_path)
-
-let store_error_message error = Format.asprintf "%a" Store.pp_error error
 
 let store_json eff encode =
   let open Eta.Syntax in
@@ -353,7 +294,9 @@ let parse_min_severity params =
       | "warn" -> Ok (Some 13)
       | "error" -> Ok (Some 17)
       | "fatal" -> Ok (Some 21)
-      | _ -> Error "minSeverity must be trace, debug, info, warn, error, or fatal"
+      | _ ->
+          Error
+            (Endpoint.allowed_values "minSeverity" Endpoint.severity_levels)
 
 let with_search_filters ?(duration = false) ?(severity = false)
     ?(contains = false) params f =
@@ -365,10 +308,6 @@ let with_search_filters ?(duration = false) ?(severity = false)
       f min_duration_ms min_severity attr_contains
   | Error message, _, _ | _, Error message, _ | _, _, Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
-
-let valid_trace_agg = function
-  | "count" | "avg_duration" | "p95_duration" | "error_rate" -> true
-  | _ -> false
 
 let json_list name encode values =
   `Assoc [ (name, `List (List.map encode values)) ]
@@ -429,9 +368,13 @@ let services store req =
       Eta.Effect.pure (error_response 400 "invalid_query" message)
   | Ok (window, lookback) ->
       let signal = param "signal" params in
-      if signal <> None && signal <> Some "metrics" then
-        Eta.Effect.pure (error_response 400 "invalid_query" "signal must be metrics")
-      else store_json (Store.list_services ~window
+      match signal with
+      | Some value when not (List.mem value Endpoint.service_signals) ->
+          Eta.Effect.pure
+            (error_response 400 "invalid_query"
+               (Endpoint.allowed_values "signal" Endpoint.service_signals))
+      | _ ->
+          store_json (Store.list_services ~window
         ~include_metrics:(signal = Some "metrics") store) (fun services ->
           `Assoc
             [
@@ -558,17 +501,6 @@ let ai_span_filter params policy cursor limit : Store.ai_call_filter =
     cursor;
     limit;
   }
-
-let valid_ai_group_by =
-  [ "provider"; "model"; "functionId"; "sessionId"; "status"; "operation";
-    "finishReason" ]
-
-let valid_ai_agg =
-  [ "count"; "avg_duration"; "p95_duration"; "total_input_tokens";
-    "total_output_tokens"; "total_tokens"; "error_rate" ]
-
-let allowed_values name values =
-  Printf.sprintf "%s must be one of %s" name (String.concat ", " values)
 
 (* AI calls only, from the AI call table that ingest maintains; paging never
    scans unrelated spans (acc-gkoz). *)
@@ -761,14 +693,14 @@ let ai_stats store req =
       Eta.Effect.pure (error_response 400 "invalid_query" "agg is required")
   | _, _, Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Some group_by, Some _, Ok _ when not (List.mem group_by valid_ai_group_by)
+  | Some group_by, Some _, Ok _ when not (List.mem group_by Endpoint.ai_group_by)
     ->
       Eta.Effect.pure
         (error_response 400 "invalid_query"
-           (allowed_values "groupBy" valid_ai_group_by))
-  | Some _, Some agg, Ok _ when not (List.mem agg valid_ai_agg) ->
+           (Endpoint.allowed_values "groupBy" Endpoint.ai_group_by))
+  | Some _, Some agg, Ok _ when not (List.mem agg Endpoint.ai_agg) ->
       Eta.Effect.pure
-        (error_response 400 "invalid_query" (allowed_values "agg" valid_ai_agg))
+        (error_response 400 "invalid_query" (Endpoint.allowed_values "agg" Endpoint.ai_agg))
   | Some group_by, Some agg, Ok policy ->
       with_search_filters ~duration:true ~contains:true params @@
       fun min_duration_ms _ attr_contains ->
@@ -851,7 +783,7 @@ let trace_stats store req =
       Eta.Effect.pure (error_response 400 "invalid_query" "agg is required")
   | _, _, Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Some group_by, Some agg, Ok policy when valid_trace_agg agg ->
+  | Some group_by, Some agg, Ok policy when List.mem agg Endpoint.trace_agg ->
       with_search_filters ~duration:true ~contains:true params @@
       fun min_duration_ms _ attr_contains ->
       let filter =
@@ -871,7 +803,7 @@ let trace_stats store req =
   | _, Some _, Ok _ ->
       Eta.Effect.pure
         (error_response 400 "invalid_query"
-           "agg must be count, avg_duration, p95_duration, or error_rate")
+           (Endpoint.allowed_values "agg" Endpoint.trace_agg))
 
 let logs store req =
   with_query req @@ fun params ->
@@ -936,9 +868,10 @@ let log_stats store req =
   | None, _, _ ->
       Eta.Effect.pure
         (error_response 400 "invalid_query" "groupBy is required")
-  | _, Some agg, _ when not (String.equal agg "count") ->
+  | _, Some agg, _ when not (List.mem agg Endpoint.log_agg) ->
       Eta.Effect.pure
-        (error_response 400 "invalid_query" "agg must be count")
+        (error_response 400 "invalid_query"
+           (Endpoint.allowed_values "agg" Endpoint.log_agg))
   | _, _, Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
   | Some group_by, _, Ok policy ->
@@ -995,7 +928,8 @@ let facets store req =
         (summary_json "facets" Model.facet_item_to_json policy)
   | Some _, Some _, Ok _ ->
       Eta.Effect.pure
-        (error_response 400 "invalid_query" "type must be traces or logs")
+        (error_response 400 "invalid_query"
+           (Endpoint.allowed_values "type" Endpoint.facet_types))
 
 let metrics store req =
   with_query req @@ fun params ->
@@ -1044,10 +978,83 @@ let with_route_param name f req =
   let* value = Service.Extractors.Param.string name req in
   f value req
 
-let add_route router ~methods path route =
-  Service.Router.add_exn router ~methods path route;
+(* Every route comes from one declaration, and only the declared query
+   parameters reach a handler, so the router topology, the inventory, and the
+   OpenAPI document are the same list (desc-de6o, desc-dmuw). *)
+let declared ~decl route req =
+  let open Eta.Syntax in
+  let* result =
+    Eta.Effect.fold ~ok:(fun value -> Ok value)
+      ~error:(fun error -> Error error)
+      (Service.Extractors.Query.all req)
+  in
+  match result with
+  | Ok params -> (
+      match Endpoint.validate_query decl params with
+      | Error message ->
+          Eta.Effect.pure (error_response 400 "invalid_query" message)
+      | Ok () -> route req)
+  | Error { S.Error.kind = Bad_request { message }; _ } ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Error error -> Eta.Effect.fail error
+
+let route_for config store (endpoint : Endpoint.t) =
+  match endpoint.Endpoint.id with
+  | "root" -> fun _req -> Eta.Effect.pure (root_text config)
+  | "health" | "healthz" -> fun _req -> Eta.Effect.pure (health config)
+  | "ready" -> fun _req -> ready config store
+  | "instructions" -> fun _req -> Eta.Effect.pure (instructions config)
+  | "endpoints" -> fun _req -> Eta.Effect.pure (endpoints config)
+  | "openapi" -> fun _req -> Eta.Effect.pure (openapi config)
+  | "docs_index" -> fun _req -> Eta.Effect.pure (docs_index ())
+  | "docs_get" ->
+      with_route_param "name" (fun name _req ->
+          Eta.Effect.pure (docs_get name))
+  | "ingest_traces" ->
+      fun req ->
+        ingest req "rejectedSpans" Otlp.decode_traces_json
+          (Store.ingest_traces store)
+  | "ingest_logs" ->
+      fun req ->
+        ingest req "rejectedLogRecords" Otlp.decode_logs_json
+          (Store.ingest_logs store)
+  | "ingest_metrics" ->
+      fun req ->
+        ingest req "rejectedDataPoints" Otlp.decode_metrics_json
+          (Store.ingest_metrics store)
+  | "services" -> services store
+  | "traces" -> traces store
+  | "trace_search" -> search_traces store
+  | "trace_stats" -> trace_stats store
+  | "trace_spans" -> with_route_param "traceId" (trace_spans store)
+  | "trace_logs" -> with_route_param "traceId" (trace_logs store)
+  | "trace" -> with_route_param "traceId" (trace store)
+  | "span_search" -> search_spans store
+  | "span" -> with_route_param "spanId" (span store)
+  | "span_logs" -> with_route_param "spanId" (span_logs store)
+  | "logs" -> logs store
+  | "log_search" -> search_logs store
+  | "log_stats" -> log_stats store
+  | "ai_calls" -> ai_calls store
+  | "ai_call" -> with_route_param "spanId" (ai_call config store)
+  | "ai_stats" -> ai_stats store
+  | "metrics" -> metrics store
+  | "facets" -> facets store
+  | "stats" -> stats store
+  | id ->
+      fun _req ->
+        Eta.Effect.pure
+          (error_response 500 "undeclared_endpoint"
+             ("no handler is registered for endpoint " ^ id))
+
+let add_declaration router config store endpoint =
+  let methods = [ Endpoint.method_to_string endpoint.Endpoint.method_ ] in
+  let route = declared ~decl:endpoint (route_for config store endpoint) in
+  Service.Router.add_exn router ~methods endpoint.Endpoint.path route;
   let aliases =
-    if String.equal path "/" then [ "/api"; "/api/" ] else [ "/api" ^ path ]
+    if String.equal endpoint.Endpoint.path "/" then
+      [ Endpoint.alias_path endpoint; "/api/" ]
+    else [ Endpoint.alias_path endpoint ]
   in
   List.iter
     (fun alias -> Service.Router.add_exn router ~methods alias route)
@@ -1055,49 +1062,7 @@ let add_route router ~methods path route =
 
 let handler config store =
   let router = Service.Router.create () in
-  add_route router ~methods:[ "GET" ] "/" (fun _req ->
-      Eta.Effect.pure (root_text config));
-  add_route router ~methods:[ "GET" ] "/health" (fun _req ->
-      Eta.Effect.pure (health config));
-  add_route router ~methods:[ "GET" ] "/healthz" (fun _req ->
-      Eta.Effect.pure (health config));
-  add_route router ~methods:[ "GET" ] "/instructions" (fun _req ->
-      Eta.Effect.pure (instructions config));
-  add_route router ~methods:[ "GET" ] "/endpoints" (fun _req ->
-      Eta.Effect.pure (endpoints config));
-  add_route router ~methods:[ "GET" ] "/openapi.json" (fun _req ->
-      Eta.Effect.pure (openapi config));
-  add_route router ~methods:[ "POST" ] "/v1/traces" (fun req ->
-      ingest req "rejectedSpans" Otlp.decode_traces_json (Store.ingest_traces store));
-  add_route router ~methods:[ "POST" ] "/v1/logs" (fun req ->
-      ingest req "rejectedLogRecords" Otlp.decode_logs_json (Store.ingest_logs store));
-  add_route router ~methods:[ "POST" ] "/v1/metrics" (fun req ->
-      ingest req "rejectedDataPoints" Otlp.decode_metrics_json (Store.ingest_metrics store));
-  add_route router ~methods:[ "GET" ] "/services" (services store);
-  add_route router ~methods:[ "GET" ] "/traces" (traces store);
-  add_route router ~methods:[ "GET" ] "/traces/search" (search_traces store);
-  add_route router ~methods:[ "GET" ] "/traces/stats" (trace_stats store);
-  add_route router ~methods:[ "GET" ] "/traces/{traceId}/spans"
-    (with_route_param "traceId" (trace_spans store));
-  add_route router ~methods:[ "GET" ] "/traces/{traceId}/logs"
-    (with_route_param "traceId" (trace_logs store));
-  add_route router ~methods:[ "GET" ] "/traces/{traceId}"
-    (with_route_param "traceId" (trace store));
-  add_route router ~methods:[ "GET" ] "/spans/search" (search_spans store);
-  add_route router ~methods:[ "GET" ] "/spans/{spanId}"
-    (with_route_param "spanId" (span store));
-  add_route router ~methods:[ "GET" ] "/spans/{spanId}/logs"
-    (with_route_param "spanId" (span_logs store));
-  add_route router ~methods:[ "GET" ] "/logs" (logs store);
-  add_route router ~methods:[ "GET" ] "/logs/search" (search_logs store);
-  add_route router ~methods:[ "GET" ] "/logs/stats" (log_stats store);
-  add_route router ~methods:[ "GET" ] "/ai/calls" (ai_calls store);
-  add_route router ~methods:[ "GET" ] "/ai/calls/{spanId}"
-    (with_route_param "spanId" (ai_call config store));
-  add_route router ~methods:[ "GET" ] "/ai/stats" (ai_stats store);
-  add_route router ~methods:[ "GET" ] "/facets" (facets store);
-  add_route router ~methods:[ "GET" ] "/metrics" (metrics store);
-  add_route router ~methods:[ "GET" ] "/stats" (stats store);
+  List.iter (add_declaration router config store) Endpoint.all;
   Service.Router.compile ~not_found:not_found_handler
     ~method_not_allowed:method_not_allowed_handler router
 
@@ -1193,6 +1158,7 @@ let close_store ~sw ~clock store =
 
 let run ~sw ~env config =
   check_bind_available config;
+  mark_started ();
   let net = Eio.Stdenv.net env in
   let clock = Eio.Stdenv.clock env in
   let store = run_store_effect ~sw ~clock (Store.open_ config) in

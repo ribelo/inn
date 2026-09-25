@@ -3,3 +3,4 @@
   tree-d24c and aic-5j9w: tree rendering and AI flags match CLI commands
   $ python3 check_trace_cli.py ../bin/main.exe
   tree-d24c: inn trace prints a tree and --json, against a live server
+  desc-85u9: inn docs lists, reads, and fails loudly on an unknown name

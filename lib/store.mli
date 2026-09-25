@@ -142,6 +142,10 @@ val open_ :
 
 val close : t -> (unit, error) Eta.Effect.t
 
+val ping : t -> (unit, error) Eta.Effect.t
+(** A cheap metadata read that proves the store still answers, used by
+    [GET /ready]. *)
+
 val with_db :
   ?now_ms:(unit -> int) ->
   ?report:(string -> unit) ->
