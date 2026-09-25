@@ -404,15 +404,15 @@ let schemas =
         column ~not_null:true Spans.ingested_at_ms;
       ];
     create_index ~if_not_exists:true ~name:"idx_spans_service" Spans.table
-      [ Spans.service_name ];
+      [ Q.Column.any Spans.service_name ];
     create_index ~if_not_exists:true ~name:"idx_spans_start_time" Spans.table
-      [ Spans.start_time_ms ];
+      [ Q.Column.any Spans.start_time_ms ];
     create_index ~if_not_exists:true ~name:"idx_spans_trace" Spans.table
-      [ Spans.trace_id ];
+      [ Q.Column.any Spans.trace_id ];
     create_index ~if_not_exists:true ~name:"idx_spans_span_id" Spans.table
-      [ Spans.span_id ];
+      [ Q.Column.any Spans.span_id ];
     create_index ~if_not_exists:true ~name:"idx_spans_status" Spans.table
-      [ Spans.status ];
+      [ Q.Column.any Spans.status ];
     create_table ~if_not_exists:true Span_attributes.table
       [
         column ~primary_key:true Span_attributes.id;
@@ -422,9 +422,9 @@ let schemas =
       ];
     create_index ~if_not_exists:true ~name:"idx_span_attributes_key_value"
       Span_attributes.table
-      [ Span_attributes.key; Span_attributes.value ];
+      [ Q.Column.any Span_attributes.key; Q.Column.any Span_attributes.value ];
     create_index ~if_not_exists:true ~name:"idx_span_attributes_owner"
-      Span_attributes.table [ Span_attributes.owner_id ];
+      Span_attributes.table [ Q.Column.any Span_attributes.owner_id ];
     create_table ~if_not_exists:true Logs.table
       [
         column ~primary_key:true Logs.id;
@@ -441,17 +441,17 @@ let schemas =
         column ~not_null:true Logs.ingested_at_ms;
       ];
     create_index ~if_not_exists:true ~name:"idx_logs_service" Logs.table
-      [ Logs.service_name ];
+      [ Q.Column.any Logs.service_name ];
     create_index ~if_not_exists:true ~name:"idx_logs_timestamp" Logs.table
-      [ Logs.timestamp_ms ];
+      [ Q.Column.any Logs.timestamp_ms ];
     create_index ~if_not_exists:true ~name:"idx_logs_trace" Logs.table
-      [ Logs.trace_id ];
+      [ Q.Column.any Logs.trace_id ];
     create_index ~if_not_exists:true ~name:"idx_logs_span" Logs.table
-      [ Logs.span_id ];
+      [ Q.Column.any Logs.span_id ];
     create_index ~if_not_exists:true ~name:"idx_logs_severity" Logs.table
-      [ Logs.severity_text ];
+      [ Q.Column.any Logs.severity_text ];
     create_index ~if_not_exists:true ~name:"idx_logs_ingested" Logs.table
-      [ Logs.ingested_at_ms ];
+      [ Q.Column.any Logs.ingested_at_ms ];
     create_table ~if_not_exists:true Log_attributes.table
       [
         column ~primary_key:true Log_attributes.id;
@@ -461,9 +461,9 @@ let schemas =
       ];
     create_index ~if_not_exists:true ~name:"idx_log_attributes_key_value"
       Log_attributes.table
-      [ Log_attributes.key; Log_attributes.value ];
+      [ Q.Column.any Log_attributes.key; Q.Column.any Log_attributes.value ];
     create_index ~if_not_exists:true ~name:"idx_log_attributes_owner"
-      Log_attributes.table [ Log_attributes.owner_id ];
+      Log_attributes.table [ Q.Column.any Log_attributes.owner_id ];
     create_table ~if_not_exists:true Trace_summaries.table
       [
         column ~primary_key:true Trace_summaries.trace_id;
@@ -477,11 +477,11 @@ let schemas =
         column ~not_null:true Trace_summaries.updated_at_ms;
       ];
     create_index ~if_not_exists:true ~name:"idx_trace_summaries_service"
-      Trace_summaries.table [ Trace_summaries.service_name ];
+      Trace_summaries.table [ Q.Column.any Trace_summaries.service_name ];
     create_index ~if_not_exists:true ~name:"idx_trace_summaries_started"
-      Trace_summaries.table [ Trace_summaries.started_at_ms ];
+      Trace_summaries.table [ Q.Column.any Trace_summaries.started_at_ms ];
     create_index ~if_not_exists:true ~name:"idx_trace_summaries_updated"
-      Trace_summaries.table [ Trace_summaries.updated_at_ms ];
+      Trace_summaries.table [ Q.Column.any Trace_summaries.updated_at_ms ];
     create_table ~if_not_exists:true Metric_points.table
       [
         column ~primary_key:true Metric_points.id;
@@ -500,13 +500,13 @@ let schemas =
         column ~not_null:true Metric_points.ingested_at_ms;
       ];
     create_index ~if_not_exists:true ~name:"idx_metric_points_service"
-      Metric_points.table [ Metric_points.service_name ];
+      Metric_points.table [ Q.Column.any Metric_points.service_name ];
     create_index ~if_not_exists:true ~name:"idx_metric_points_timestamp"
-      Metric_points.table [ Metric_points.timestamp_ms ];
+      Metric_points.table [ Q.Column.any Metric_points.timestamp_ms ];
     create_index ~if_not_exists:true ~name:"idx_metric_points_name"
-      Metric_points.table [ Metric_points.name ];
+      Metric_points.table [ Q.Column.any Metric_points.name ];
     create_index ~if_not_exists:true ~name:"idx_metric_points_ingested"
-      Metric_points.table [ Metric_points.ingested_at_ms ];
+      Metric_points.table [ Q.Column.any Metric_points.ingested_at_ms ];
     create_table ~if_not_exists:true Metric_attributes.table
       [
         column ~primary_key:true Metric_attributes.id;
@@ -516,9 +516,9 @@ let schemas =
       ];
     create_index ~if_not_exists:true ~name:"idx_metric_attributes_key_value"
       Metric_attributes.table
-      [ Metric_attributes.key; Metric_attributes.value ];
+      [ Q.Column.any Metric_attributes.key; Q.Column.any Metric_attributes.value ];
     create_index ~if_not_exists:true ~name:"idx_metric_attributes_owner"
-      Metric_attributes.table [ Metric_attributes.owner_id ];
+      Metric_attributes.table [ Q.Column.any Metric_attributes.owner_id ];
   ]
 
 (* The compiled statements are what actually runs, so the fingerprint covers
@@ -541,7 +541,7 @@ let init_schema runner =
       into Meta.table
       |> value Meta.key "schema_version"
       |> value Meta.value schema_version_text
-      |> on_conflict_update [ Meta.key ] ~set:[ Meta.value ]
+      |> on_conflict_update [ Q.Column.any Meta.key ] ~set:[ Q.Column.any Meta.value ]
       |> compile)
   in
   let* _ = q_exec_pool runner query in
@@ -1159,7 +1159,7 @@ let refresh_trace_summary ~now_ms runner trace_id =
           |> value Trace_summaries.span_count (List.length spans)
           |> value Trace_summaries.error_count error_count
           |> value Trace_summaries.updated_at_ms now_ms
-          |> on_conflict_do_nothing [ Trace_summaries.trace_id ]
+          |> on_conflict_do_nothing [ Q.Column.any Trace_summaries.trace_id ]
           |> compile)
       in
       let update =
@@ -1487,7 +1487,7 @@ let ingest_traces t spans =
         |> value Spans.resource_json (Model.attrs_json_string span.resource)
         |> value Spans.events_json (events_json span.events)
         |> value Spans.ingested_at_ms now_ms
-        |> on_conflict_do_nothing [ Spans.id ]
+        |> on_conflict_do_nothing [ Q.Column.any Spans.id ]
         |> compile)
     in
     let update =

@@ -76,6 +76,11 @@ be exact, the response says so instead of silently truncating.
   summaries (root service, root operation). The status facet comes from the
   trace summary's error count. Attribute facets count
   `DISTINCT trace_id` through the span-to-trace mapping.
+- **Indexes and upserts.** Eta now supports mixed-type column lists
+  (`Q.Column.any`). Add the composite indexes the new queries need, such as
+  (service_name, start time) and (trace_id, parent_span_id). Replace the span
+  and trace-summary insert-then-update pairs with single
+  `on_conflict_update` upserts.
 - Remove the 10,000-row fetches from stats, facets, AI, and trace search.
 - Schema changes bump the schema version.
 

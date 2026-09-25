@@ -16,6 +16,13 @@ Inn runs goes through one helper in `lib/store.ml` built on it. Pragmas that
 
 ## Resolved Gaps
 
+Eta commit `5a24b687` adds `Eta_sql.Column.any`. `create_index`,
+`on_conflict_do_nothing`, and `on_conflict_update ~set` now accept mixed-type
+column lists, which resolves the two heterogeneous-list gaps below. Inn wraps its
+columns with `Q.Column.any`. The query accuracy spec adopts composite indexes and
+single-statement upserts.
+
+
 None of the gaps below is resolved by local Eta master at `d38804d0` (checked
 against its SQL public interfaces). Inn therefore keeps its typed builders and
 the workarounds described here.
