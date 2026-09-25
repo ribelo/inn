@@ -59,7 +59,10 @@ let not_found () = error_response 404 "not_found" "endpoint not found"
 let wall_now_ms () = int_of_float (Unix.gettimeofday () *. 1000.)
 
 let started_at_ms = Atomic.make (wall_now_ms ())
-let mark_started () = Atomic.set started_at_ms (wall_now_ms ())
+let draining = Atomic.make false
+let mark_started () =
+  Atomic.set started_at_ms (wall_now_ms ());
+  Atomic.set draining false
 
 let iso8601_of_ms ms =
   let seconds = ms / 1000 in
@@ -97,22 +100,33 @@ let health_fields config =
 
 let health config = json_response (`Assoc (health_fields config))
 
-(* Readiness is more than liveness: the store must answer (desc-dmuw). *)
+(* Inn owns /ready (and /api/ready): retain the JSON identity and store check,
+   and report draining before Eta closes the listener (desc-dmuw, svc-pehm). *)
+let draining_response () =
+  error_response_with_details 503 "not_ready" "server is draining"
+    [ ("ready", `Bool false); ("store", `String "draining") ]
+
 let ready config store =
   let open Eta.Syntax in
   let* result =
-    Eta.Effect.fold ~ok:(fun value -> Ok value)
-      ~error:(fun error -> Error error)
-      (Store.ping store)
+    if Atomic.get draining then Eta.Effect.pure None
+    else
+      Eta.Effect.map Option.some
+        (Eta.Effect.fold ~ok:(fun value -> Ok value)
+           ~error:(fun error -> Error error)
+           (Store.ping store))
   in
   match result with
-  | Ok () ->
+  | None -> Eta.Effect.pure (draining_response ())
+  | Some (Ok ()) when Atomic.get draining ->
+      Eta.Effect.pure (draining_response ())
+  | Some (Ok ()) ->
       Eta.Effect.pure
         (json_response
            (`Assoc
              (health_fields config
              @ [ ("ready", `Bool true); ("store", `String "ok") ])))
-  | Error error ->
+  | Some (Error error) ->
       Eta.Effect.pure
         (error_response_with_details 503 "not_ready"
            ("the store did not answer: " ^ store_error_message error)
@@ -1137,18 +1151,19 @@ let pruner_loop ~config store =
   loop ()
 
 let start_pruner ~sw ~clock ~config store =
-  Eio.Fiber.fork ~sw (fun () ->
+  Eio.Fiber.fork_daemon ~sw (fun () ->
       let rt = Eta_eio.Runtime.create ~sw ~clock () in
-      match Eta.Runtime.run rt (pruner_loop ~config store) with
+      (match Eta.Runtime.run rt (pruner_loop ~config store) with
       | Eta.Exit.Ok () -> ()
       | Eta.Exit.Error cause ->
           if not (Eta.Cause.is_interrupt_only cause) then
             prerr_endline
               (Format.asprintf "inn pruner stopped: %a"
-                 (Eta.Cause.pp Store.pp_error) cause))
+                 (Eta.Cause.pp Store.pp_error) cause));
+      `Stop_daemon)
 
-(* Shutdown runs on a cancelled switch, so the close effect is expected to be
-   interrupted; only a real failure is reported. *)
+(* The serving switch has cancelled and awaited the pruner before the store
+   closes on this still-live outer switch. *)
 let close_store ~sw ~clock store =
   let rt = Eta_eio.Runtime.create ~sw ~clock () in
   match Eta.Runtime.run rt (Store.close store) with
@@ -1175,38 +1190,29 @@ let log_startup config =
        config.metrics_retention_hours config.prune_interval_seconds
        config.max_db_size_mb)
 
-(* svc-pehm: SIGTERM (and SIGINT) cancels the serving switch. The accept loop,
-   every in-flight connection, and the pruner all run under that switch, and the
-   [Fun.protect] finaliser in [run] then closes the store on the still-live
-   outer switch, so the process exits 0 -- which is what the unit's
-   [Restart=on-failure] expects -- instead of leaving a hung process and an
-   unclean WAL behind. Eta's [Serve.h1] stop path only stops accepting new
-   connections and never returns while a connection fiber lingers, so the
-   handler fails the switch ourselves instead of relying on that promise. *)
-exception Shutdown
-
-let rec is_shutdown = function
-  | Shutdown -> true
-  | Eio.Cancel.Cancelled inner -> is_shutdown inner
-  | _ -> false
-
-(* The handler only records the signal: a signal handler runs at an arbitrary
-   allocation point, so the switch is failed from a daemon fiber that polls the
-   flag, never from the handler itself. *)
-let install_shutdown_handler ~sw ~clock =
-  let fired = Atomic.make false in
-  let on_signal (_ : int) = Atomic.set fired true in
-  Sys.Safe.set_signal Sys.sigterm (Sys.Signal_handle on_signal);
-  Sys.Safe.set_signal Sys.sigint (Sys.Signal_handle on_signal);
-  Eio.Fiber.fork_daemon ~sw (fun () ->
-      let rec wait () =
-        if not (Atomic.get fired) then (
-          Eio.Time.sleep clock 0.02;
-          wait ())
-      in
-      wait ();
-      Eio.Switch.fail sw Shutdown;
-      `Stop_daemon)
+(* svc-pehm: Both SIGTERM and SIGINT resolve Serve.h1's stop promise.
+   Serve.h1 closes the listener and idle connections, gives in-flight requests
+   five seconds to finish, and returns normally. The serving switch then
+   cancels and awaits the pruner before the outer finaliser closes the store,
+   giving systemd's Restart=on-failure an exit status of 0. Inn owns signal
+   handlers here so its /ready route can report draining; Eta's readiness
+   wrapper is disabled to preserve Inn's JSON/store-check contract. *)
+let with_shutdown_signals f =
+  let stop, resolver = Eio.Promise.create () in
+  let stopped = Atomic.make false in
+  let on_signal (_ : int) =
+    Atomic.set draining true;
+    if Atomic.compare_and_set stopped false true then
+      Eio.Promise.resolve resolver ()
+  in
+  let previous_term = Sys.signal Sys.sigterm (Sys.Signal_handle on_signal) in
+  Fun.protect
+    ~finally:(fun () -> ignore (Sys.signal Sys.sigterm previous_term))
+    (fun () ->
+      let previous_int = Sys.signal Sys.sigint (Sys.Signal_handle on_signal) in
+      Fun.protect
+        ~finally:(fun () -> ignore (Sys.signal Sys.sigint previous_int))
+        (fun () -> f stop))
 
 let run ~sw ~env config =
   check_bind_available config;
@@ -1217,21 +1223,16 @@ let run ~sw ~env config =
   Fun.protect
     ~finally:(fun () -> close_store ~sw ~clock store)
     (fun () ->
-      try
-        (* The serving fibers run under their own switch so that a failed
-           switch tears down the accept loop and the pruner while the finaliser
-           above still closes the store on the outer, live switch. *)
-        Eio.Switch.run (fun serve_sw ->
-            install_shutdown_handler ~sw:serve_sw ~clock;
-            (* The pruner runs under the same switch as the server, so ending
-               the switch cancels and awaits it before the finaliser above
-               closes the store it uses. *)
-            start_pruner ~sw:serve_sw ~clock ~config store;
-            log_startup config;
-            let addr =
-              Serve.tcp_addr ~host:config.Config.host ~port:config.port
-            in
-            Eta_http_eio.Server.run_h1 ~sw:serve_sw ~net ~clock ~addr
-              (handler config store))
-      with exn when is_shutdown exn ->
-        prerr_endline "inn server: shutting down on SIGTERM")
+      (* Serve.h1 returns after draining. Leaving this switch cancels and
+         awaits the pruner before the store closes on the outer switch. *)
+      Eio.Switch.run (fun serve_sw ->
+          start_pruner ~sw:serve_sw ~clock ~config store;
+          log_startup config;
+          let addr =
+            Serve.tcp_addr ~host:config.Config.host ~port:config.port
+          in
+          with_shutdown_signals (fun stop ->
+              Serve.h1 ~sw:serve_sw ~net ~clock ~addr ~stop
+                ~install_signal_handlers:false ~ready_path:None
+                ~drain_timeout:(Eta.Duration.seconds 5)
+                (handler config store))))

@@ -103,9 +103,13 @@ inn restart
 
 `inn server` logs its listen address, its database path, and its retention
 settings to stderr at startup, so `journalctl --user -u inn` shows the
-configuration the running process actually uses. On SIGTERM (and SIGINT) it
-cancels the serving fibers and the pruner, closes the store, and exits 0, so a
-restart never leaves a hung process or an unclean WAL behind.
+configuration the running process actually uses. On SIGTERM (and SIGINT),
+it stops accepting connections, closes idle keep-alives, and gives in-flight
+requests up to five seconds to finish before cancelling any that remain. It
+then cancels and awaits the pruner, closes the store, and exits 0, so a restart
+never leaves a hung process or an unclean WAL behind. Inn owns `/ready` (and
+`/api/ready`) rather than Eta’s plain-text readiness wrapper: it retains the
+JSON identity and store check, and returns `503` when draining.
 
 Default server address:
 
@@ -235,7 +239,7 @@ guides, `/endpoints`, and `/openapi.json`.
 UTC), and `uptimeSeconds`, plus the pid, the configured state paths, and the
 managed daemon `instanceId` when one is set. `GET /ready` returns `200` with
 `ready:true` while the store answers a query, and `503` with the store error
-when it does not. `inn --version`, the MCP `serverInfo.version`, `/health`,
+when it does not (or `503` with `store:"draining"` during shutdown). `inn --version`, the MCP `serverInfo.version`, `/health`,
 and `info.version` in `/openapi.json` all report the same build version.
 
 ### Search filters and exact results

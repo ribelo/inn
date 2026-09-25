@@ -1,13 +1,13 @@
-"""svc-pehm: SIGTERM stops the server cleanly -- exit status 0, no hung process,
+"""svc-pehm: SIGTERM drains an in-flight request, exits 0 without hanging,
 and the database opens cleanly again with its data intact.
 svc-dh98: the startup log names the listen address, the database path, and the
 effective retention settings, so journalctl --user -u inn shows them.
 
 The check runs the real bin/main.exe server on a free port and a temporary
-state directory, ingests one trace, sends SIGTERM, requires exit status 0,
-starts the server again on the same state directory, and requires the trace to
-still be there. The second start also proves the store was closed, not left
-with a WAL nothing can recover.
+state directory, ingests one trace, completes another across SIGTERM, requires
+exit status 0, starts the server again on the same state directory, and requires
+both traces to still be there. The second start also proves the store was closed,
+not left with a WAL nothing can recover.
 """
 import json
 import os
@@ -22,6 +22,7 @@ import urllib.request
 exe = os.path.abspath(sys.argv[1])
 
 TRACE_ID = "0123456789abcdef0123456789abcdef"
+DRAIN_TRACE_ID = "fedcba9876543210fedcba9876543210"
 SPAN_ID = "1111111111111111"
 SERVICE = "service-check"
 
@@ -119,14 +120,16 @@ def start(state_dir, port, log_path):
     return proc
 
 
-def stop(proc, base_url):
-    proc.send_signal(signal.SIGTERM)
+def stop(proc, base_url, *, signal_sent=False, sig=signal.SIGTERM):
+    name = signal.Signals(sig).name
+    if not signal_sent:
+        proc.send_signal(sig)
     try:
         returncode = proc.wait(timeout=20)
     except subprocess.TimeoutExpired:
         proc.kill()
-        raise AssertionError("SIGTERM left the server running (svc-pehm)")
-    assert returncode == 0, "SIGTERM exit status was %d, not 0" % returncode
+        raise AssertionError("%s left the server running (svc-pehm)" % name)
+    assert returncode == 0, "%s exit status was %d, not 0" % (name, returncode)
     deadline = time.time() + 5
     while time.time() < deadline:
         try:
@@ -134,7 +137,34 @@ def stop(proc, base_url):
         except Exception:
             return
         time.sleep(0.05)
-    raise AssertionError("the server still answers after SIGTERM (svc-pehm)")
+    raise AssertionError("the server still answers after %s (svc-pehm)" % name)
+
+
+def finish_inflight_across_sigterm(proc, port):
+    payload = json.loads(json.dumps(trace_payload))
+    payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["traceId"] = DRAIN_TRACE_ID
+    body = json.dumps(payload).encode()
+    headers = (
+        "POST /v1/traces HTTP/1.1\r\n"
+        "Host: 127.0.0.1:%d\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n\r\n"
+    ) % (port, len(body))
+    with socket.create_connection(("127.0.0.1", port), timeout=7) as sock:
+        sock.sendall(headers.encode() + body[: len(body) // 2])
+        # The server has a partial request body; the response cannot finish yet.
+        time.sleep(0.1)
+        proc.send_signal(signal.SIGTERM)
+        time.sleep(0.2)
+        assert proc.poll() is None, "server exited before the request completed"
+        sock.sendall(body[len(body) // 2 :])
+        with sock.makefile("rb") as response:
+            status_line = response.readline()
+            assert status_line.startswith(b"HTTP/1.1 200 "), status_line
+            while response.readline().strip():
+                pass
+            assert json.loads(response.read()) == {}, "in-flight ingest failed"
 
 
 root = tempfile.mkdtemp(prefix="inn-service-check-")
@@ -147,11 +177,16 @@ db_path = os.path.join(state_dir, "telemetry.sqlite")
 try:
     server = start(state_dir, port, log_path)
     wait_health(base_url, server)
+    for path in ("/ready", "/api/ready"):
+        status, readiness = get(base_url + path)
+        assert status == 200 and readiness["ready"] is True, readiness
+        assert readiness["store"] == "ok", readiness
 
     status, _ = post(base_url + "/v1/traces", trace_payload)
     assert status == 200, "ingest answered %d" % status
 
-    stop(server, base_url)
+    finish_inflight_across_sigterm(server, port)
+    stop(server, base_url, signal_sent=True)
 
     with open(log_path, "r", errors="replace") as handle:
         log = handle.read()
@@ -174,8 +209,14 @@ try:
     status, trace = get(base_url + "/traces/" + TRACE_ID)
     assert status == 200, "the reopened store answered %d" % status
     assert trace["summary"]["traceId"] == TRACE_ID, trace
-    stop(server, base_url)
+    status, drained_trace = get(base_url + "/traces/" + DRAIN_TRACE_ID)
+    assert status == 200, "the drained trace was not persisted"
+    assert drained_trace["summary"]["traceId"] == DRAIN_TRACE_ID, drained_trace
+    stop(server, base_url, sig=signal.SIGINT)
 finally:
+    if "server" in locals() and server.poll() is None:
+        server.kill()
+        server.wait(timeout=5)
     if os.path.exists(log_path):
         os.remove(log_path)
     import shutil
@@ -183,6 +224,6 @@ finally:
     shutil.rmtree(root, ignore_errors=True)
 
 print(
-    "svc-pehm svc-dh98: SIGTERM exits 0, the reopened store still has its data, "
-    "and the startup log names the effective configuration"
+    "svc-pehm svc-dh98: SIGTERM drains an in-flight request and exits 0, "
+    "SIGINT exits 0, both traces survive reopen, and startup logs config"
 )
