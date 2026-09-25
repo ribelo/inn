@@ -20,10 +20,17 @@ type ingest_counts = {
   metric_points : int;
 }
 
+type 'a page = {
+  items : 'a list;
+  next : Model.cursor_position option;
+}
+
 type log_filter = {
   service : string option;
   severity : string option;
   contains : string option;
+  window : Model.window;
+  cursor : Model.cursor_position option;
   limit : int;
 }
 
@@ -34,6 +41,8 @@ type span_search_filter = {
   parent_operation : string option;
   status : string option;
   attrs : (string * string) list;
+  window : Model.window;
+  cursor : Model.cursor_position option;
   limit : int;
 }
 
@@ -42,6 +51,8 @@ type trace_search_filter = {
   operation : string option;
   status : string option;
   attrs : (string * string) list;
+  window : Model.window;
+  cursor : Model.cursor_position option;
   limit : int;
 }
 
@@ -52,6 +63,8 @@ type log_search_filter = {
   severity : string option;
   body : string option;
   attrs : (string * string) list;
+  window : Model.window;
+  cursor : Model.cursor_position option;
   limit : int;
 }
 
@@ -62,6 +75,7 @@ type trace_stats_filter = {
   operation : string option;
   status : string option;
   attrs : (string * string) list;
+  window : Model.window;
   limit : int;
 }
 
@@ -73,6 +87,7 @@ type log_stats_filter = {
   severity : string option;
   body : string option;
   attrs : (string * string) list;
+  window : Model.window;
   limit : int;
 }
 
@@ -81,6 +96,7 @@ type facet_filter = {
   field : string;
   key : string option;
   service : string option;
+  window : Model.window;
   limit : int;
 }
 
@@ -94,6 +110,8 @@ type trace_stat_bucket = {
 type metric_filter = {
   service : string option;
   name : string option;
+  window : Model.window;
+  cursor : Model.cursor_position option;
   limit : int;
 }
 
@@ -772,6 +790,10 @@ let open_ ?(now_ms = wall_now_ms) ?(report = default_report) config =
 
 let close t = Q.Pool.shutdown t.pool |> Eta.Effect.map_error widen_pool_error
 
+(* The query window is resolved against this clock, so handler tests can drive
+   both ingestion and lookback with the same injected time. *)
+let now_ms t = t.now_ms ()
+
 let with_db ?now_ms ?report config f =
   Eta.Effect.with_resource
     ~acquire:(open_ ?now_ms ?report config)
@@ -825,17 +847,19 @@ let span_projection =
 let log_projection =
   Q.Projection.(
     map
-      (fun ( ( trace_id,
-               span_id,
-               service_name,
-               scope_name,
-               severity_text,
-               severity_number,
-               timestamp_ns,
-               body ),
-             (attributes_json, resource_json, observed_timestamp_ns) ) ->
+      (fun ( id,
+             ( ( trace_id,
+                 span_id,
+                 service_name,
+                 scope_name,
+                 severity_text,
+                 severity_number,
+                 timestamp_ns,
+                 body ),
+               (attributes_json, resource_json, observed_timestamp_ns) ) ) ->
         {
-          Model.trace_id;
+          Model.id;
+          trace_id;
           span_id;
           service_name;
           scope_name;
@@ -847,12 +871,13 @@ let log_projection =
           attributes = attrs_of_json attributes_json;
           resource = attrs_of_json resource_json;
         })
-      (t2
-         (t8 (one Logs.trace_id) (one Logs.span_id) (one Logs.service_name)
-            (one Logs.scope_name) (one Logs.severity_text)
-            (one Logs.severity_number) (one Logs.timestamp_ns) (one Logs.body))
-         (t3 (one Logs.attributes_json) (one Logs.resource_json)
-           (one Logs.observed_timestamp_ns))))
+      (t2 (one Logs.id)
+         (t2
+            (t8 (one Logs.trace_id) (one Logs.span_id) (one Logs.service_name)
+               (one Logs.scope_name) (one Logs.severity_text)
+               (one Logs.severity_number) (one Logs.timestamp_ns) (one Logs.body))
+            (t3 (one Logs.attributes_json) (one Logs.resource_json)
+              (one Logs.observed_timestamp_ns)))))
 
 let metric_projection =
   Q.Projection.(
@@ -959,6 +984,88 @@ let rec take count values =
     match values with
     | [] -> []
     | value :: rest -> value :: take (count - 1) rest
+
+(* Keyset pagination and resolved windows (win-edze, win-7xet, win-xi3q). The
+   HTTP layer resolves the window and decodes the cursor; the store only
+   compares rows against them, fetching one row past the page size so
+   truncation is exact. *)
+
+let window_predicate column (window : Model.window) =
+  match window.start_ms with
+  | None -> Q.Expr.true_
+  | Some start_ms -> Q.Expr.ge column (start_ms * 1_000_000)
+
+let keyset_predicate ~sort_key ~tie_breaker cursor =
+  match cursor with
+  | None -> Q.Expr.true_
+  | Some position ->
+      Q.Expr.or_
+        (Q.Expr.lt sort_key position.Model.sort_key_ns)
+        (Q.Expr.and_
+           (Q.Expr.eq sort_key position.Model.sort_key_ns)
+           (Q.Expr.lt tie_breaker position.Model.tie_breaker))
+
+let page_of_rows ~limit ~position rows =
+  if List.length rows > limit then
+    let items = take limit rows in
+    { items; next = Some (position (List.nth items (limit - 1))) }
+  else { items = rows; next = None }
+
+let empty_page = { items = []; next = None }
+
+let span_position (span : Model.span) =
+  { Model.sort_key_ns = span.start_time_ns; tie_breaker = span_row_id span }
+
+let log_position (log : Model.log_record) =
+  { Model.sort_key_ns = log.timestamp_ns; tie_breaker = log.id }
+
+let trace_position (summary : Model.trace_summary) =
+  { Model.sort_key_ns = summary.started_at_ns; tie_breaker = summary.trace_id }
+
+let trace_spans_page_query ~window ~cursor ~limit trace_id =
+  let max_rows = limit + 1 in
+  Q.Select.(
+    from Spans.table span_projection
+    |> where
+         Q.Expr.(
+           and_ (eq Spans.trace_id trace_id)
+             (and_
+                (window_predicate Spans.start_time_ns window)
+                (keyset_predicate ~sort_key:Spans.start_time_ns
+                   ~tie_breaker:Spans.id cursor)))
+    |> order_by ~desc:true Spans.start_time_ns
+    |> order_by ~desc:true Spans.id
+    |> limit max_rows)
+
+let logs_for_trace_page_query ~window ~cursor ~limit trace_id =
+  let max_rows = limit + 1 in
+  Q.Select.(
+    from Logs.table log_projection
+    |> where
+         Q.Expr.(
+           and_ (eq Logs.trace_id (Some trace_id))
+             (and_
+                (window_predicate Logs.timestamp_ns window)
+                (keyset_predicate ~sort_key:Logs.timestamp_ns
+                   ~tie_breaker:Logs.id cursor)))
+    |> order_by ~desc:true Logs.timestamp_ns
+    |> order_by ~desc:true Logs.id
+    |> limit max_rows)
+
+let logs_for_span_page_query ~window ~cursor ~limit span_id =
+  let max_rows = limit + 1 in
+  Q.Select.(
+    from Logs.table log_projection
+    |> where
+         Q.Expr.(
+           and_ (eq Logs.span_id (Some span_id))
+             (and_
+                (window_predicate Logs.timestamp_ns window)
+                (keyset_predicate ~sort_key:Logs.timestamp_ns
+                   ~tie_breaker:Logs.id cursor)))
+    |> order_by ~desc:true Logs.timestamp_ns
+    |> order_by ~desc:true Logs.id
+    |> limit max_rows)
 
 let intersect_sorted left right =
   let right = String_set.of_list right in
@@ -1621,12 +1728,14 @@ let ingest_metrics t points =
   in
   Eta.Effect.pure (List.length points)
 
-let list_services_runner runner =
+let list_services_runner ?window runner =
+  let window = Option.value window ~default:Model.window_all in
   let open Eta.Syntax in
   let* span_services =
     q_select runner
       Q.Select.(
         from Spans.table Q.Projection.(one Spans.service_name)
+        |> where (window_predicate Spans.start_time_ns window)
         |> distinct
         |> order_by Spans.service_name)
   in
@@ -1634,6 +1743,7 @@ let list_services_runner runner =
     q_select runner
       Q.Select.(
         from Logs.table Q.Projection.(one Logs.service_name)
+        |> where (window_predicate Logs.timestamp_ns window)
         |> distinct
         |> order_by Logs.service_name)
   in
@@ -1641,6 +1751,7 @@ let list_services_runner runner =
     q_select runner
       Q.Select.(
         from Metric_points.table Q.Projection.(one Metric_points.service_name)
+        |> where (window_predicate Metric_points.timestamp_ns window)
         |> distinct
         |> order_by Metric_points.service_name)
   in
@@ -1648,23 +1759,34 @@ let list_services_runner runner =
     (List.sort_uniq String.compare
        (span_services @ log_services @ metric_services))
 
-let list_services t = list_services_runner t.pool
+let list_services ?window t = list_services_runner ?window t.pool
 
-let list_trace_summaries ?service ?(limit = 100) t =
-  let max_rows = limit in
+let list_trace_summaries ?service ~window ?cursor ~limit t =
   let predicate =
     match service with
     | None -> Q.Expr.true_
     | Some service -> Q.Expr.eq Trace_summaries.service_name service
   in
+  let predicate =
+    Q.Expr.and_ predicate
+      (window_predicate Trace_summaries.started_at_ns window)
+  in
+  let predicate =
+    Q.Expr.and_ predicate
+      (keyset_predicate ~sort_key:Trace_summaries.started_at_ns
+         ~tie_breaker:Trace_summaries.trace_id cursor)
+  in
+  let max_rows = limit + 1 in
   let query =
     Q.Select.(
       from Trace_summaries.table trace_summary_projection
       |> where predicate
-      |> order_by ~desc:true Trace_summaries.started_at_ns)
-    |> Q.Select.limit max_rows
+      |> order_by ~desc:true Trace_summaries.started_at_ns
+      |> order_by ~desc:true Trace_summaries.trace_id
+      |> limit max_rows)
   in
   q_select t.pool query
+  |> Eta.Effect.map (page_of_rows ~limit ~position:trace_position)
 
 let get_trace t trace_id =
   let open Eta.Syntax in
@@ -1688,11 +1810,17 @@ let get_span t span_id =
   let* spans = q_select t.pool (span_id_query span_id) in
   one_or_none "span lookup" spans
 
-let list_trace_spans t trace_id = select_spans_for_trace t.pool trace_id
+let list_trace_spans t ~window ?cursor ~limit trace_id =
+  q_select t.pool (trace_spans_page_query ~window ~cursor ~limit trace_id)
+  |> Eta.Effect.map (page_of_rows ~limit ~position:span_position)
 
-let list_trace_logs t trace_id = q_select t.pool (logs_for_trace_query trace_id)
+let list_trace_logs t ~window ?cursor ~limit trace_id =
+  q_select t.pool (logs_for_trace_page_query ~window ~cursor ~limit trace_id)
+  |> Eta.Effect.map (page_of_rows ~limit ~position:log_position)
 
-let list_span_logs t span_id = q_select t.pool (logs_for_span_query span_id)
+let list_span_logs t ~window ?cursor ~limit span_id =
+  q_select t.pool (logs_for_span_page_query ~window ~cursor ~limit span_id)
+  |> Eta.Effect.map (page_of_rows ~limit ~position:log_position)
 
 let span_search_predicate (filter : span_search_filter) owner_ids parent_span_ids =
   let predicate = Q.Expr.true_ in
@@ -1723,6 +1851,14 @@ let span_search_predicate (filter : span_search_filter) owner_ids parent_span_id
     | None -> predicate
     | Some ids -> Q.Expr.and_ predicate (Q.Expr.in_values Spans.id ids)
   in
+  let predicate =
+    Q.Expr.and_ predicate (window_predicate Spans.start_time_ns filter.window)
+  in
+  let predicate =
+    Q.Expr.and_ predicate
+      (keyset_predicate ~sort_key:Spans.start_time_ns ~tie_breaker:Spans.id
+         filter.cursor)
+  in
   match parent_span_ids with
   | None -> predicate
   | Some ids ->
@@ -1739,7 +1875,7 @@ let search_spans (filter : span_search_filter) t =
         Eta.Effect.pure (Some ids)
   in
   match owner_ids with
-  | Some [] -> Eta.Effect.pure []
+  | Some [] -> Eta.Effect.pure empty_page
   | _ ->
       let* parent_span_ids =
         match filter.parent_operation with
@@ -1749,14 +1885,17 @@ let search_spans (filter : span_search_filter) t =
             Eta.Effect.pure (Some (sorted_unique ids))
       in
       (match parent_span_ids with
-      | Some [] -> Eta.Effect.pure []
+      | Some [] -> Eta.Effect.pure empty_page
       | _ ->
           q_select t.pool
             Q.Select.(
               from Spans.table span_projection
               |> where (span_search_predicate filter owner_ids parent_span_ids)
               |> order_by ~desc:true Spans.start_time_ns
-              |> limit filter.limit))
+              |> order_by ~desc:true Spans.id
+              |> limit (filter.limit + 1))
+          |> Eta.Effect.map
+               (page_of_rows ~limit:filter.limit ~position:span_position))
 
 let trace_summary_search_query (filter : trace_search_filter) trace_ids =
   let predicate = Q.Expr.true_ in
@@ -1772,18 +1911,31 @@ let trace_summary_search_query (filter : trace_search_filter) trace_ids =
     | Some ids ->
         Q.Expr.and_ predicate (Q.Expr.in_values Trace_summaries.trace_id ids)
   in
+  let predicate =
+    Q.Expr.and_ predicate
+      (window_predicate Trace_summaries.started_at_ns filter.window)
+  in
+  let predicate =
+    Q.Expr.and_ predicate
+      (keyset_predicate ~sort_key:Trace_summaries.started_at_ns
+         ~tie_breaker:Trace_summaries.trace_id filter.cursor)
+  in
   Q.Select.(
     from Trace_summaries.table trace_summary_projection
     |> where predicate
     |> order_by ~desc:true Trace_summaries.started_at_ns
-    |> limit filter.limit)
+    |> order_by ~desc:true Trace_summaries.trace_id
+    |> limit (filter.limit + 1))
 
 let search_traces (filter : trace_search_filter) t =
   let needs_span_filter =
     Option.is_some filter.operation || Option.is_some filter.status
     || filter.attrs <> []
   in
-  if not needs_span_filter then q_select t.pool (trace_summary_search_query filter None)
+  if not needs_span_filter then
+    q_select t.pool (trace_summary_search_query filter None)
+    |> Eta.Effect.map
+         (page_of_rows ~limit:filter.limit ~position:trace_position)
   else
     let open Eta.Syntax in
     let span_filter =
@@ -1794,16 +1946,23 @@ let search_traces (filter : trace_search_filter) t =
         parent_operation = None;
         status = filter.status;
         attrs = filter.attrs;
+        window = filter.window;
+        cursor = None;
         limit = 10_000;
       }
     in
-    let* spans = search_spans span_filter t in
+    let* spans_page = search_spans span_filter t in
     let trace_ids =
-      spans |> List.map (fun (span : Model.span) -> span.trace_id) |> sorted_unique
+      spans_page.items
+      |> List.map (fun (span : Model.span) -> span.trace_id)
+      |> sorted_unique
     in
     match trace_ids with
-    | [] -> Eta.Effect.pure []
-    | trace_ids -> q_select t.pool (trace_summary_search_query filter (Some trace_ids))
+    | [] -> Eta.Effect.pure empty_page
+    | trace_ids ->
+        q_select t.pool (trace_summary_search_query filter (Some trace_ids))
+        |> Eta.Effect.map
+             (page_of_rows ~limit:filter.limit ~position:trace_position)
 
 let log_predicate (filter : log_filter) =
   let predicate = Q.Expr.true_ in
@@ -1817,10 +1976,18 @@ let log_predicate (filter : log_filter) =
     | None -> predicate
     | Some severity -> Q.Expr.and_ predicate (Q.Expr.eq Logs.severity_text severity)
   in
-  match filter.contains with
-  | None -> predicate
-  | Some contains ->
-      Q.Expr.and_ predicate (Q.Expr.like Logs.body ("%" ^ contains ^ "%"))
+  let predicate =
+    match filter.contains with
+    | None -> predicate
+    | Some contains ->
+        Q.Expr.and_ predicate (Q.Expr.like Logs.body ("%" ^ contains ^ "%"))
+  in
+  let predicate =
+    Q.Expr.and_ predicate (window_predicate Logs.timestamp_ns filter.window)
+  in
+  Q.Expr.and_ predicate
+    (keyset_predicate ~sort_key:Logs.timestamp_ns ~tie_breaker:Logs.id
+       filter.cursor)
 
 let list_logs (filter : log_filter) t =
   q_select t.pool
@@ -1828,7 +1995,9 @@ let list_logs (filter : log_filter) t =
       from Logs.table log_projection
       |> where (log_predicate filter)
       |> order_by ~desc:true Logs.timestamp_ns
-      |> limit filter.limit)
+      |> order_by ~desc:true Logs.id
+      |> limit (filter.limit + 1))
+  |> Eta.Effect.map (page_of_rows ~limit:filter.limit ~position:log_position)
 
 let log_search_predicate (filter : log_search_filter) owner_ids =
   let predicate = Q.Expr.true_ in
@@ -1858,9 +2027,17 @@ let log_search_predicate (filter : log_search_filter) owner_ids =
     | None -> predicate
     | Some body -> Q.Expr.and_ predicate (Q.Expr.like Logs.body ("%" ^ body ^ "%"))
   in
-  match owner_ids with
-  | None -> predicate
-  | Some ids -> Q.Expr.and_ predicate (Q.Expr.in_values Logs.id ids)
+  let predicate =
+    match owner_ids with
+    | None -> predicate
+    | Some ids -> Q.Expr.and_ predicate (Q.Expr.in_values Logs.id ids)
+  in
+  let predicate =
+    Q.Expr.and_ predicate (window_predicate Logs.timestamp_ns filter.window)
+  in
+  Q.Expr.and_ predicate
+    (keyset_predicate ~sort_key:Logs.timestamp_ns ~tie_breaker:Logs.id
+       filter.cursor)
 
 let search_logs (filter : log_search_filter) t =
   let open Eta.Syntax in
@@ -1872,14 +2049,17 @@ let search_logs (filter : log_search_filter) t =
         Eta.Effect.pure (Some ids)
   in
   match owner_ids with
-  | Some [] -> Eta.Effect.pure []
+  | Some [] -> Eta.Effect.pure empty_page
   | _ ->
       q_select t.pool
         Q.Select.(
           from Logs.table log_projection
           |> where (log_search_predicate filter owner_ids)
           |> order_by ~desc:true Logs.timestamp_ns
-          |> limit filter.limit)
+          |> order_by ~desc:true Logs.id
+          |> limit (filter.limit + 1))
+      |> Eta.Effect.map
+           (page_of_rows ~limit:filter.limit ~position:log_position)
 
 let trace_attr_lookup t trace_ids key =
   let open Eta.Syntax in
@@ -1898,17 +2078,20 @@ let trace_attr_lookup t trace_ids key =
 
 let trace_stats (filter : trace_stats_filter) t =
   let open Eta.Syntax in
-  let* summaries =
+  let* summaries_page =
     search_traces
       {
         service = filter.service;
         operation = filter.operation;
         status = filter.status;
         attrs = filter.attrs;
+        window = filter.window;
+        cursor = None;
         limit = 10_000;
       }
       t
   in
+  let summaries = summaries_page.items in
   let trace_ids =
     summaries
     |> List.map (fun (summary : Model.trace_summary) -> summary.trace_id)
@@ -1979,7 +2162,7 @@ let trace_stats (filter : trace_stats_filter) t =
 
 let log_stats (filter : log_stats_filter) t =
   let open Eta.Syntax in
-  let* logs =
+  let* logs_page =
     search_logs
       {
         service = filter.service;
@@ -1988,10 +2171,13 @@ let log_stats (filter : log_stats_filter) t =
         severity = filter.severity;
         body = filter.body;
         attrs = filter.attrs;
+        window = filter.window;
+        cursor = None;
         limit = 10_000;
       }
       t
   in
+  let logs = logs_page.items in
   let groups = Hashtbl.create 16 in
   let group_for_log (log : Model.log_record) =
     match filter.group_by with
@@ -2075,7 +2261,7 @@ let facets (filter : facet_filter) t =
   let open Eta.Syntax in
   match filter.kind with
   | "traces" ->
-      let* spans =
+      let* spans_page =
         search_spans
           {
             service = filter.service;
@@ -2084,15 +2270,17 @@ let facets (filter : facet_filter) t =
             parent_operation = None;
             status = None;
             attrs = [];
+            window = filter.window;
+            cursor = None;
             limit = 10_000;
           }
           t
       in
       Eta.Effect.pure
         (facet_items_from_counts filter.limit
-           (count_span_facets spans filter.field filter.key))
+           (count_span_facets spans_page.items filter.field filter.key))
   | "logs" ->
-      let* logs =
+      let* logs_page =
         search_logs
           {
             service = filter.service;
@@ -2101,13 +2289,15 @@ let facets (filter : facet_filter) t =
             severity = None;
             body = None;
             attrs = [];
+            window = filter.window;
+            cursor = None;
             limit = 10_000;
           }
           t
       in
       Eta.Effect.pure
         (facet_items_from_counts filter.limit
-           (count_log_facets logs filter.field filter.key))
+           (count_log_facets logs_page.items filter.field filter.key))
   | _ -> Eta.Effect.pure []
 
 let metric_predicate (filter : metric_filter) =
@@ -2118,30 +2308,68 @@ let metric_predicate (filter : metric_filter) =
     | Some service ->
         Q.Expr.and_ predicate (Q.Expr.eq Metric_points.service_name service)
   in
-  match filter.name with
-  | None -> predicate
-  | Some name -> Q.Expr.and_ predicate (Q.Expr.eq Metric_points.name name)
+  let predicate =
+    match filter.name with
+    | None -> predicate
+    | Some name -> Q.Expr.and_ predicate (Q.Expr.eq Metric_points.name name)
+  in
+  let predicate =
+    Q.Expr.and_ predicate
+      (window_predicate Metric_points.timestamp_ns filter.window)
+  in
+  Q.Expr.and_ predicate
+    (keyset_predicate ~sort_key:Metric_points.timestamp_ns
+       ~tie_breaker:Metric_points.id filter.cursor)
 
 let list_metric_points (filter : metric_filter) t =
   q_select t.pool
     Q.Select.(
-      from Metric_points.table metric_projection
+      from Metric_points.table
+        (Q.Projection.t2 (Q.Projection.one Metric_points.id) metric_projection)
       |> where (metric_predicate filter)
       |> order_by ~desc:true Metric_points.timestamp_ns
-      |> limit filter.limit)
+      |> order_by ~desc:true Metric_points.id
+      |> limit (filter.limit + 1))
+  |> Eta.Effect.map (fun rows ->
+         let page =
+           page_of_rows ~limit:filter.limit
+             ~position:(fun (id, (point : Model.metric_point)) ->
+               {
+                 Model.sort_key_ns = point.timestamp_ns;
+                 tie_breaker = id;
+               })
+             rows
+         in
+         { items = List.map snd page.items; next = page.next })
 
 let count_rows runner table =
   let open Eta.Syntax in
   let* rows = q_select runner Q.Select.(from table Q.Projection.(count ())) in
   scalar "count" rows
 
-let stats t =
+let count_windowed_rows runner table sort_key window =
   let open Eta.Syntax in
-  let* spans = count_rows t.pool Spans.table in
-  let* logs = count_rows t.pool Logs.table in
-  let* metric_points = count_rows t.pool Metric_points.table in
-  let* traces = count_rows t.pool Trace_summaries.table in
-  let* services = list_services_runner t.pool in
+  let* rows =
+    q_select runner
+      Q.Select.(
+        from table Q.Projection.(count ())
+        |> where (window_predicate sort_key window))
+  in
+  scalar "count" rows
+
+let stats ?window t =
+  let window = Option.value window ~default:Model.window_all in
+  let open Eta.Syntax in
+  let* spans = count_windowed_rows t.pool Spans.table Spans.start_time_ns window in
+  let* logs = count_windowed_rows t.pool Logs.table Logs.timestamp_ns window in
+  let* metric_points =
+    count_windowed_rows t.pool Metric_points.table Metric_points.timestamp_ns window
+  in
+  let* traces =
+    count_windowed_rows t.pool Trace_summaries.table Trace_summaries.started_at_ns
+      window
+  in
+  let* services = list_services_runner ~window t.pool in
   let* live_bytes = live_bytes t.pool in
   Eta.Effect.pure
     {

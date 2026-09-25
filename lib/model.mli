@@ -31,6 +31,9 @@ type span = {
 }
 
 type log_record = {
+  id : string;
+  (** Stable id assigned when the record is stored. It is empty on a record
+      that has only been decoded. *)
   trace_id : string option;
   span_id : string option;
   service_name : string;
@@ -75,6 +78,19 @@ type trace = {
   spans : span list;
   logs : log_record list;
 }
+
+type window = { start_ms : int option }
+(** A resolved query window. [None] is the whole retained history. *)
+
+type cursor_position = { sort_key_ns : int; tie_breaker : string }
+(** The sort key and the unique tie-breaker of one row, so a keyset cursor can
+    resume strictly after it. *)
+
+val window_all : window
+(** The whole retained history. *)
+
+val window_lookback : now_ms:int -> ms:int -> window
+(** A window that starts [ms] milliseconds before [now_ms]. *)
 
 type prune_report = {
   pruned_at_ms : int;

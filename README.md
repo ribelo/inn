@@ -67,6 +67,12 @@ installs packages into the shared switch and does not edit Eta. Missing OCaml
 dependencies must be addressed outside this workflow, not installed into the
 shared switch.
 
+The Alcotest suite runs with `EIO_BACKEND=posix` (set by `test/dune`). Each
+short-lived Eio runtime otherwise creates an io_uring ring, and ring creation
+fails with `ENOMEM` under a small per-user locked-memory cap, which hides real
+failures. The posix backend is the same Eio API without io_uring; the server
+itself keeps the default backend.
+
 To check Inn against the previously installed Eta in the shared switch instead:
 
 ```sh
@@ -152,6 +158,37 @@ GET /openapi.json
 
 The `/api/...` prefix is accepted as an alias for query endpoints.
 
+### Windows and cursors
+
+Every list, search, stats, facet, services, and store-stats query takes a
+relative `lookback` window: a positive integer followed by `m`, `h`, or `d`
+(`15m`, `2h`, `1d`), or the literal `all` for the whole retained history.
+The window is resolved once per request against the server clock and applies
+to the event timestamp of each signal (span start, log timestamp, metric
+timestamp), not to ingestion time.
+
+- Lists and searches default to `1h`. Stats, facets, services, and store
+  stats default to `all`, so aggregates stay complete unless narrowed.
+- Every list and search also takes `cursor`: the opaque `nextCursor` value
+  from the previous response. Later pages reuse the window resolved for page
+  one, so paging stays stable while new data arrives.
+- List and search responses keep their named collection key and add a sibling
+  `meta` object:
+
+  ```json
+  {"logs":[...],"meta":{"limit":100,"lookback":"1h","returned":100,"truncated":true,"nextCursor":"eyJ..."}}
+  ```
+
+  `nextCursor` appears only when another page exists. Stats and facets add
+  `meta` with `lookback` and `limit`; services add `lookback` and `returned`;
+  store stats (`/stats`) add `lookback`.
+- Ordering is newest first with a unique tie-breaker (trace id, span row id,
+  log id, or metric row id), so pages never repeat or skip a row.
+- Log records carry a stable `id`, which is also their tie-breaker.
+- An invalid lookback, a malformed cursor, a cursor issued for another
+  endpoint kind, or a limit outside 1..10000 is a `400` that explains the
+  expected format; Inn never ignores a bad window or cursor.
+
 ## CLI
 
 The CLI queries the running server. It does not silently open a cwd-local
@@ -184,6 +221,16 @@ inn instructions
 inn openapi
 ```
 
+Query commands that accept a time window or page through results use
+`--lookback` and `--cursor`; the values are passed to the HTTP API unchanged:
+
+```sh
+inn logs --lookback 15m --limit 100
+inn logs --lookback all --cursor eyJraW5kIjoibG9nIi...
+inn traces --lookback 2h
+inn trace-stats operation count --lookback all
+```
+
 Use `--base-url` to query a non-default server:
 
 ```sh
@@ -199,8 +246,17 @@ inn mcp
 ```
 
 The MCP tools proxy to the configured Inn HTTP API and include status, services,
-trace/span/log search, trace/log stats, facets, metrics, endpoint inventory,
-AI call search/stats/detail, instructions, and OpenAPI.
+trace/span/log search, trace/log stats, store stats, facets, metrics, endpoint
+inventory, AI call search/stats/detail, instructions, and OpenAPI.
+
+`inn_stats` returns the store row counts and the retention section, including
+the last prune report, so the pruner is observable without reading server
+logs.
+
+List and search tools take `lookback` and `cursor`. `inn_stats`,
+`inn_services`, `inn_trace_stats`, `inn_log_stats`, `inn_facets`, and
+`inn_ai_stats` take `lookback` only. The tool arguments become the same HTTP
+query parameters the CLI sends.
 
 ## Eta SQL
 

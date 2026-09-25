@@ -53,21 +53,134 @@ let test_versions () =
       ("2099-01-01", "2025-11-25");
     ]
 
-let test_catalogue () =
-  (* mcp-gurs: tools/list advertises the existing read-only HTTP catalogue. *)
+let tools () =
   let json = response (handle (request "tools/list")) in
   match required "tools" (required "result" json) with
-  | `List tools ->
-      Alcotest.(check int) "tool count" 20 (List.length tools);
-      List.iter
-        (fun name ->
-          Alcotest.(check bool)
-            (name ^ " listed") true
-            (List.exists
-               (fun tool -> member "name" tool = Some (`String name))
-               tools))
-        [ "inn_status"; "inn_services"; "inn_search_traces"; "inn_openapi" ]
+  | `List tools -> tools
   | _ -> Alcotest.fail "tools is not an array"
+
+let contains haystack needle =
+  let haystack = String.lowercase_ascii haystack in
+  let needle = String.lowercase_ascii needle in
+  let length = String.length haystack in
+  let needle_length = String.length needle in
+  let rec loop index =
+    if index + needle_length > length then false
+    else if String.equal (String.sub haystack index needle_length) needle then true
+    else loop (index + 1)
+  in
+  needle_length = 0 || loop 0
+
+let test_catalogue () =
+  (* mcp-gurs: tools/list advertises the existing read-only HTTP catalogue. *)
+  let tools = tools () in
+  Alcotest.(check int) "tool count" 21 (List.length tools);
+  List.iter
+    (fun name ->
+      Alcotest.(check bool)
+        (name ^ " listed") true
+        (List.exists
+           (fun tool -> member "name" tool = Some (`String name))
+           tools))
+    [
+      "inn_status";
+      "inn_services";
+      "inn_search_traces";
+      "inn_stats";
+      "inn_openapi";
+    ]
+
+let test_window_arguments_in_schemas () =
+  (* win-2olw: the MCP schemas advertise the window and cursor arguments. *)
+  let tools = tools () in
+  let check name expected =
+    match List.find_opt (fun tool -> member "name" tool = Some (`String name)) tools with
+    | None -> Alcotest.failf "%s is not listed" name
+    | Some tool ->
+        let properties = required "properties" (required "inputSchema" tool) in
+        List.iter
+          (fun property ->
+            Alcotest.(check bool)
+              (name ^ " lists " ^ property) true
+              (match member property properties with
+              | Some (`Assoc _) -> true
+              | _ -> false))
+          expected
+  in
+  check "inn_services" [ "lookback" ];
+  check "inn_search_traces" [ "lookback"; "cursor" ];
+  check "inn_get_trace_spans" [ "lookback"; "cursor"; "limit" ];
+  check "inn_get_trace_logs" [ "lookback"; "cursor"; "limit" ];
+  check "inn_search_spans" [ "lookback"; "cursor" ];
+  check "inn_get_span_logs" [ "lookback"; "cursor"; "limit" ];
+  check "inn_search_logs" [ "lookback"; "cursor" ];
+  check "inn_trace_stats" [ "lookback" ];
+  check "inn_log_stats" [ "lookback" ];
+  check "inn_facets" [ "lookback" ];
+  check "inn_search_ai_calls" [ "lookback"; "cursor" ];
+  check "inn_ai_stats" [ "lookback" ];
+  check "inn_metrics" [ "lookback"; "cursor" ];
+  check "inn_stats" [ "lookback" ]
+
+let test_window_arguments_reach_http () =
+  (* win-2olw and ret-eeb1: the tool arguments become query parameters. *)
+  let paths = ref [] in
+  let stats_body =
+    {|{"spans":1,"logs":2,"retention":{"tracesTtlHours":48,"lastPrune":null}}|}
+  in
+  let request path =
+    paths := path :: !paths;
+    if contains path "/stats" then Ok (200, stats_body) else Ok (200, "{}")
+  in
+  let tool_call =
+    Mcp.tool_call ~request ~status:(fun () -> `Assoc [])
+      ~base_url:"http://127.0.0.1:27687"
+  in
+  let call name args =
+    match tool_call name args with
+    | Ok _ -> ()
+    | Error message -> Alcotest.failf "%s: %s" name message
+  in
+  call "inn_search_logs"
+    (`Assoc
+      [
+        ("lookback", `String "15m");
+        ("cursor", `String "abc-def");
+        ("limit", `Int 5);
+      ]);
+  call "inn_services" (`Assoc [ ("lookback", `String "2h") ]);
+  let stats_text =
+    match tool_call "inn_stats" (`Assoc [ ("lookback", `String "1h") ]) with
+    | Ok text -> text
+    | Error message -> Alcotest.fail message
+  in
+  Alcotest.(check bool)
+    "inn_stats returns the retention section (ret-eeb1)" true
+    (contains stats_text "retention");
+  call "inn_search_ai_calls"
+    (`Assoc [ ("lookback", `String "all"); ("cursor", `String "xyz") ]);
+  let paths = List.rev !paths in
+  let check_contains index fragment =
+    match List.nth_opt paths index with
+    | None -> Alcotest.failf "call %d did not reach HTTP" index
+    | Some path ->
+        Alcotest.(check bool)
+          (Printf.sprintf "call %d carries %s (win-2olw)" index fragment) true
+          (contains path fragment)
+  in
+  check_contains 0 "lookback=15m";
+  check_contains 0 "cursor=abc-def";
+  check_contains 0 "limit=5";
+  check_contains 0 "/logs/search";
+  check_contains 1 "/services?lookback=2h";
+  (* inn_stats proxies GET /stats, so the retention section is reachable from
+     MCP (ret-eeb1). *)
+  Alcotest.(check (option string))
+    "inn_stats proxies /stats (ret-eeb1)" (Some "/stats?lookback=1h")
+    (List.nth_opt paths 2);
+  check_contains 3 "lookback=all";
+  check_contains 3 "cursor=xyz";
+  check_contains 3 "/ai/calls"
 
 let test_down_server () =
   (* mcp-j7lb: connection errors stay tool results, not protocol errors. *)
@@ -137,6 +250,10 @@ let () =
           Alcotest.test_case "mcp-592g mcp-zxs5 version negotiation" `Quick
             test_versions;
           Alcotest.test_case "mcp-gurs tools catalogue" `Quick test_catalogue;
+          Alcotest.test_case "window arguments in schemas (win-2olw)" `Quick
+            test_window_arguments_in_schemas;
+          Alcotest.test_case "window arguments reach HTTP (win-2olw, ret-eeb1)"
+            `Quick test_window_arguments_reach_http;
           Alcotest.test_case "mcp-j7lb server down" `Quick test_down_server;
           Alcotest.test_case "mcp-i9qo mcp-v9fl errors notifications" `Quick
             test_protocol_errors;

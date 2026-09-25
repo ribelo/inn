@@ -36,6 +36,15 @@ let mcp_string_property description =
 let mcp_int_property description =
   `Assoc [ ("type", `String "integer"); ("description", `String description) ]
 
+let mcp_lookback_property =
+  mcp_string_property
+    "Relative time window: Nm, Nh, Nd, or all. Lists default to 1h; stats, \
+     facets, and services default to all."
+
+let mcp_cursor_property =
+  mcp_string_property
+    "Opaque nextCursor value from a previous list response."
+
 let mcp_attributes_property =
   `Assoc
     [
@@ -65,7 +74,9 @@ let mcp_tool ?required name description properties =
 let mcp_tools =
   [
     mcp_tool "inn_status" "Check configured Inn daemon/server status." [];
-    mcp_tool "inn_services" "List services that have emitted telemetry." [];
+    mcp_tool "inn_services"
+      "List services that have emitted telemetry."
+      [ ("lookback", mcp_lookback_property) ];
     mcp_tool "inn_search_traces"
       "Search trace summaries by service, operation, status, and attributes."
       [
@@ -73,6 +84,8 @@ let mcp_tools =
         ("operation", mcp_string_property "Span operation name");
         ("status", mcp_string_property "ok or error");
         ("attributes", mcp_attributes_property);
+        ("lookback", mcp_lookback_property);
+        ("cursor", mcp_cursor_property);
         ("limit", mcp_int_property "Maximum number of traces");
       ];
     mcp_tool ~required:[ "traceId" ] "inn_get_trace"
@@ -80,10 +93,20 @@ let mcp_tools =
       [ ("traceId", mcp_string_property "32-character trace id") ];
     mcp_tool ~required:[ "traceId" ] "inn_get_trace_spans"
       "Fetch spans for one trace."
-      [ ("traceId", mcp_string_property "32-character trace id") ];
+      [
+        ("traceId", mcp_string_property "32-character trace id");
+        ("lookback", mcp_lookback_property);
+        ("cursor", mcp_cursor_property);
+        ("limit", mcp_int_property "Maximum number of spans");
+      ];
     mcp_tool ~required:[ "traceId" ] "inn_get_trace_logs"
       "Fetch logs correlated with one trace."
-      [ ("traceId", mcp_string_property "32-character trace id") ];
+      [
+        ("traceId", mcp_string_property "32-character trace id");
+        ("lookback", mcp_lookback_property);
+        ("cursor", mcp_cursor_property);
+        ("limit", mcp_int_property "Maximum number of logs");
+      ];
     mcp_tool "inn_search_spans"
       "Search spans by service, trace id, operation, parent operation, status, \
        and attributes."
@@ -94,13 +117,20 @@ let mcp_tools =
         ("parentOperation", mcp_string_property "Parent span operation name");
         ("status", mcp_string_property "ok or error");
         ("attributes", mcp_attributes_property);
+        ("lookback", mcp_lookback_property);
+        ("cursor", mcp_cursor_property);
         ("limit", mcp_int_property "Maximum number of spans");
       ];
     mcp_tool ~required:[ "spanId" ] "inn_get_span" "Fetch one span by span id."
       [ ("spanId", mcp_string_property "16-character span id") ];
     mcp_tool ~required:[ "spanId" ] "inn_get_span_logs"
       "Fetch logs correlated with one span."
-      [ ("spanId", mcp_string_property "16-character span id") ];
+      [
+        ("spanId", mcp_string_property "16-character span id");
+        ("lookback", mcp_lookback_property);
+        ("cursor", mcp_cursor_property);
+        ("limit", mcp_int_property "Maximum number of logs");
+      ];
     mcp_tool "inn_search_logs"
       "Search logs by service, severity, trace/span correlation, body \
        substring, and attributes."
@@ -111,6 +141,8 @@ let mcp_tools =
         ("spanId", mcp_string_property "Span id");
         ("body", mcp_string_property "Body substring");
         ("attributes", mcp_attributes_property);
+        ("lookback", mcp_lookback_property);
+        ("cursor", mcp_cursor_property);
         ("limit", mcp_int_property "Maximum number of logs");
       ];
     mcp_tool ~required:[ "groupBy"; "agg" ] "inn_trace_stats"
@@ -125,6 +157,7 @@ let mcp_tools =
         ("operation", mcp_string_property "Span operation name");
         ("status", mcp_string_property "ok or error");
         ("attributes", mcp_attributes_property);
+        ("lookback", mcp_lookback_property);
         ("limit", mcp_int_property "Maximum number of rows");
       ];
     mcp_tool ~required:[ "groupBy" ] "inn_log_stats"
@@ -138,6 +171,7 @@ let mcp_tools =
         ("spanId", mcp_string_property "Span id");
         ("body", mcp_string_property "Body substring");
         ("attributes", mcp_attributes_property);
+        ("lookback", mcp_lookback_property);
         ("limit", mcp_int_property "Maximum number of rows");
       ];
     mcp_tool ~required:[ "type"; "field" ] "inn_facets"
@@ -150,6 +184,7 @@ let mcp_tools =
              attribute_values" );
         ("key", mcp_string_property "Attribute key for attribute_values");
         ("service", mcp_string_property "OTel service.name");
+        ("lookback", mcp_lookback_property);
         ("limit", mcp_int_property "Maximum number of values");
       ];
     mcp_tool "inn_search_ai_calls"
@@ -166,6 +201,8 @@ let mcp_tools =
         ("status", mcp_string_property "ok or error");
         ( "text",
           mcp_string_property "Text contained in AI span attributes/events" );
+        ("lookback", mcp_lookback_property);
+        ("cursor", mcp_cursor_property);
         ("limit", mcp_int_property "Maximum number of calls");
       ];
     mcp_tool ~required:[ "spanId" ] "inn_get_ai_call"
@@ -192,14 +229,21 @@ let mcp_tools =
         ("status", mcp_string_property "ok or error");
         ( "text",
           mcp_string_property "Text contained in AI span attributes/events" );
+        ("lookback", mcp_lookback_property);
         ("limit", mcp_int_property "Maximum number of rows");
       ];
     mcp_tool "inn_metrics" "List recent metric points."
       [
         ("service", mcp_string_property "OTel service.name");
         ("name", mcp_string_property "Metric name");
+        ("lookback", mcp_lookback_property);
+        ("cursor", mcp_cursor_property);
         ("limit", mcp_int_property "Maximum number of metric points");
       ];
+    mcp_tool "inn_stats"
+      "Fetch store row counts and the retention section, including the last \
+       prune report."
+      [ ("lookback", mcp_lookback_property) ];
     mcp_tool "inn_endpoints" "Fetch Inn endpoint inventory." [];
     mcp_tool "inn_instructions" "Fetch OTLP setup instructions." [];
     mcp_tool "inn_openapi" "Fetch Inn OpenAPI JSON." [];
@@ -260,7 +304,10 @@ let http_tool ~request ~base_url path =
 let tool_call ~request ~status ~base_url name args =
   match name with
   | "inn_status" -> Ok (Yojson.Safe.pretty_to_string (status ()))
-  | "inn_services" -> http_tool ~request ~base_url "/services"
+  | "inn_services" ->
+      http_tool ~request ~base_url
+        ("/services"
+        ^ query [ optional_arg "lookback" "lookback" args ])
   | "inn_search_traces" ->
       http_tool ~request ~base_url
         ("/traces/search"
@@ -269,6 +316,8 @@ let tool_call ~request ~status ~base_url name args =
                optional_arg "service" "service" args;
                optional_arg "operation" "operation" args;
                optional_arg "status" "status" args;
+               optional_arg "lookback" "lookback" args;
+               optional_arg "cursor" "cursor" args;
                ("limit", json_limit_arg args);
              ]
             @ json_attributes_arg args))
@@ -281,13 +330,25 @@ let tool_call ~request ~status ~base_url name args =
       match json_required_string "traceId" args with
       | Ok trace_id ->
           http_tool ~request ~base_url
-            ("/traces/" ^ percent_encode trace_id ^ "/spans")
+            ("/traces/" ^ percent_encode trace_id ^ "/spans"
+            ^ query
+                [
+                  optional_arg "lookback" "lookback" args;
+                  optional_arg "cursor" "cursor" args;
+                  ("limit", json_limit_arg args);
+                ])
       | Error message -> Error message)
   | "inn_get_trace_logs" -> (
       match json_required_string "traceId" args with
       | Ok trace_id ->
           http_tool ~request ~base_url
-            ("/traces/" ^ percent_encode trace_id ^ "/logs")
+            ("/traces/" ^ percent_encode trace_id ^ "/logs"
+            ^ query
+                [
+                  optional_arg "lookback" "lookback" args;
+                  optional_arg "cursor" "cursor" args;
+                  ("limit", json_limit_arg args);
+                ])
       | Error message -> Error message)
   | "inn_search_spans" ->
       http_tool ~request ~base_url
@@ -299,6 +360,8 @@ let tool_call ~request ~status ~base_url name args =
                optional_arg "operation" "operation" args;
                optional_arg "parentOperation" "parentOperation" args;
                optional_arg "status" "status" args;
+               optional_arg "lookback" "lookback" args;
+               optional_arg "cursor" "cursor" args;
                ("limit", json_limit_arg args);
              ]
             @ json_attributes_arg args))
@@ -311,7 +374,13 @@ let tool_call ~request ~status ~base_url name args =
       match json_required_string "spanId" args with
       | Ok span_id ->
           http_tool ~request ~base_url
-            ("/spans/" ^ percent_encode span_id ^ "/logs")
+            ("/spans/" ^ percent_encode span_id ^ "/logs"
+            ^ query
+                [
+                  optional_arg "lookback" "lookback" args;
+                  optional_arg "cursor" "cursor" args;
+                  ("limit", json_limit_arg args);
+                ])
       | Error message -> Error message)
   | "inn_search_logs" ->
       http_tool ~request ~base_url
@@ -323,6 +392,8 @@ let tool_call ~request ~status ~base_url name args =
                optional_arg "traceId" "traceId" args;
                optional_arg "spanId" "spanId" args;
                optional_arg "body" "body" args;
+               optional_arg "lookback" "lookback" args;
+               optional_arg "cursor" "cursor" args;
                ("limit", json_limit_arg args);
              ]
             @ json_attributes_arg args))
@@ -340,6 +411,7 @@ let tool_call ~request ~status ~base_url name args =
                    optional_arg "service" "service" args;
                    optional_arg "operation" "operation" args;
                    optional_arg "status" "status" args;
+                   optional_arg "lookback" "lookback" args;
                    ("limit", json_limit_arg ~default:20 args);
                  ]
                 @ json_attributes_arg args))
@@ -358,6 +430,7 @@ let tool_call ~request ~status ~base_url name args =
                    optional_arg "traceId" "traceId" args;
                    optional_arg "spanId" "spanId" args;
                    optional_arg "body" "body" args;
+                   optional_arg "lookback" "lookback" args;
                    ("limit", json_limit_arg ~default:20 args);
                  ]
                 @ json_attributes_arg args))
@@ -375,6 +448,7 @@ let tool_call ~request ~status ~base_url name args =
                   ("field", Some field);
                   optional_arg "key" "key" args;
                   optional_arg "service" "service" args;
+                  optional_arg "lookback" "lookback" args;
                   ("limit", json_limit_arg ~default:20 args);
                 ])
       | Error message, _ | _, Error message -> Error message)
@@ -392,6 +466,8 @@ let tool_call ~request ~status ~base_url name args =
               optional_arg "operation" "operation" args;
               optional_arg "status" "status" args;
               optional_arg "text" "text" args;
+              optional_arg "lookback" "lookback" args;
+              optional_arg "cursor" "cursor" args;
               ("limit", json_limit_arg args);
             ])
   | "inn_get_ai_call" -> (
@@ -419,6 +495,7 @@ let tool_call ~request ~status ~base_url name args =
                   optional_arg "operation" "operation" args;
                   optional_arg "status" "status" args;
                   optional_arg "text" "text" args;
+                  optional_arg "lookback" "lookback" args;
                   ("limit", json_limit_arg ~default:20 args);
                 ])
       | Error message, _ | _, Error message -> Error message)
@@ -429,8 +506,13 @@ let tool_call ~request ~status ~base_url name args =
             [
               optional_arg "service" "service" args;
               optional_arg "name" "name" args;
+              optional_arg "lookback" "lookback" args;
+              optional_arg "cursor" "cursor" args;
               ("limit", json_limit_arg args);
             ])
+  | "inn_stats" ->
+      http_tool ~request ~base_url
+        ("/stats" ^ query [ optional_arg "lookback" "lookback" args ])
   | "inn_endpoints" -> http_tool ~request ~base_url "/endpoints"
   | "inn_instructions" -> http_tool ~request ~base_url "/instructions"
   | "inn_openapi" -> http_tool ~request ~base_url "/openapi.json"

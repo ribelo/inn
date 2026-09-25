@@ -76,25 +76,25 @@ let endpoint_inventory =
     endpoint "POST" "/v1/traces" "OTLP/HTTP JSON trace ingest";
     endpoint "POST" "/v1/logs" "OTLP/HTTP JSON log ingest";
     endpoint "POST" "/v1/metrics" "OTLP/HTTP JSON metric ingest";
-    endpoint "GET" "/services" "services that have emitted telemetry";
-    endpoint "GET" "/traces" "recent trace summaries";
-    endpoint "GET" "/traces/search" "search trace summaries by span filters";
-    endpoint "GET" "/traces/stats" "aggregate trace statistics";
+    endpoint "GET" "/services" "services that have emitted telemetry, optionally in a lookback window";
+    endpoint "GET" "/traces" "recent trace summaries with lookback, limit, and cursor";
+    endpoint "GET" "/traces/search" "search trace summaries by span filters with lookback, limit, and cursor";
+    endpoint "GET" "/traces/stats" "aggregate trace statistics over a lookback window";
     endpoint "GET" "/traces/{traceId}" "full trace with spans and logs";
-    endpoint "GET" "/traces/{traceId}/spans" "spans for one trace";
-    endpoint "GET" "/traces/{traceId}/logs" "logs correlated with one trace";
-    endpoint "GET" "/spans/search" "search spans";
+    endpoint "GET" "/traces/{traceId}/spans" "spans for one trace with lookback, limit, and cursor";
+    endpoint "GET" "/traces/{traceId}/logs" "logs correlated with one trace with lookback, limit, and cursor";
+    endpoint "GET" "/spans/search" "search spans with lookback, limit, and cursor";
     endpoint "GET" "/spans/{spanId}" "single span";
-    endpoint "GET" "/spans/{spanId}/logs" "logs correlated with one span";
-    endpoint "GET" "/logs" "recent logs";
-    endpoint "GET" "/logs/search" "search logs";
-    endpoint "GET" "/logs/stats" "aggregate log counts";
-    endpoint "GET" "/ai/calls" "search spans that represent AI calls";
+    endpoint "GET" "/spans/{spanId}/logs" "logs correlated with one span with lookback, limit, and cursor";
+    endpoint "GET" "/logs" "recent logs with lookback, limit, and cursor";
+    endpoint "GET" "/logs/search" "search logs with lookback, limit, and cursor";
+    endpoint "GET" "/logs/stats" "aggregate log counts over a lookback window";
+    endpoint "GET" "/ai/calls" "search spans that represent AI calls with lookback, limit, and cursor";
     endpoint "GET" "/ai/calls/{spanId}" "AI call detail with correlated logs";
-    endpoint "GET" "/ai/stats" "aggregate AI call statistics";
-    endpoint "GET" "/metrics" "recent metric points";
-    endpoint "GET" "/facets" "discover trace and log facet values";
-    endpoint "GET" "/stats" "store row counts";
+    endpoint "GET" "/ai/stats" "aggregate AI call statistics over a lookback window";
+    endpoint "GET" "/metrics" "recent metric points with lookback, limit, and cursor";
+    endpoint "GET" "/facets" "discover trace and log facet values over a lookback window";
+    endpoint "GET" "/stats" "store row counts over a lookback window";
     endpoint "GET" "/instructions" "copy-paste OTLP setup instructions";
     endpoint "GET" "/endpoints" "machine-readable endpoint inventory";
     endpoint "GET" "/openapi.json" "OpenAPI description";
@@ -260,14 +260,6 @@ let attr_filters params =
       else None)
     params
 
-let parse_limit ?(default = 100) params =
-  match param "limit" params with
-  | None -> Ok default
-  | Some value -> (
-      match int_of_string_opt value with
-      | Some limit when limit > 0 && limit <= 10_000 -> Ok limit
-      | _ -> Error "limit must be an integer between 1 and 10000")
-
 let valid_trace_agg = function
   | "count" | "avg_duration" | "p95_duration" | "error_rate" -> true
   | _ -> false
@@ -280,6 +272,35 @@ let valid_ai_agg = function
 
 let json_list name encode values =
   `Assoc [ (name, `List (List.map encode values)) ]
+
+let rec take count values =
+  if count <= 0 then []
+  else
+    match values with
+    | [] -> []
+    | value :: rest -> value :: take (count - 1) rest
+
+(* A list or search response keeps its named collection key and adds the
+   sibling meta object; [nextCursor] is present only when another page exists
+   (win-fl8w, win-7xet). *)
+let page_json name encode (policy : List_policy.request) (page : _ Store.page) =
+  let returned = List.length page.items in
+  `Assoc
+    [
+      (name, `List (List.map encode page.items));
+      ( "meta",
+        List_policy.meta_json policy ~returned
+          ~truncated:(Option.is_some page.next) ~next:page.next );
+    ]
+
+let summary_json name encode (policy : List_policy.request) values =
+  `Assoc
+    [
+      (name, `List (List.map encode values));
+      ( "meta",
+        List_policy.stats_meta ~lookback:policy.List_policy.lookback
+          ~limit:policy.limit );
+    ]
 
 let ingest req rejected_field decode ingest =
   let open Eta.Syntax in
@@ -301,20 +322,35 @@ let ingest req rejected_field decode ingest =
           | Error message -> Eta.Effect.pure (otlp_error 400 3 message)
           | Ok decoded -> store_accepted rejected_field decoded (ingest decoded.items)
 
-let services store _req =
-  store_json (Store.list_services store) (fun services ->
-      json_list "services" (fun service -> `String service) services)
+let services store req =
+  with_query req @@ fun params ->
+  match List_policy.resolve_lookback ~now_ms:(Store.now_ms store) params with
+  | Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Ok (window, lookback) ->
+      store_json (Store.list_services ~window store) (fun services ->
+          `Assoc
+            [
+              ("services", `List (List.map (fun service -> `String service) services));
+              ( "meta",
+                List_policy.services_meta ~lookback
+                  ~returned:(List.length services) );
+            ])
 
 let traces store req =
   with_query req @@ fun params ->
-  match parse_limit params with
+  match
+    List_policy.list_request ~kind:List_policy.Trace
+      ~now_ms:(Store.now_ms store) params
+  with
   | Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Ok limit ->
+  | Ok policy ->
       store_json
-        (Store.list_trace_summaries ?service:(param "service" params) ~limit
-           store)
-        (json_list "traces" Model.trace_summary_to_json)
+        (Store.list_trace_summaries ?service:(param "service" params)
+           ~window:policy.List_policy.window ?cursor:policy.cursor
+           ~limit:policy.limit store)
+        (page_json "traces" Model.trace_summary_to_json policy)
 
 let trace store trace_id _req =
   let open Eta.Syntax in
@@ -345,17 +381,47 @@ let span store span_id _req =
       Eta.Effect.pure (error_response 404 "span_not_found" "span was not found")
   | Ok (Some span) -> Eta.Effect.pure (json_response (Model.span_to_json span))
 
-let trace_spans store trace_id _req =
-  store_json (Store.list_trace_spans store trace_id)
-    (json_list "spans" Model.span_to_json)
+let trace_spans store trace_id req =
+  with_query req @@ fun params ->
+  match
+    List_policy.list_request ~kind:List_policy.Span
+      ~now_ms:(Store.now_ms store) params
+  with
+  | Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Ok policy ->
+      store_json
+        (Store.list_trace_spans store ~window:policy.List_policy.window
+           ?cursor:policy.cursor ~limit:policy.limit trace_id)
+        (page_json "spans" Model.span_to_json policy)
 
-let trace_logs store trace_id _req =
-  store_json (Store.list_trace_logs store trace_id)
-    (json_list "logs" Model.log_to_json)
+let trace_logs store trace_id req =
+  with_query req @@ fun params ->
+  match
+    List_policy.list_request ~kind:List_policy.Log
+      ~now_ms:(Store.now_ms store) params
+  with
+  | Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Ok policy ->
+      store_json
+        (Store.list_trace_logs store ~window:policy.List_policy.window
+           ?cursor:policy.cursor ~limit:policy.limit trace_id)
+        (page_json "logs" Model.log_to_json policy)
 
-let span_logs store span_id _req =
-  store_json (Store.list_span_logs store span_id)
-    (json_list "logs" Model.log_to_json)
+let span_logs store span_id req =
+  with_query req @@ fun params ->
+  match
+    List_policy.list_request ~kind:List_policy.Log
+      ~now_ms:(Store.now_ms store) params
+  with
+  | Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Ok policy ->
+      store_json
+        (Store.list_span_logs store ~window:policy.List_policy.window
+           ?cursor:policy.cursor ~limit:policy.limit span_id)
+        (page_json "logs" Model.log_to_json policy)
 
 let has_prefix prefix text = String.starts_with ~prefix text
 
@@ -519,51 +585,71 @@ let ai_call_to_json (span : Model.span) =
     @ optional_int "inputTokens" (ai_input_tokens attrs)
     @ optional_int "outputTokens" (ai_output_tokens attrs))
 
-let select_ai_spans store params =
-  match parse_limit params with
-  | Error message -> Error message
-  | Ok limit ->
-      let filter =
-        {
-          Store.service = param "service" params;
-          trace_id = param "traceId" params;
-          operation = param "operation" params;
-          parent_operation = None;
-          status = param "status" params;
-          attrs = attr_filters params;
-          limit = 10_000;
-        }
-      in
-      Ok (limit, Store.search_spans filter store)
+let ai_span_filter policy params cursor limit =
+  {
+    Store.service = param "service" params;
+    trace_id = param "traceId" params;
+    operation = param "operation" params;
+    parent_operation = None;
+    status = param "status" params;
+    attrs = attr_filters params;
+    window = policy.List_policy.window;
+    cursor;
+    limit;
+  }
 
+(* The AI-call test runs in memory, so walk raw span pages until the page is
+   full or the raw result set is exhausted. The cursor is the position of the
+   last returned AI call, so pages repeat nothing and skip nothing even when
+   new spans arrive between requests (win-5hgv, win-edze). *)
 let ai_calls store req =
   with_query req @@ fun params ->
-  match select_ai_spans store params with
+  match
+    List_policy.list_request ~kind:List_policy.Ai_call
+      ~now_ms:(Store.now_ms store) params
+  with
   | Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Ok (limit, eff) ->
+  | Ok policy ->
       let open Eta.Syntax in
-      let* result = Eta.Effect.fold ~ok:(fun value -> Ok value) ~error:(fun error -> Error error) eff in
+      let batch = max (policy.List_policy.limit + 1) 1000 in
+      let rec collect position acc =
+        let* page = Store.search_spans (ai_span_filter policy params position batch) store in
+        let matched =
+          page.Store.items
+          |> List.filter is_ai_span
+          |> List.filter (ai_call_matches params)
+        in
+        let acc = acc @ matched in
+        if List.length acc > policy.List_policy.limit then
+          let items = take policy.limit acc in
+          Eta.Effect.pure
+            (items, Some (Store.span_position (List.nth items (policy.limit - 1))))
+        else
+          match page.next with
+          | None -> Eta.Effect.pure (acc, None)
+          | Some next -> collect (Some next) acc
+      in
+      let* result =
+        Eta.Effect.fold ~ok:(fun value -> Ok value)
+          ~error:(fun error -> Error error)
+          (collect policy.cursor [])
+      in
       (match result with
       | Error error ->
           Eta.Effect.pure
             (error_response 500 "store_error" (store_error_message error))
-      | Ok spans ->
-          let calls =
-            spans
-            |> List.filter is_ai_span
-            |> List.filter (ai_call_matches params)
-            |> List.sort (fun (left : Model.span) (right : Model.span) ->
-                   compare right.Model.start_time_ns left.Model.start_time_ns)
-            |> fun spans ->
-            let rec take acc count = function
-              | _ when count <= 0 -> List.rev acc
-              | [] -> List.rev acc
-              | item :: rest -> take (item :: acc) (count - 1) rest
-            in
-            take [] limit spans
-          in
-          Eta.Effect.pure (json_response (json_list "calls" ai_call_to_json calls)))
+      | Ok (calls, next) ->
+          let returned = List.length calls in
+          Eta.Effect.pure
+            (json_response
+               (`Assoc
+                 [
+                   ("calls", `List (List.map ai_call_to_json calls));
+                   ( "meta",
+                     List_policy.meta_json policy ~returned
+                       ~truncated:(Option.is_some next) ~next );
+                 ])))
 
 let ai_call store span_id _req =
   let open Eta.Syntax in
@@ -585,7 +671,8 @@ let ai_call store span_id _req =
       let* logs_result = Eta.Effect.fold
           ~ok:(fun value -> Ok value)
           ~error:(fun error -> Error error)
-          (Store.list_span_logs store span.span_id) in
+          (Store.list_span_logs store ~window:Model.window_all ~limit:10_000
+             span.span_id) in
       (match logs_result with
       | Error error ->
           Eta.Effect.pure
@@ -597,13 +684,16 @@ let ai_call store span_id _req =
                  [
                    ("call", ai_call_to_json span);
                    ("span", Model.span_to_json span);
-                   ("logs", `List (List.map Model.log_to_json logs));
+                   ( "logs",
+                     `List (List.map Model.log_to_json logs.Store.items) );
                  ])))
 
 let ai_stats store req =
   with_query req @@ fun params ->
   match
-    (param "groupBy" params, param "agg" params, parse_limit ~default:20 params)
+    ( param "groupBy" params,
+      param "agg" params,
+      List_policy.summary_request ~now_ms:(Store.now_ms store) params )
   with
   | None, _, _ ->
       Eta.Effect.pure
@@ -612,22 +702,23 @@ let ai_stats store req =
       Eta.Effect.pure (error_response 400 "invalid_query" "agg is required")
   | _, _, Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Some _group_by, Some agg, Ok _limit when not (valid_ai_agg agg) ->
+  | Some _group_by, Some agg, Ok _policy when not (valid_ai_agg agg) ->
       Eta.Effect.pure
         (error_response 400 "invalid_query"
            "agg must be count, avg_duration, p95_duration, total_input_tokens, or total_output_tokens")
-  | Some group_by, Some agg, Ok limit -> (
-      match select_ai_spans store params with
-      | Error message ->
-          Eta.Effect.pure (error_response 400 "invalid_query" message)
-      | Ok (_, eff) ->
-          let open Eta.Syntax in
-          let* result = Eta.Effect.fold ~ok:(fun value -> Ok value) ~error:(fun error -> Error error) eff in
-          (match result with
+  | Some group_by, Some agg, Ok policy -> (
+      let open Eta.Syntax in
+      let* result =
+        Eta.Effect.fold ~ok:(fun value -> Ok value)
+          ~error:(fun error -> Error error)
+          (Store.search_spans (ai_span_filter policy params None 10_000) store)
+      in
+      (match result with
                   | Error error ->
                       Eta.Effect.pure
                         (error_response 500 "store_error" (store_error_message error))
-                  | Ok spans ->
+                  | Ok page ->
+                      let spans = page.Store.items in
                       let groups = Hashtbl.create 16 in
                       let bucket group span =
                         let count, total, durations, input_tokens, output_tokens =
@@ -705,21 +796,26 @@ let ai_stats store req =
                                in
                                Float.compare (value right) (value left))
                       in
-                      let rec take acc count = function
-                        | _ when count <= 0 -> List.rev acc
-                        | [] -> List.rev acc
-                        | item :: rest -> take (item :: acc) (count - 1) rest
-                      in
                       Eta.Effect.pure
                         (json_response
-                           (`Assoc [ ("stats", `List (take [] limit rows)) ]))))
+                           (`Assoc
+                             [
+                               ("stats", `List (take policy.List_policy.limit rows));
+                               ( "meta",
+                                 List_policy.stats_meta
+                                   ~lookback:policy.List_policy.lookback
+                                   ~limit:policy.limit );
+                             ]))))
 
 let search_spans store req =
   with_query req @@ fun params ->
-  match parse_limit params with
+  match
+    List_policy.list_request ~kind:List_policy.Span
+      ~now_ms:(Store.now_ms store) params
+  with
   | Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Ok limit ->
+  | Ok policy ->
       let filter =
         {
           Store.service = param "service" params;
@@ -728,33 +824,44 @@ let search_spans store req =
           parent_operation = param "parentOperation" params;
           status = param "status" params;
           attrs = attr_filters params;
-          limit;
+          window = policy.List_policy.window;
+          cursor = policy.cursor;
+          limit = policy.limit;
         }
       in
       store_json (Store.search_spans filter store)
-        (json_list "spans" Model.span_to_json)
+        (page_json "spans" Model.span_to_json policy)
 
 let search_traces store req =
   with_query req @@ fun params ->
-  match parse_limit params with
+  match
+    List_policy.list_request ~kind:List_policy.Trace
+      ~now_ms:(Store.now_ms store) params
+  with
   | Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Ok limit ->
+  | Ok policy ->
       let filter =
         {
           Store.service = param "service" params;
           operation = param "operation" params;
           status = param "status" params;
           attrs = attr_filters params;
-          limit;
+          window = policy.List_policy.window;
+          cursor = policy.cursor;
+          limit = policy.limit;
         }
       in
       store_json (Store.search_traces filter store)
-        (json_list "traces" Model.trace_summary_to_json)
+        (page_json "traces" Model.trace_summary_to_json policy)
 
 let trace_stats store req =
   with_query req @@ fun params ->
-  match (param "groupBy" params, param "agg" params, parse_limit ~default:20 params) with
+  match
+    ( param "groupBy" params,
+      param "agg" params,
+      List_policy.summary_request ~now_ms:(Store.now_ms store) params )
+  with
   | None, _, _ ->
       Eta.Effect.pure
         (error_response 400 "invalid_query" "groupBy is required")
@@ -762,7 +869,7 @@ let trace_stats store req =
       Eta.Effect.pure (error_response 400 "invalid_query" "agg is required")
   | _, _, Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Some group_by, Some agg, Ok limit when valid_trace_agg agg ->
+  | Some group_by, Some agg, Ok policy when valid_trace_agg agg ->
       let filter =
         {
           Store.group_by;
@@ -771,11 +878,12 @@ let trace_stats store req =
           operation = param "operation" params;
           status = param "status" params;
           attrs = attr_filters params;
-          limit;
+          window = policy.List_policy.window;
+          limit = policy.limit;
         }
       in
       store_json (Store.trace_stats filter store)
-        (json_list "stats" Model.stat_item_to_json)
+        (summary_json "stats" Model.stat_item_to_json policy)
   | _, Some _, Ok _ ->
       Eta.Effect.pure
         (error_response 400 "invalid_query"
@@ -783,27 +891,35 @@ let trace_stats store req =
 
 let logs store req =
   with_query req @@ fun params ->
-  match parse_limit params with
+  match
+    List_policy.list_request ~kind:List_policy.Log
+      ~now_ms:(Store.now_ms store) params
+  with
   | Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Ok limit ->
+  | Ok policy ->
       let filter =
         {
           Store.service = param "service" params;
           severity = param "severity" params;
           contains = param "contains" params;
-          limit;
+          window = policy.List_policy.window;
+          cursor = policy.cursor;
+          limit = policy.limit;
         }
       in
       store_json (Store.list_logs filter store)
-        (json_list "logs" Model.log_to_json)
+        (page_json "logs" Model.log_to_json policy)
 
 let search_logs store req =
   with_query req @@ fun params ->
-  match parse_limit params with
+  match
+    List_policy.list_request ~kind:List_policy.Log
+      ~now_ms:(Store.now_ms store) params
+  with
   | Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Ok limit ->
+  | Ok policy ->
       let body =
         match param "body" params with
         | Some _ as value -> value
@@ -817,15 +933,21 @@ let search_logs store req =
           severity = param "severity" params;
           body;
           attrs = attr_filters params;
-          limit;
+          window = policy.List_policy.window;
+          cursor = policy.cursor;
+          limit = policy.limit;
         }
       in
       store_json (Store.search_logs filter store)
-        (json_list "logs" Model.log_to_json)
+        (page_json "logs" Model.log_to_json policy)
 
 let log_stats store req =
   with_query req @@ fun params ->
-  match (param "groupBy" params, param "agg" params, parse_limit ~default:20 params) with
+  match
+    ( param "groupBy" params,
+      param "agg" params,
+      List_policy.summary_request ~now_ms:(Store.now_ms store) params )
+  with
   | None, _, _ ->
       Eta.Effect.pure
         (error_response 400 "invalid_query" "groupBy is required")
@@ -834,7 +956,7 @@ let log_stats store req =
         (error_response 400 "invalid_query" "agg must be count")
   | _, _, Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Some group_by, _, Ok limit ->
+  | Some group_by, _, Ok policy ->
       let body =
         match param "body" params with
         | Some _ as value -> value
@@ -849,15 +971,20 @@ let log_stats store req =
           severity = param "severity" params;
           body;
           attrs = attr_filters params;
-          limit;
+          window = policy.List_policy.window;
+          limit = policy.limit;
         }
       in
       store_json (Store.log_stats filter store)
-        (json_list "stats" Model.stat_item_to_json)
+        (summary_json "stats" Model.stat_item_to_json policy)
 
 let facets store req =
   with_query req @@ fun params ->
-  match (param "type" params, param "field" params, parse_limit ~default:20 params) with
+  match
+    ( param "type" params,
+      param "field" params,
+      List_policy.summary_request ~now_ms:(Store.now_ms store) params )
+  with
   | None, _, _ ->
       Eta.Effect.pure
         (error_response 400 "invalid_query" "type is required")
@@ -865,7 +992,7 @@ let facets store req =
       Eta.Effect.pure (error_response 400 "invalid_query" "field is required")
   | _, _, Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Some kind, Some field, Ok limit
+  | Some kind, Some field, Ok policy
     when String.equal kind "traces" || String.equal kind "logs" ->
       let filter =
         {
@@ -873,32 +1000,50 @@ let facets store req =
           field;
           key = param "key" params;
           service = param "service" params;
-          limit;
+          window = policy.List_policy.window;
+          limit = policy.limit;
         }
       in
       store_json (Store.facets filter store)
-        (json_list "facets" Model.facet_item_to_json)
+        (summary_json "facets" Model.facet_item_to_json policy)
   | Some _, Some _, Ok _ ->
       Eta.Effect.pure
         (error_response 400 "invalid_query" "type must be traces or logs")
 
 let metrics store req =
   with_query req @@ fun params ->
-  match parse_limit params with
+  match
+    List_policy.list_request ~kind:List_policy.Metric
+      ~now_ms:(Store.now_ms store) params
+  with
   | Error message ->
       Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Ok limit ->
+  | Ok policy ->
       let filter =
         {
           Store.service = param "service" params;
           name = param "name" params;
-          limit;
+          window = policy.List_policy.window;
+          cursor = policy.cursor;
+          limit = policy.limit;
         }
       in
       store_json (Store.list_metric_points filter store)
-        (json_list "metrics" Model.metric_point_to_json)
+        (page_json "metrics" Model.metric_point_to_json policy)
 
-let stats store _req = store_json (Store.stats store) Model.stats_to_json
+let stats store req =
+  with_query req @@ fun params ->
+  match List_policy.resolve_lookback ~now_ms:(Store.now_ms store) params with
+  | Error message ->
+      Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Ok (window, lookback) ->
+      store_json (Store.stats ~window store) (fun stats ->
+          match Model.stats_to_json stats with
+          | `Assoc fields ->
+              `Assoc
+                (fields
+                @ [ ("meta", List_policy.store_stats_meta ~lookback) ])
+          | json -> json)
 
 let method_not_allowed_handler ~allowed _request =
   method_not_allowed ()

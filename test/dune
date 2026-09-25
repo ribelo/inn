@@ -1,7 +1,13 @@
 (test
  (name test_inn)
  (package inn)
- (libraries inn alcotest eta eta_eio eta_http eta_http_eio eio_main unix))
+ (libraries inn alcotest eta eta_eio eta_http eta_http_eio eio_main unix)
+ ; The suite starts many short-lived Eio runtimes. Each io_uring ring locks
+ ; memory against a per-user cap that this sandbox sets to 8 MiB, so under
+ ; contention with other processes Eio_main.run fails with
+ ; "io_uring_queue_init: ENOMEM" and hides real failures. The posix backend
+ ; is the same Eio API without io_uring, so the tests stay deterministic.
+ (action (setenv EIO_BACKEND posix (run %{test}))))
 
 (test
  (name test_mcp)
@@ -9,4 +15,4 @@
  (libraries inn alcotest yojson))
 
 (cram
- (deps ../bin/main.exe check_mcp.py))
+ (deps ../bin/main.exe check_mcp.py check_cli.py))

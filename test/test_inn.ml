@@ -151,9 +151,16 @@ let test_otlp_decodes_traces_logs_and_metrics () =
   Alcotest.(check string) "metric name" "requests.total" (List.hd metrics).name;
   Alcotest.(check string) "metric value" "3" (List.hd metrics).value
 
+(* [page_items] unwraps a keyset page: store tests assert on the rows, while
+   the pagination tests below assert on the cursor itself. *)
+let page_items (page : 'a Store.page) = page.items
+
+let all_window = Model.window_all
+
 let test_span ?(trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     ?(span_id = "bbbbbbbbbbbbbbbb") ?(parent_span_id = None) ?(service_name = "svc")
-    ?(operation_name = "root") ?(status = "ok") ?(attributes = []) () =
+    ?(operation_name = "root") ?(status = "ok") ?(attributes = [])
+    ?(timestamp_ms = base_time) () =
   {
     Model.trace_id;
     span_id;
@@ -162,8 +169,8 @@ let test_span ?(trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     scope_name = Some "scope";
     operation_name;
     kind = Some Model.Server;
-    start_time_ns = base_time * 1_000_000;
-    end_time_ns = (base_time * 1_000_000) + 1_000_000;
+    start_time_ns = timestamp_ms * 1_000_000;
+    end_time_ns = (timestamp_ms * 1_000_000) + 1_000_000;
     duration_ms = 1.0;
     status = Option.value (Model.span_status_of_string status) ~default:Model.Unset;
     status_message = None;
@@ -176,7 +183,8 @@ let test_span ?(trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 let test_log ?(service_name = "svc") ?(body = "failed") ?(timestamp_ms = base_time)
     ?(attributes = []) ?(resource = [ ("service.name", "svc") ]) () =
   {
-    Model.trace_id = None;
+    Model.id = "";
+    trace_id = None;
     span_id = None;
     service_name;
     scope_name = Some "scope";
@@ -707,16 +715,28 @@ let test_store_ingests_and_queries_all_signals () =
         let* inserted_logs = Store.ingest_logs store logs in
         let* inserted_metrics = Store.ingest_metrics store metrics in
         let* services = Store.list_services store in
-        let* summaries = Store.list_trace_summaries ~service:"svc" store in
+        let* summaries =
+          Store.list_trace_summaries ~service:"svc" ~window:all_window ~limit:100
+            store
+          |> Eta.Effect.map page_items
+        in
         let* trace = Store.get_trace store "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in
         let* span = Store.get_span store "bbbbbbbbbbbbbbbb" in
         let* trace_spans =
-          Store.list_trace_spans store "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          Store.list_trace_spans store ~window:all_window ~limit:100
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          |> Eta.Effect.map page_items
         in
         let* trace_logs =
-          Store.list_trace_logs store "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          Store.list_trace_logs store ~window:all_window ~limit:100
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          |> Eta.Effect.map page_items
         in
-        let* span_logs = Store.list_span_logs store "bbbbbbbbbbbbbbbb" in
+        let* span_logs =
+          Store.list_span_logs store ~window:all_window ~limit:100
+            "bbbbbbbbbbbbbbbb"
+          |> Eta.Effect.map page_items
+        in
         let* searched_spans =
           Store.search_spans
             {
@@ -726,9 +746,12 @@ let test_store_ingests_and_queries_all_signals () =
               parent_operation = None;
               status = Some "error";
               attrs = [ ("route", "/users") ];
+              window = all_window;
+              cursor = None;
               limit = 10;
             }
             store
+          |> Eta.Effect.map page_items
         in
         let* searched_traces =
           Store.search_traces
@@ -737,9 +760,12 @@ let test_store_ingests_and_queries_all_signals () =
               operation = Some "root";
               status = Some "error";
               attrs = [ ("route", "/users") ];
+              window = all_window;
+              cursor = None;
               limit = 10;
             }
             store
+          |> Eta.Effect.map page_items
         in
         let* searched_logs =
           Store.search_logs
@@ -750,9 +776,12 @@ let test_store_ingests_and_queries_all_signals () =
               severity = Some "ERROR";
               body = Some "fail";
               attrs = [ ("route", "/users") ];
+              window = all_window;
+              cursor = None;
               limit = 10;
             }
             store
+          |> Eta.Effect.map page_items
         in
         let* trace_stats =
           Store.trace_stats
@@ -763,6 +792,7 @@ let test_store_ingests_and_queries_all_signals () =
               operation = None;
               status = Some "error";
               attrs = [];
+              window = all_window;
               limit = 10;
             }
             store
@@ -777,6 +807,7 @@ let test_store_ingests_and_queries_all_signals () =
               severity = None;
               body = None;
               attrs = [];
+              window = all_window;
               limit = 10;
             }
             store
@@ -788,6 +819,7 @@ let test_store_ingests_and_queries_all_signals () =
               field = "attribute_keys";
               key = None;
               service = Some "svc";
+              window = all_window;
               limit = 10;
             }
             store
@@ -799,6 +831,7 @@ let test_store_ingests_and_queries_all_signals () =
               field = "severity";
               key = None;
               service = Some "svc";
+              window = all_window;
               limit = 10;
             }
             store
@@ -809,14 +842,24 @@ let test_store_ingests_and_queries_all_signals () =
               service = Some "svc";
               severity = Some "ERROR";
               contains = Some "fail";
+              window = all_window;
+              cursor = None;
               limit = 10;
             }
             store
+          |> Eta.Effect.map page_items
         in
         let* read_metrics =
           Store.list_metric_points
-            { service = Some "svc"; name = Some "requests.total"; limit = 10 }
+            {
+              service = Some "svc";
+              name = Some "requests.total";
+              window = all_window;
+              cursor = None;
+              limit = 10;
+            }
             store
+          |> Eta.Effect.map page_items
         in
         let* stats = Store.stats store in
         Eta.Effect.pure
@@ -1001,9 +1044,12 @@ let test_prune_keeps_trace_with_fresh_span () =
               parent_operation = None;
               status = None;
               attrs = [ ("route", "/gone") ];
+              window = all_window;
+              cursor = None;
               limit = 10;
             }
             store
+          |> Eta.Effect.map page_items
         in
         let* attr_traces =
           Store.search_traces
@@ -1012,9 +1058,12 @@ let test_prune_keeps_trace_with_fresh_span () =
               operation = None;
               status = None;
               attrs = [ ("route", "/gone") ];
+              window = all_window;
+              cursor = None;
               limit = 10;
             }
             store
+          |> Eta.Effect.map page_items
         in
         Eta.Effect.pure (report, stats, kept, gone, attr_spans, attr_traces))
   in
@@ -1117,13 +1166,29 @@ let test_prune_size_cap_removes_only_oldest () =
         let* stats = Store.stats store in
         let* new_left =
           Store.list_logs
-            { service = Some "new"; severity = None; contains = None; limit = 1000 }
+            {
+              service = Some "new";
+              severity = None;
+              contains = None;
+              window = all_window;
+              cursor = None;
+              limit = 1000;
+            }
             store
+          |> Eta.Effect.map page_items
         in
         let* old_left =
           Store.list_logs
-            { service = Some "old"; severity = None; contains = None; limit = 1000 }
+            {
+              service = Some "old";
+              severity = None;
+              contains = None;
+              window = all_window;
+              cursor = None;
+              limit = 1000;
+            }
             store
+          |> Eta.Effect.map page_items
         in
         Eta.Effect.pure (report, second_report, stats, new_left, old_left))
   in
@@ -1234,9 +1299,12 @@ let test_server_handler_ingests_and_queries_services () =
       in
       Alcotest.(check int)
         "services status" 200 (Eta_http.Server.Response.status services);
+      Alcotest.(check int)
+        "services length" 1 (services |> response_json |> json_list_length "services");
       Alcotest.(check string)
-        "services body" "{\"services\":[\"svc\"]}\n"
-        (response_body_string services);
+        "services meta lookback (win-3ghy)" "all"
+        (services |> response_json
+        |> fun json -> Yojson.Safe.Util.(json |> member "meta" |> member "lookback" |> to_string));
       let span =
         run_server_effect
           (Inn.Server.handler config store
@@ -1251,7 +1319,8 @@ let test_server_handler_ingests_and_queries_services () =
         run_server_effect
           (Inn.Server.handler config store
              (request
-                ~target:"/traces/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/spans" ()))
+                ~target:
+                  "/traces/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/spans?lookback=all" ()))
       in
       Alcotest.(check int)
         "trace spans status" 200 (Eta_http.Server.Response.status trace_spans);
@@ -1261,7 +1330,9 @@ let test_server_handler_ingests_and_queries_services () =
       let trace_logs =
         run_server_effect
           (Inn.Server.handler config store
-             (request ~target:"/api/traces/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/logs" ()))
+             (request
+                ~target:
+                  "/api/traces/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/logs?lookback=all" ()))
       in
       Alcotest.(check int)
         "trace logs status" 200 (Eta_http.Server.Response.status trace_logs);
@@ -1271,7 +1342,7 @@ let test_server_handler_ingests_and_queries_services () =
       let span_logs =
         run_server_effect
           (Inn.Server.handler config store
-             (request ~target:"/spans/bbbbbbbbbbbbbbbb/logs" ()))
+             (request ~target:"/spans/bbbbbbbbbbbbbbbb/logs?lookback=all" ()))
       in
       Alcotest.(check int)
         "span logs status" 200 (Eta_http.Server.Response.status span_logs);
@@ -1283,7 +1354,7 @@ let test_server_handler_ingests_and_queries_services () =
           (Inn.Server.handler config store
              (request
                 ~target:
-                  "/spans/search?service=svc&operation=root&status=error&attr.route=%2Fusers"
+                  "/spans/search?service=svc&operation=root&status=error&attr.route=%2Fusers&lookback=all"
                 ()))
       in
       Alcotest.(check int)
@@ -1297,7 +1368,7 @@ let test_server_handler_ingests_and_queries_services () =
           (Inn.Server.handler config store
              (request
                 ~target:
-                  "/traces/search?service=svc&operation=root&status=error&attr.route=%2Fusers"
+                  "/traces/search?service=svc&operation=root&status=error&attr.route=%2Fusers&lookback=all"
                 ()))
       in
       Alcotest.(check int)
@@ -1311,7 +1382,7 @@ let test_server_handler_ingests_and_queries_services () =
           (Inn.Server.handler config store
              (request
                 ~target:
-                  "/logs/search?service=svc&body=fail&severity=ERROR&attr.route=%2Fusers"
+                  "/logs/search?service=svc&body=fail&severity=ERROR&attr.route=%2Fusers&lookback=all"
                 ()))
       in
       Alcotest.(check int)
@@ -1323,7 +1394,8 @@ let test_server_handler_ingests_and_queries_services () =
       let ai_calls =
         run_server_effect
           (Inn.Server.handler config store
-             (request ~target:"/ai/calls?model=gpt-test&provider=openai" ()))
+             (request
+                ~target:"/ai/calls?model=gpt-test&provider=openai&lookback=all" ()))
       in
       Alcotest.(check int)
         "ai calls status" 200 (Eta_http.Server.Response.status ai_calls);
@@ -1340,7 +1412,7 @@ let test_server_handler_ingests_and_queries_services () =
       let ai_stats =
         run_server_effect
           (Inn.Server.handler config store
-             (request ~target:"/ai/stats?groupBy=model&agg=count" ()))
+             (request ~target:"/ai/stats?groupBy=model&agg=count&lookback=all" ()))
       in
       Alcotest.(check int)
         "ai stats status" 200 (Eta_http.Server.Response.status ai_stats);
@@ -1352,7 +1424,7 @@ let test_server_handler_ingests_and_queries_services () =
           (Inn.Server.handler config store
              (request
                 ~target:
-                  "/traces/stats?groupBy=operation&agg=count&service=svc&status=error"
+                  "/traces/stats?groupBy=operation&agg=count&service=svc&status=error&lookback=all"
                 ()))
       in
       Alcotest.(check int)
@@ -1363,7 +1435,7 @@ let test_server_handler_ingests_and_queries_services () =
       let log_stats =
         run_server_effect
           (Inn.Server.handler config store
-             (request ~target:"/logs/stats?groupBy=severity&service=svc" ()))
+             (request ~target:"/logs/stats?groupBy=severity&service=svc&lookback=all" ()))
       in
       Alcotest.(check int)
         "log stats status" 200 (Eta_http.Server.Response.status log_stats);
@@ -1373,7 +1445,9 @@ let test_server_handler_ingests_and_queries_services () =
       let facets =
         run_server_effect
           (Inn.Server.handler config store
-             (request ~target:"/facets?type=traces&field=attribute_keys&service=svc" ()))
+             (request
+                ~target:
+                  "/facets?type=traces&field=attribute_keys&service=svc&lookback=all" ()))
       in
       Alcotest.(check int)
         "facets status" 200 (Eta_http.Server.Response.status facets);
@@ -1567,20 +1641,20 @@ let test_otlp_conformance_handler () =
   Alcotest.(check bool) "link typed attrs round trip (otlp-l0be)" true
     (match member "links" span with `List (link :: _) ->
       member "weight" (member "attributes" link) = `Int 3 | _ -> false);
-  let found = get "/api/spans/search?status=ok&attr.count=7" in
+  let found = get "/api/spans/search?status=ok&attr.count=7&lookback=all" in
   Alcotest.(check int) "unset matches ok and numeric attr (otlp-u6rw, otlp-zc8b)"
     1 (json_list_length "spans" found);
   Alcotest.(check int) "trace status ok includes unset (otlp-u6rw)" 1
-    (json_list_length "traces" (get "/api/traces/search?status=ok"));
+    (json_list_length "traces" (get "/api/traces/search?status=ok&lookback=all"));
   Alcotest.(check int) "AI status ok includes unset (otlp-u6rw)" 1
-    (json_list_length "calls" (get "/api/ai/calls?status=ok"));
+    (json_list_length "calls" (get "/api/ai/calls?status=ok&lookback=all"));
   Alcotest.(check int) "stats status ok includes unset (otlp-u6rw)" 1
     (json_list_length "stats"
-      (get "/api/traces/stats?groupBy=operation&agg=count&status=ok"));
+      (get "/api/traces/stats?groupBy=operation&agg=count&status=ok&lookback=all"));
   let logs = post "/v1/logs"
     {|{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"0","observedTimeUnixNano":"1000000501","body":{"stringValue":"hello"}}]}]}]}|} in
   Alcotest.(check int) "log ingested" 200 (Eta_http.Server.Response.status logs);
-  let logs_json = get "/api/logs?limit=10" in
+  let logs_json = get "/api/logs?limit=10&lookback=all" in
   let rows = member "logs" logs_json in
   let log = match rows with `List (head :: _) -> head | _ -> Alcotest.fail "missing log" in
   Alcotest.(check bool) "log ns output (otlp-e9t0, otlp-l754)" true
@@ -1591,7 +1665,7 @@ let test_otlp_conformance_handler () =
     (member "observedTimestampUnixNano" log = `String "1000000501");
   let _ = post "/v1/logs"
     {|{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"stringValue":"ingest fallback"}}]}]}]}|} in
-  let fallback = get "/api/logs/search?body=ingest%20fallback" in
+  let fallback = get "/api/logs/search?body=ingest%20fallback&lookback=all" in
   let row = match member "logs" fallback with
     | `List (first :: _) -> first | _ -> Alcotest.fail "missing fallback log" in
   Alcotest.(check bool) "missing log time uses ingest clock (otlp-e9t0)" true
@@ -1606,7 +1680,7 @@ let test_otlp_conformance_handler () =
   Alcotest.(check bool) "unspecified kind stays null (otlp-5oj4)" true
     (member "kind" explicit = `Null);
   Alcotest.(check int) "OK filter includes OK and UNSET (otlp-u6rw)" 2
-    (json_list_length "spans" (get "/api/spans/search?status=ok"))
+    (json_list_length "spans" (get "/api/spans/search?status=ok&lookback=all"))
 
 let test_otlp_store_retry () =
   let config = temp_config () in
@@ -1623,6 +1697,549 @@ let test_otlp_store_retry () =
   Alcotest.(check (option string)) "Retry-After" (Some "1")
     (Eta_http.Core.Header.get "retry-after"
       (Eta_http.Server.Response.headers response))
+
+(* Query windows and cursors --------------------------------------------- *)
+
+let json_member name json = Yojson.Safe.Util.member name json
+
+let json_field_opt name = function
+  | `Assoc fields -> List.assoc_opt name fields
+  | _ -> None
+
+let server_get config store path =
+  run_server_effect (Inn.Server.handler config store (request ~target:path ()))
+
+let server_json config store path = server_get config store path |> response_json
+
+let check_invalid_query label response fragment =
+  Alcotest.(check int)
+    (label ^ " status") 400
+    (Eta_http.Server.Response.status response);
+  let json = response_json response in
+  Alcotest.(check string)
+    (label ^ " code") "invalid_query" (json_string_field "error" json);
+  let message = json_string_field "message" json in
+  Alcotest.(check bool)
+    (label ^ " explains " ^ fragment) true (contains message fragment)
+
+let test_list_policy_lookback () =
+  (* win-nzur, win-e7k8, win-m4ld, win-xl30 *)
+  let check_ok text ms =
+    match List_policy.parse_lookback text with
+    | Ok lookback ->
+        Alcotest.(check (option int)) text ms lookback.List_policy.ms
+    | Error message -> Alcotest.failf "%s: %s" text message
+  in
+  check_ok "15m" (Some (15 * 60_000));
+  check_ok "2h" (Some (2 * 3_600_000));
+  check_ok "1d" (Some (24 * 3_600_000));
+  check_ok " all " None;
+  List.iter
+    (fun text ->
+      match List_policy.parse_lookback text with
+      | Ok _ -> Alcotest.failf "%S must be rejected (win-xl30)" text
+      | Error message ->
+          Alcotest.(check bool)
+            (Printf.sprintf "%S names the grammar" text) true
+            (contains message "lookback"))
+    [
+      "";
+      "15";
+      "m";
+      "0m";
+      "-5m";
+      "1w";
+      "1h30m";
+      "1.5h";
+      "15 m";
+      "alll";
+      "999999999999999999999h";
+    ];
+  (match List_policy.parse_lookback "1h" with
+  | Ok lookback ->
+      let window = List_policy.resolve ~now_ms:base_time lookback in
+      Alcotest.(check (option int))
+        "window start (win-nzur)" (Some (base_time - hour_ms))
+        window.Model.start_ms
+  | Error message -> Alcotest.fail message);
+  (match List_policy.parse_lookback "all" with
+  | Ok lookback ->
+      let window = List_policy.resolve ~now_ms:base_time lookback in
+      Alcotest.(check (option int))
+        "all is the whole history (win-m4ld)" None window.Model.start_ms
+  | Error message -> Alcotest.fail message)
+
+let test_list_policy_limit_and_defaults () =
+  (* win-e7k8, win-jee9, win-3ghy, win-xl30 *)
+  (match
+     List_policy.list_request ~kind:List_policy.Trace ~now_ms:base_time
+       [ ("limit", "10") ]
+   with
+  | Ok policy ->
+      Alcotest.(check int) "limit" 10 policy.List_policy.limit;
+      Alcotest.(check string)
+        "lists default to one hour (win-e7k8)" "1h" policy.List_policy.lookback;
+      Alcotest.(check (option int))
+        "default window start" (Some (base_time - hour_ms))
+        policy.window.Model.start_ms
+  | Error message -> Alcotest.fail message);
+  (match List_policy.summary_request ~now_ms:base_time [] with
+  | Ok policy ->
+      Alcotest.(check string)
+        "stats default to the whole history (win-jee9)" "all"
+        policy.List_policy.lookback;
+      Alcotest.(check int) "stats limit default" 20 policy.limit;
+      Alcotest.(check (option int))
+        "stats window is unbounded" None policy.window.Model.start_ms
+  | Error message -> Alcotest.fail message);
+  (match List_policy.resolve_lookback ~now_ms:base_time [] with
+  | Ok (window, lookback) ->
+      Alcotest.(check string)
+        "services default to the whole history (win-3ghy)" "all" lookback;
+      Alcotest.(check (option int)) "services window" None window.Model.start_ms
+  | Error message -> Alcotest.fail message);
+  List.iter
+    (fun value ->
+      match
+        List_policy.list_request ~kind:List_policy.Log ~now_ms:base_time
+          [ ("limit", value) ]
+      with
+      | Ok _ -> Alcotest.failf "limit %S must be rejected" value
+      | Error message ->
+          Alcotest.(check bool)
+            (Printf.sprintf "limit %S names the range" value) true
+            (contains message "limit"))
+    [ "0"; "-1"; "10001"; "many"; "" ];
+  (match
+     List_policy.list_request ~kind:List_policy.Trace ~now_ms:base_time
+       [ ("lookback", "1w") ]
+   with
+  | Ok _ -> Alcotest.fail "lookback=1w must be rejected (win-xl30)"
+  | Error message ->
+      Alcotest.(check bool)
+        "invalid lookback is explained (win-xl30)" true
+        (contains message "lookback"))
+
+let test_list_policy_cursor () =
+  (* win-edze, win-7xet, win-xl30 *)
+  let position = { Model.sort_key_ns = 1234; tie_breaker = "log-1" } in
+  let window = Model.window_lookback ~now_ms:base_time ~ms:hour_ms in
+  let token =
+    List_policy.encode_cursor ~kind:List_policy.Log ~window ~lookback:"1h"
+      position
+  in
+  Alcotest.(check bool)
+    "the token is opaque" true
+    (not (String.contains token (Char.chr 123))
+    && not (String.contains token (Char.chr 61)));
+  (match List_policy.decode_cursor ~kind:List_policy.Log token with
+  | Ok cursor ->
+      Alcotest.(check string) "kind" "log"
+        (List_policy.kind_to_string cursor.List_policy.cursor_kind);
+      Alcotest.(check int)
+        "sort key" 1234 cursor.cursor_position.Model.sort_key_ns;
+      Alcotest.(check string)
+        "tie breaker" "log-1" cursor.cursor_position.Model.tie_breaker;
+      Alcotest.(check string) "lookback label" "1h" cursor.cursor_lookback;
+      Alcotest.(check (option int))
+        "window start" (Some (base_time - hour_ms))
+        cursor.cursor_window.Model.start_ms
+  | Error message -> Alcotest.fail message);
+  (match List_policy.decode_cursor ~kind:List_policy.Trace token with
+  | Ok _ -> Alcotest.fail "a log cursor is not a trace cursor (win-xl30)"
+  | Error message ->
+      Alcotest.(check bool)
+        "the wrong-kind error names both kinds (win-xl30)" true
+        (contains message "log" && contains message "trace"));
+  List.iter
+    (fun garbage ->
+      match List_policy.decode_cursor ~kind:List_policy.Log garbage with
+      | Ok _ -> Alcotest.failf "%S must be rejected (win-xl30)" garbage
+      | Error message ->
+          Alcotest.(check bool)
+            (Printf.sprintf "%S is explained" garbage) true
+            (contains message "cursor"))
+    [ "not-a-cursor"; "AAAA"; "eyJ4IjoxfQ"; ""; "!!!!"; "="; "abc" ];
+  (* A cursor pins the page-one window, so later pages cannot drift. *)
+  (match
+     List_policy.list_request ~kind:List_policy.Log
+       ~now_ms:(base_time + (10 * hour_ms))
+       [ ("cursor", token); ("lookback", "5m") ]
+   with
+  | Ok policy ->
+      Alcotest.(check (option int))
+        "later pages reuse the page-one window (win-edze)"
+        (Some (base_time - hour_ms)) policy.List_policy.window.Model.start_ms;
+      Alcotest.(check string)
+        "meta lookback follows the cursor" "1h" policy.lookback;
+      Alcotest.(check (option int))
+        "cursor position" (Some 1234)
+        (Option.map (fun position -> position.Model.sort_key_ns) policy.cursor)
+  | Error message -> Alcotest.fail message)
+
+let test_query_windows () =
+  (* win-nzur, win-e7k8, win-m4ld, win-jee9, win-3ghy, win-xl30 *)
+  let config = temp_config () in
+  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let store = run_store (Store.open_ ~now_ms:(fun () -> base_time) config) in
+  Fun.protect
+    ~finally:(fun () -> run_store (Store.close store))
+    (fun () ->
+      let ages = [ ("now", 0); ("30m", 30); ("2h", 120); ("3d", 3 * 24 * 60) ] in
+      let spans =
+        List.mapi
+          (fun index (label, minutes) ->
+            test_span
+              ~trace_id:(Printf.sprintf "%032x" (index + 1))
+              ~span_id:(Printf.sprintf "%016x" (index + 1))
+              ~service_name:("span-" ^ label)
+              ~timestamp_ms:(base_time - (minutes * 60_000)) ())
+          ages
+      in
+      let logs =
+        List.map
+          (fun (label, minutes) ->
+            test_log ~service_name:("log-" ^ label) ~body:("body-" ^ label)
+              ~timestamp_ms:(base_time - (minutes * 60_000)) ())
+          ages
+      in
+      let metrics =
+        List.map
+          (fun (label, minutes) ->
+            test_metric ~service_name:("metric-" ^ label)
+              ~timestamp_ms:(base_time - (minutes * 60_000)) ())
+          ages
+      in
+      ignore
+        (run_store
+           (let open Eta.Syntax in
+            let* _ = Store.ingest_traces store spans in
+            let* _ = Store.ingest_logs store logs in
+            let* _ = Store.ingest_metrics store metrics in
+            Eta.Effect.pure ()));
+      let count path name =
+        json_list_length name (server_json config store path)
+      in
+      Alcotest.(check int)
+        "lists default to one hour (win-e7k8)" 2 (count "/traces" "traces");
+      Alcotest.(check int)
+        "lookback=15m narrows the window (win-nzur)" 1
+        (count "/traces?lookback=15m" "traces");
+      Alcotest.(check int)
+        "lookback=2h widens the window (win-nzur)" 3
+        (count "/traces?lookback=2h" "traces");
+      Alcotest.(check int)
+        "lookback=1d covers three days (win-nzur)" 3
+        (count "/traces?lookback=1d" "traces");
+      Alcotest.(check int)
+        "lookback=all is the whole retained history (win-m4ld)" 4
+        (count "/traces?lookback=all" "traces");
+      Alcotest.(check int)
+        "logs default to one hour (win-e7k8)" 2 (count "/logs" "logs");
+      Alcotest.(check int)
+        "logs honour lookback=all (win-m4ld)" 4
+        (count "/logs?lookback=all" "logs");
+      Alcotest.(check int)
+        "metrics default to one hour (win-e7k8)" 2 (count "/metrics" "metrics");
+      Alcotest.(check int)
+        "metrics honour lookback=all (win-m4ld)" 4
+        (count "/metrics?lookback=all" "metrics");
+      Alcotest.(check int)
+        "services default to the whole history (win-3ghy)" 12
+        (count "/services" "services");
+      Alcotest.(check int)
+        "services accept a window (win-3ghy)" 6
+        (count "/services?lookback=1h" "services");
+      Alcotest.(check int)
+        "facet queries default to the whole history (win-jee9)" 4
+        (count "/facets?type=logs&field=service" "facets");
+      Alcotest.(check int)
+        "facet queries accept a window (win-jee9)" 2
+        (count "/facets?type=logs&field=service&lookback=1h" "facets");
+      Alcotest.(check int)
+        "stats queries default to the whole history (win-jee9)" 4
+        (count "/logs/stats?groupBy=service" "stats");
+      Alcotest.(check int)
+        "stats queries accept a window (win-jee9)" 2
+        (count "/logs/stats?groupBy=service&lookback=1h" "stats");
+      Alcotest.(check int)
+        "trace stats default to the whole history (win-jee9)" 4
+        (count "/traces/stats?groupBy=service&agg=count" "stats");
+      (match server_json config store "/stats" with
+      | json ->
+          Alcotest.(check bool)
+            "store stats count the whole history (win-jee9)" true
+            (json_member "logs" json = `Int 4);
+          Alcotest.(check string)
+            "store stats report the effective lookback" "all"
+            (match json_member "lookback" (json_member "meta" json) with
+            | `String value -> value
+            | _ -> ""));
+      (match server_json config store "/stats?lookback=1h" with
+      | json ->
+          Alcotest.(check bool)
+            "store stats narrow with a lookback (win-jee9)" true
+            (json_member "logs" json = `Int 2));
+      check_invalid_query "invalid lookback"
+        (server_get config store "/traces?lookback=1w") "lookback";
+      check_invalid_query "empty lookback"
+        (server_get config store "/logs?lookback=") "lookback";
+      check_invalid_query "invalid cursor"
+        (server_get config store "/traces?cursor=not-a-cursor") "cursor";
+      check_invalid_query "invalid limit"
+        (server_get config store "/traces?limit=0") "limit")
+
+let json_list name json =
+  match json_member name json with
+  | `List items -> items
+  | _ -> Alcotest.failf "%s is missing" name
+
+let next_cursor json =
+  match json_field_opt "nextCursor" (json_member "meta" json) with
+  | Some (`String cursor) -> cursor
+  | Some _ -> Alcotest.fail "nextCursor is not a string"
+  | None -> Alcotest.fail "expected another page"
+
+let walk_list ~config ~store ~name path =
+  let rec loop cursor pages acc =
+    let target =
+      match cursor with
+      | None -> path
+      | Some cursor ->
+          path
+          ^ (if String.contains path (Char.chr 63) then "&" else "?")
+          ^ "cursor=" ^ cursor
+    in
+    let json = server_json config store target in
+    let items = json_list name json in
+    let meta = json_member "meta" json in
+    Alcotest.(check int)
+      (target ^ " meta returned") (List.length items)
+      (match json_member "returned" meta with `Int value -> value | _ -> -1);
+    let next = json_field_opt "nextCursor" meta in
+    Alcotest.(check bool)
+      (target ^ " meta truncated matches nextCursor (win-fl8w)") true
+      ((match json_member "truncated" meta with
+        | `Bool value -> value
+        | _ -> false)
+      = Option.is_some next);
+    let acc = acc @ items in
+    let pages = (items, meta) :: pages in
+    match next with
+    | Some (`String next) -> loop (Some next) pages acc
+    | Some _ -> Alcotest.failf "%s has a non-string nextCursor" target
+    | None -> (List.rev pages, acc)
+  in
+  loop None [] []
+
+(* Walk one endpoint in small pages and prove there are no duplicates, no
+   gaps, and no cursor on the last page (win-edze, win-7xet, win-5hgv). *)
+let check_walk ~config ~store ~name ~key ~limit path =
+  let target = path ^ "&limit=" ^ string_of_int limit in
+  let full =
+    json_list_length name (server_json config store (path ^ "&limit=1000"))
+  in
+  let pages, items = walk_list ~config ~store ~name target in
+  let keys = List.map key items in
+  Alcotest.(check int)
+    (path ^ " pages repeat nothing (win-edze)") (List.length keys)
+    (List.length (List.sort_uniq String.compare keys));
+  Alcotest.(check int)
+    (path ^ " pages skip nothing (win-edze)") full (List.length items);
+  Alcotest.(check bool)
+    (path ^ " walks more than one page (win-5hgv)") true
+    (List.length pages > 1);
+  (match List.rev pages with
+  | (_, last_meta) :: _ ->
+      Alcotest.(check bool)
+        (path ^ " last page has no cursor (win-7xet)") true
+        (json_field_opt "nextCursor" last_meta = None)
+  | [] -> Alcotest.fail "expected at least one page");
+  items
+
+let test_pagination_walk_logs () =
+  (* win-edze, win-7xet, win-fl8w, win-xi3q, win-xpfn *)
+  let config = temp_config () in
+  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let store = run_store (Store.open_ ~now_ms:(fun () -> base_time) config) in
+  Fun.protect
+    ~finally:(fun () -> run_store (Store.close store))
+    (fun () ->
+      let walk_body index = Printf.sprintf "walk-%03d" index in
+      let logs =
+        List.init 250 (fun index ->
+            test_log ~service_name:"walk" ~body:(walk_body index)
+              ~timestamp_ms:(base_time - (index * 60_000)) ())
+      in
+      ignore (run_store (Store.ingest_logs store logs));
+      let bodies json =
+        List.map
+          (fun item ->
+            match json_member "body" item with `String body -> body | _ -> "")
+          (json_list "logs" json)
+      in
+      let page1 = server_json config store "/logs?limit=100&lookback=all" in
+      Alcotest.(check int)
+        "the first page is full (win-fl8w)" 100 (List.length (bodies page1));
+      Alcotest.(check bool)
+        "the first page reports truncation (win-fl8w)" true
+        (json_member "truncated" (json_member "meta" page1) = `Bool true);
+      Alcotest.(check string)
+        "meta carries the effective window (win-fl8w)" "all"
+        (match json_member "lookback" (json_member "meta" page1) with
+        | `String value -> value
+        | _ -> "");
+      Alcotest.(check int)
+        "meta carries the effective limit (win-fl8w)" 100
+        (match json_member "limit" (json_member "meta" page1) with
+        | `Int value -> value
+        | _ -> -1);
+      let cursor1 = next_cursor page1 in
+      ignore
+        (run_store
+           (Store.ingest_logs store
+              (List.init 5 (fun index ->
+                   test_log ~service_name:"walk"
+                     ~body:(Printf.sprintf "late-%d" index)
+                     ~timestamp_ms:(base_time + ((index + 1) * 60_000)) ()))));
+      let page2 =
+        server_json config store
+          ("/logs?limit=100&lookback=all&cursor=" ^ cursor1)
+      in
+      let cursor2 = next_cursor page2 in
+      let page3 =
+        server_json config store
+          ("/logs?limit=100&lookback=all&cursor=" ^ cursor2)
+      in
+      Alcotest.(check (list int))
+        "page sizes honour the limit (win-fl8w)"
+        [ 100; 100; 50 ]
+        [
+          List.length (bodies page1);
+          List.length (bodies page2);
+          List.length (bodies page3);
+        ];
+      Alcotest.(check (list string))
+        "newest first with a stable tie-breaker (win-xi3q)"
+        (List.init 250 walk_body)
+        (bodies page1 @ bodies page2 @ bodies page3);
+      Alcotest.(check bool)
+        "the last page has no cursor (win-7xet)" true
+        (json_field_opt "nextCursor" (json_member "meta" page3) = None);
+      Alcotest.(check bool)
+        "the last page is not truncated (win-fl8w)" true
+        (json_member "truncated" (json_member "meta" page3) = `Bool false);
+      Alcotest.(check bool)
+        "rows that arrived between pages are not mixed in (win-edze)" true
+        (not
+           (List.exists
+              (fun body ->
+                String.length body >= 5 && String.equal (String.sub body 0 5) "late-")
+              (bodies page1 @ bodies page2 @ bodies page3)));
+      Alcotest.(check string)
+        "a fresh query sees rows that arrived between pages (win-edze)" "late-4"
+        (match bodies (server_json config store "/logs?limit=1&lookback=all") with
+        | first :: _ -> first
+        | [] -> "");
+      let ids =
+        List.map
+          (fun item -> match json_member "id" item with `String id -> id | _ -> "")
+          (json_list "logs" page1)
+      in
+      Alcotest.(check bool)
+        "every log row carries its stable id (win-xpfn)" true
+        (List.for_all (fun id -> String.length id > 0) ids);
+      Alcotest.(check int)
+        "log ids are unique (win-xpfn)" 100
+        (List.length (List.sort_uniq String.compare ids)))
+
+let test_pagination_endpoints () =
+  (* win-5hgv, win-ggl7, win-7xet, win-xl30 *)
+  let config = temp_config () in
+  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let store = run_store (Store.open_ ~now_ms:(fun () -> base_time) config) in
+  Fun.protect
+    ~finally:(fun () -> run_store (Store.close store))
+    (fun () ->
+      let trace_id index = Printf.sprintf "%032x" (index + 1) in
+      let span_id index = Printf.sprintf "%016x" (index + 1) in
+      let trace_one = trace_id 0 in
+      let span_one = span_id 0 in
+      let spans =
+        List.init 5 (fun index ->
+            test_span ~trace_id:trace_one ~span_id:(span_id index)
+              ~service_name:"page"
+              ~timestamp_ms:(base_time - (index * 60_000)) ())
+        @ List.init 4 (fun index ->
+              test_span ~trace_id:(trace_id (index + 1))
+                ~span_id:(span_id index) ~service_name:"page"
+                ~timestamp_ms:(base_time - ((index + 1) * 60_000)) ())
+        @ List.init 5 (fun index ->
+              test_span ~trace_id:(trace_id 5) ~span_id:(span_id index)
+                ~service_name:"ai" ~attributes:[ ("ai.model.id", "gpt-page") ]
+                ~timestamp_ms:(base_time - (index * 30_000)) ())
+      in
+      let logs =
+        List.init 5 (fun index ->
+            let log =
+              test_log ~service_name:"page" ~body:(Printf.sprintf "log-%d" index)
+                ~timestamp_ms:(base_time - (index * 60_000)) ()
+            in
+            { log with Model.trace_id = Some trace_one; span_id = Some span_one })
+      in
+      let metrics =
+        List.init 5 (fun index ->
+            test_metric ~service_name:"page" ~name:"page.metric"
+              ~timestamp_ms:(base_time - (index * 60_000)) ())
+      in
+      ignore
+        (run_store
+           (let open Eta.Syntax in
+            let* _ = Store.ingest_traces store spans in
+            let* _ = Store.ingest_logs store logs in
+            let* _ = Store.ingest_metrics store metrics in
+            Eta.Effect.pure ()));
+      let string_field name json =
+        match json_member name json with `String value -> value | _ -> ""
+      in
+      let trace_key json = string_field "traceId" json in
+      let span_key json = trace_key json ^ ":" ^ string_field "spanId" json in
+      let log_key json = string_field "id" json in
+      let metric_key json = string_field "timestampUnixNano" json in
+      ignore
+        (check_walk ~config ~store ~name:"traces" ~key:trace_key ~limit:2
+           "/traces?lookback=all");
+      ignore
+        (check_walk ~config ~store ~name:"spans" ~key:span_key ~limit:2
+           "/spans/search?lookback=all");
+      ignore
+        (check_walk ~config ~store ~name:"spans" ~key:span_key ~limit:2
+           ("/traces/" ^ trace_one ^ "/spans?lookback=all"));
+      ignore
+        (check_walk ~config ~store ~name:"logs" ~key:log_key ~limit:2
+           ("/traces/" ^ trace_one ^ "/logs?lookback=all"));
+      ignore
+        (check_walk ~config ~store ~name:"logs" ~key:log_key ~limit:2
+           ("/spans/" ^ span_one ^ "/logs?lookback=all"));
+      ignore
+        (check_walk ~config ~store ~name:"metrics" ~key:metric_key ~limit:2
+           "/metrics?lookback=all");
+      ignore
+        (check_walk ~config ~store ~name:"calls" ~key:span_key ~limit:2
+           "/ai/calls?lookback=all");
+      let log_page = server_json config store "/logs?limit=1&lookback=all" in
+      let log_cursor = next_cursor log_page in
+      let wrong_kind = server_get config store ("/traces?lookback=all&cursor=" ^ log_cursor) in
+      check_invalid_query "a log cursor on traces" wrong_kind "cursor";
+      Alcotest.(check bool)
+        "the wrong-kind error names both kinds (win-xl30)" true
+        (let message = json_string_field "message" (response_json wrong_kind) in
+         contains message "log" && contains message "trace");
+      let trace_page = server_json config store "/traces?limit=1&lookback=all" in
+      let trace_cursor = next_cursor trace_page in
+      check_invalid_query "a trace cursor on logs"
+        (server_get config store ("/logs?lookback=all&cursor=" ^ trace_cursor))
+        "cursor")
 
 let () =
   Alcotest.run "inn"
@@ -1679,6 +2296,24 @@ let () =
             `Quick test_prune_size_cap_removes_only_oldest;
           Alcotest.test_case "stats carry the retention section (ret-eeb1)"
             `Quick test_stats_reports_retention;
+        ] );
+      ( "windows",
+        [
+          Alcotest.test_case "lookback grammar resolves windows (win-nzur, win-e7k8, win-m4ld)"
+            `Quick test_list_policy_lookback;
+          Alcotest.test_case "defaults and the limit range (win-jee9, win-3ghy, win-xl30)"
+            `Quick test_list_policy_limit_and_defaults;
+          Alcotest.test_case "cursor round trips and rejects garbage (win-edze, win-xl30)"
+            `Quick test_list_policy_cursor;
+          Alcotest.test_case "list, stats, facet, service, and store windows (win-nzur, win-e7k8, win-m4ld, win-jee9, win-3ghy)"
+            `Quick test_query_windows;
+        ] );
+      ( "pagination",
+        [
+          Alcotest.test_case "walk 250 logs in pages of 100 (win-edze, win-7xet, win-fl8w, win-xi3q, win-xpfn)"
+            `Quick test_pagination_walk_logs;
+          Alcotest.test_case "cursor pagination on every long list (win-5hgv, win-ggl7, win-7xet, win-xl30)"
+            `Quick test_pagination_endpoints;
         ] );
       ( "server",
         [

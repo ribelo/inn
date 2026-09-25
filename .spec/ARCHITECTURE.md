@@ -101,6 +101,19 @@ Core HTTP query endpoints:
 
 The `/api/...` aliases exist for query/discovery endpoints.
 
+List, search, stats, facet, services, and store-stats queries take a relative
+`lookback` window (`Nm`, `Nh`, `Nd`, or `all`). Lists and searches default to
+`1h`; stats, facets, services, and store stats default to `all`. The window is
+resolved once per request against the store clock and filters on the event
+timestamp of each signal. List and search responses keep their named collection
+key and add a `meta` object with the effective limit and window, the number
+returned, whether more rows exist, and `nextCursor` when they do. Paging is
+keyset-only: the opaque cursor carries the endpoint kind, the sort key and the
+unique tie-breaker of the last row, and the window resolved for page one, so
+later pages cannot drift. Results are newest first. A malformed lookback,
+limit, or cursor, or a cursor issued for another endpoint kind, is a `400`.
+Log records expose the store-assigned stable `id` they were always keyed by.
+
 Core CLI commands:
 
 - `inn server`
@@ -151,6 +164,11 @@ plus attribute side tables for indexed filtering:
 
 The server opens the store, applies the schema, and runs retention. CLI query
 commands do not open the database or run schema statements as a side effect.
+
+Query functions take a resolved window, a limit, and an optional decoded cursor
+position, and return one page: the rows plus the position of the last row when
+more exist. They fetch one row past the limit, so truncation is exact. The
+store never parses a query parameter.
 
 The store is implemented through Eta SQL's typed schema/query builders. The one
 documented exception is SQLite pragmas, which have no typed API: `page_count`,

@@ -31,6 +31,7 @@ type span = {
 }
 
 type log_record = {
+  id : string;
   trace_id : string option;
   span_id : string option;
   service_name : string;
@@ -115,6 +116,13 @@ type facet_item = {
   count : int;
 }
 
+type window = { start_ms : int option }
+
+type cursor_position = { sort_key_ns : int; tie_breaker : string }
+
+let window_all = { start_ms = None }
+let window_lookback ~now_ms ~ms = { start_ms = Some (now_ms - ms) }
+
 let option_string name = function
   | None -> []
   | Some value -> [ (name, `String value) ]
@@ -192,6 +200,7 @@ let span_to_json (span : span) =
 let log_to_json (log : log_record) =
   `Assoc
     ([
+       ("id", `String log.id);
        ("serviceName", `String log.service_name);
        ("severityText", `String log.severity_text);
        ("timestampMs", `Float (milliseconds log.timestamp_ns));

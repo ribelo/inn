@@ -194,7 +194,8 @@ let decode_log ~resource ~service_name ~scope_name log =
     | None -> ""
   in
   {
-    Model.trace_id = (let id = normalized_id 32 (string_member "traceId" log) in
+    Model.id = "";
+    trace_id = (let id = normalized_id 32 (string_member "traceId" log) in
       match id with Some _ -> id | None ->
         let values = attrs log in
         let attr_id = match List.assoc_opt "traceId" values with
