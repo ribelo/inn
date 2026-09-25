@@ -1,5 +1,5 @@
 ---
-status: ready-for-agent
+status: completed
 ---
 
 # Per-signal retention with background pruning

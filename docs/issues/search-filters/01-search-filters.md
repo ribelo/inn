@@ -1,5 +1,5 @@
 ---
-status: ready-for-agent
+status: completed
 ---
 
 # Search filters with motel's reach

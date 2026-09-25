@@ -1,7 +1,7 @@
 # Inn issues
 
 Specs for the Eta migration and motel-parity work, in implementation order.
-Each spec's frontmatter carries its status. Story IDs are cited by tests.
+Each spec's frontmatter carries its status (completed = implemented and accepted). Story IDs are cited by tests.
 
 | Order | Spec | Status |
 |---|---|---|
@@ -13,10 +13,10 @@ Each spec's frontmatter carries its status. Story IDs are cited by tests.
 | 6 | [query-windows](query-windows/01-lookback-and-cursors.md) | done (da7ed14) |
 | 7 | [search-filters](search-filters/01-search-filters.md) | done (6154c60) |
 | 8 | [query-accuracy](query-accuracy/01-exact-bounded-queries.md) | done (6154c60) |
-| 9 | [trace-tree](trace-tree/01-trace-tree-view.md) | in progress |
-| 10 | [ai-calls](ai-calls/01-ai-call-insight.md) | in progress |
-| 11 | [self-description](self-description/01-openapi-and-guides.md) | ready |
-| 12 | [systemd-service](systemd-service/01-service-runs.md) | ready (runs last) |
+| 9 | [trace-tree](trace-tree/01-trace-tree-view.md) | done (3426a91) |
+| 10 | [ai-calls](ai-calls/01-ai-call-insight.md) | done (3426a91) |
+| 11 | [self-description](self-description/01-openapi-and-guides.md) | done (c03f279) |
+| 12 | [systemd-service](systemd-service/01-service-runs.md) | done (fb9bd18) |
 
 Specs 3–11 all touch the store and server, so they are implemented one at a
 time, in this order.
