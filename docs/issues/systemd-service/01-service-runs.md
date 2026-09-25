@@ -36,18 +36,21 @@ mention the systemd service.
 
 ## Implementation Decisions
 
-- Order of operations:
-  1. Build and test pie and grip against the local Eta master without
-     touching the switch. Use the same isolated mechanism the Eta migration
-     spec introduces, or those projects' own dev shells.
-  2. Only if both pass, run Inn's existing install helper
-     (`inn-opam-install`). It installs the local Eta checkout into the switch
-     and pins Inn from the local repository.
-  3. Restart `inn.service` and verify health.
-  4. If pie or grip fail, stop. Do not install. Report the exact failures:
-     those projects are outside this spec.
-- The helper pins Inn from `git+file://...#master`. The installed binary
-  therefore reflects committed state only. Commit before installing.
+- **Install path (decided after the compatibility check).** pie and grip do
+  NOT build on current Eta master. They break on Eta_http.Client.t, the
+  Eta.Queue kinds, Eta_linux_input.Device.fd, and the Eta_otel.create and
+  shutdown signatures, all from Eta commit 992ed936. Upgrading Eta in the
+  shared switch would therefore break them, so this spec must not upgrade
+  Eta there. Instead, add a script that builds Inn against the local Eta (as
+  the existing local-Eta test script does). The script then installs only the
+  `inn` executable at the path the unit runs
+  (`$OPAMROOT/5.4.0+ox/bin/inn`, with OPAMROOT defaulting to
+  `~/.cache/opam`). It copies the binary to a temporary file in the same
+  directory, then renames it into place atomically, then restarts
+  `inn.service` if the unit exists, then checks health. Document this in the
+  README as the service update command. Once pie and grip are ported, the
+  opam-managed `inn-opam-install` path can replace it.
+- svc-is5q is satisfied by the decision not to touch Eta in the switch.
 - Do not restart pie or other services. The rebuilt pie binary takes effect
   at the next restart the user chooses.
 - SIGTERM: install a handler that cancels the server switch, so that the store
