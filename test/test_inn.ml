@@ -129,22 +129,22 @@ let ai_trace_fixture =
 let test_otlp_decodes_traces_logs_and_metrics () =
   let spans =
     match Otlp.decode_traces_json trace_fixture with
-    | Ok spans -> spans
+    | Ok decoded -> decoded.items
     | Error message -> Alcotest.fail message
   in
   let logs =
     match Otlp.decode_logs_json log_fixture with
-    | Ok logs -> logs
+    | Ok decoded -> decoded.items
     | Error message -> Alcotest.fail message
   in
   let metrics =
     match Otlp.decode_metrics_json metric_fixture with
-    | Ok metrics -> metrics
+    | Ok decoded -> decoded.items
     | Error message -> Alcotest.fail message
   in
   Alcotest.(check int) "span count" 1 (List.length spans);
   Alcotest.(check string) "span service" "svc" (List.hd spans).service_name;
-  Alcotest.(check string) "span status" "error" (List.hd spans).status;
+  Alcotest.(check string) "span status" "error" (Model.span_status_to_string (List.hd spans).status);
   Alcotest.(check int) "log count" 1 (List.length logs);
   Alcotest.(check string) "log body" "failed" (List.hd logs).body;
   Alcotest.(check int) "metric count" 1 (List.length metrics);
@@ -161,15 +161,16 @@ let test_span ?(trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     service_name;
     scope_name = Some "scope";
     operation_name;
-    kind = Some "SPAN_KIND_SERVER";
-    start_time_ms = base_time;
-    end_time_ms = base_time + 1_000;
+    kind = Some Model.Server;
+    start_time_ns = base_time * 1_000_000;
+    end_time_ns = (base_time * 1_000_000) + 1_000_000;
     duration_ms = 1.0;
-    status;
+    status = Option.value (Model.span_status_of_string status) ~default:Model.Unset;
     status_message = None;
-    attributes;
-    resource = [ ("service.name", service_name) ];
+    attributes = List.map (fun (key, value) -> (key, `String value)) attributes;
+    resource = [ ("service.name", `String service_name) ];
     events = [];
+    links = [];
   }
 
 let test_log ?(service_name = "svc") ?(body = "failed") ?(timestamp_ms = base_time)
@@ -181,10 +182,11 @@ let test_log ?(service_name = "svc") ?(body = "failed") ?(timestamp_ms = base_ti
     scope_name = Some "scope";
     severity_text = "ERROR";
     severity_number = Some 17;
-    timestamp_ms;
+    timestamp_ns = timestamp_ms * 1_000_000;
+    observed_timestamp_ns = None;
     body;
-    attributes;
-    resource;
+    attributes = List.map (fun (key, value) -> (key, `String value)) attributes;
+    resource = List.map (fun (key, value) -> (key, `String value)) resource;
   }
 
 let test_metric ?(service_name = "svc") ?(name = "requests.total")
@@ -196,11 +198,11 @@ let test_metric ?(service_name = "svc") ?(name = "requests.total")
     description = None;
     unit_ = None;
     kind = "sum";
-    start_time_ms = Some base_time;
-    timestamp_ms;
+    start_time_ns = Some (base_time * 1_000_000);
+    timestamp_ns = timestamp_ms * 1_000_000;
     value = "3";
-    attributes;
-    resource = [ ("service.name", service_name) ];
+    attributes = List.map (fun (key, value) -> (key, `String value)) attributes;
+    resource = [ ("service.name", `String service_name) ];
     raw_json = `Assoc [];
   }
 
@@ -460,7 +462,8 @@ let run_server_effect program =
   | Eta.Exit.Error cause ->
       Alcotest.failf "%a" (Eta.Cause.pp Eta_http.Server.Error.pp) cause
 
-let request ?(method_ = "GET") ?(target = "/health") ?(body = "") () =
+let request ?(method_ = "GET") ?(target = "/health") ?(body = "")
+    ?(headers = Eta_http.Core.Header.empty) () =
   let path, query = Eta_http.Server.Request.split_target target in
   let body =
     if String.equal body "" then Eta_http.Server.Body.empty ()
@@ -482,7 +485,7 @@ let request ?(method_ = "GET") ?(target = "/health") ?(body = "") () =
     target;
     path;
     query;
-    headers = Eta_http.Core.Header.empty;
+    headers;
     body;
     trailers = (fun () -> Eta.Effect.pure Eta_http.Core.Header.empty);
     peer = { address = Some "127.0.0.1"; port = Some 43123 };
@@ -557,10 +560,10 @@ let wait_until ~clock ~timeout_seconds predicate =
 
 (* Recorded together with [Store.schema_version]: change one and you must
    change the other (schm-hnis). *)
-let recorded_schema_fingerprint = "4093c36348bf05af77b3168bdf8cd1ad"
+let recorded_schema_fingerprint = "cb40fcdc494a82f1ad013f025fd7cb2c"
 
 let test_schema_fingerprint_matches_version () =
-  Alcotest.(check int) "schema version" 2 Store.schema_version;
+  Alcotest.(check int) "schema version" 3 Store.schema_version;
   Alcotest.(check string)
     "schema fingerprint (schm-hnis)" recorded_schema_fingerprint
     Store.schema_fingerprint
@@ -663,17 +666,17 @@ let test_store_ingests_and_queries_all_signals () =
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   let spans =
     match Otlp.decode_traces_json trace_fixture with
-    | Ok spans -> spans
+    | Ok decoded -> decoded.items
     | Error message -> Alcotest.fail message
   in
   let logs =
     match Otlp.decode_logs_json log_fixture with
-    | Ok logs -> logs
+    | Ok decoded -> decoded.items
     | Error message -> Alcotest.fail message
   in
   let metrics =
     match Otlp.decode_metrics_json metric_fixture with
-    | Ok metrics -> metrics
+    | Ok decoded -> decoded.items
     | Error message -> Alcotest.fail message
   in
   let
@@ -1210,7 +1213,7 @@ let test_server_handler_ingests_and_queries_services () =
       Alcotest.(check int)
         "ingest status" 200 (Eta_http.Server.Response.status ingest);
       Alcotest.(check string)
-        "ingest body" "{\"accepted\":1}\n" (response_body_string ingest);
+        "ingest body" "{}\n" (response_body_string ingest);
       let ingest_ai =
         run_server_effect
           (Inn.Server.handler config store
@@ -1486,6 +1489,141 @@ let test_server_pruner_prunes_without_ingest () =
         "the interval pass prunes it (ret-sj15)" true
         (wait_until ~clock ~timeout_seconds:10.0 (fun () -> log_count () = 0)))
 
+(* OTLP/HTTP JSON conformance regression cases. *)
+let member field = function
+  | `Assoc fields -> Option.value (List.assoc_opt field fields) ~default:`Null
+  | _ -> `Null
+
+let test_otlp_conformance_decoder () =
+  let payload =
+    {|{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","spanId":"BBBBBBBBBBBBBBBB","name":"short","kind":"SPAN_KIND_CLIENT","startTimeUnixNano":"1000000001","endTimeUnixNano":"1000000501","status":{"code":"STATUS_CODE_OK"},"attributes":[{"key":"count","value":{"intValue":"7"}},{"key":"enabled","value":{"boolValue":true}},{"key":"arr","value":{"arrayValue":{"values":[{"stringValue":"a"},{"intValue":"2"}]}}},{"key":"object","value":{"kvlistValue":{"values":[{"key":"x","value":{"doubleValue":1.25}}]}}}],"links":[{"traceId":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC","spanId":"DDDDDDDDDDDDDDDD","attributes":[{"key":"weight","value":{"intValue":"3"}}]}]},{"traceId":"00000000000000000000000000000000","spanId":"bbbbbbbbbbbbbbbb"},{"traceId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","spanId":"bad"}]}]}]}|}
+  in
+  let decoded = match Otlp.decode_traces_json payload with
+    | Ok result -> result | Error message -> Alcotest.fail message in
+  Alcotest.(check int) "bad IDs rejected separately (otlp-r73z)" 2 decoded.rejected;
+  Alcotest.(check int) "good span retained" 1 (List.length decoded.items);
+  let span = List.hd decoded.items in
+  Alcotest.(check string) "lowercase ID (otlp-hb7r)"
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" span.Model.trace_id;
+  Alcotest.(check string) "Effect kind (otlp-5oj4)" "client"
+    (Option.fold ~none:"" ~some:Model.span_kind_to_string span.kind);
+  Alcotest.(check string) "explicit OK (otlp-a16d)" "ok"
+    (Model.span_status_to_string span.status);
+  Alcotest.(check (float 0.00000001)) "500ns duration (otlp-6ul3)"
+    0.0005 span.duration_ms;
+  Alcotest.(check int) "link (otlp-l0be)" 1 (List.length span.links);
+  let attrs = Model.attrs_to_json span.attributes in
+  Alcotest.(check bool) "numeric typed (otlp-8avj)" true (member "count" attrs = `Int 7);
+  Alcotest.(check bool) "boolean typed" true (member "enabled" attrs = `Bool true);
+  Alcotest.(check bool) "array typed" true (member "arr" attrs = `List [`String "a"; `Int 2]);
+  Alcotest.(check bool) "object typed" true (member "object" attrs = `Assoc ["x", `Float 1.25]);
+  let log_payload = {|{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"0","observedTimeUnixNano":"1234567899","traceId":"","attributes":[{"key":"trace_id","value":{"stringValue":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}},{"key":"spanId","value":{"stringValue":"BBBBBBBBBBBBBBBB"}}]}]}]}]}|} in
+  let logs = match Otlp.decode_logs_json log_payload with
+    | Ok result -> result.items | Error message -> Alcotest.fail message in
+  let log = List.hd logs in
+  Alcotest.(check int) "observed fallback (otlp-e9t0)" 1234567899 log.timestamp_ns;
+  Alcotest.(check (option string)) "attribute trace (otlp-beaj)"
+    (Some "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") log.trace_id;
+  Alcotest.(check (option string)) "attribute span (otlp-beaj)"
+    (Some "bbbbbbbbbbbbbbbb") log.span_id
+
+let test_otlp_conformance_handler () =
+  let config = temp_config () in
+  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let store = run_store (Store.open_ config) in
+  let post ?(headers = Eta_http.Core.Header.empty) path body =
+    run_server_effect (Inn.Server.handler config store
+      (request ~method_:"POST" ~target:path ~body ~headers ())) in
+  let get path = run_server_effect
+    (Inn.Server.handler config store (request ~target:path ())) |> response_json in
+  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  List.iter (fun path ->
+    let response = post path "" in
+    Alcotest.(check int) "empty status (otlp-dtfh)" 200 (Eta_http.Server.Response.status response);
+    Alcotest.(check bool) "OTLP empty response (otlp-2k5g)" true
+      (response_json response = `Assoc [])) ["/v1/traces"; "/v1/logs"; "/v1/metrics"];
+  let invalid = post "/v1/traces" "{" in
+  Alcotest.(check int) "bad JSON (otlp-qso2)" 400 (Eta_http.Server.Response.status invalid);
+  Alcotest.(check bool) "INVALID_ARGUMENT body" true (member "code" (response_json invalid) = `Int 3);
+  let headers = Eta_http.Core.Header.unsafe_of_list ["content-type", "application/x-protobuf"] in
+  let unsupported = post ~headers "/v1/traces" "{}" in
+  Alcotest.(check int) "protobuf rejected (otlp-ohmj)" 415 (Eta_http.Server.Response.status unsupported);
+  let oversized = post "/v1/traces" (String.make (32 * 1024 * 1024 + 1) ' ') in
+  Alcotest.(check int) "body cap (otlp-ohmj)" 413 (Eta_http.Server.Response.status oversized);
+  let payload = {|{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","spanId":"BBBBBBBBBBBBBBBB","name":"short","kind":2,"startTimeUnixNano":"1000000001","endTimeUnixNano":"1000000501","attributes":[{"key":"count","value":{"intValue":"7"}},{"key":"ai.model.id","value":{"stringValue":"example"}}],"events":[{"name":"instant","timeUnixNano":"1000000002"}],"links":[{"traceId":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC","spanId":"DDDDDDDDDDDDDDDD","attributes":[{"key":"weight","value":{"intValue":"3"}}]}]},{"traceId":"oops","spanId":"bbbbbbbbbbbbbbbb"}]}]}]}|} in
+  let ingested = post "/v1/traces" payload in
+  Alcotest.(check int) "partial status (otlp-2k5g)" 200 (Eta_http.Server.Response.status ingested);
+  Alcotest.(check bool) "rejectedSpans (otlp-r73z)" true
+    (member "rejectedSpans" (member "partialSuccess" (response_json ingested)) = `Int 1);
+  let span = get "/api/spans/bbbbbbbbbbbbbbbb" in
+  Alcotest.(check bool) "ns output (otlp-l754)" true
+    (member "startTimeUnixNano" span = `String "1000000001");
+  Alcotest.(check bool) "fractional ms output (otlp-l754)" true
+    (member "startTimeMs" span = `Float 1000.000001);
+  Alcotest.(check bool) "kind output (otlp-5oj4)" true (member "kind" span = `String "server");
+  Alcotest.(check bool) "event ns round trip" true
+    (match member "events" span with `List (event :: _) ->
+      member "timestampUnixNano" event = `String "1000000002" | _ -> false);
+  Alcotest.(check bool) "link typed attrs round trip (otlp-l0be)" true
+    (match member "links" span with `List (link :: _) ->
+      member "weight" (member "attributes" link) = `Int 3 | _ -> false);
+  let found = get "/api/spans/search?status=ok&attr.count=7" in
+  Alcotest.(check int) "unset matches ok and numeric attr (otlp-u6rw, otlp-zc8b)"
+    1 (json_list_length "spans" found);
+  Alcotest.(check int) "trace status ok includes unset (otlp-u6rw)" 1
+    (json_list_length "traces" (get "/api/traces/search?status=ok"));
+  Alcotest.(check int) "AI status ok includes unset (otlp-u6rw)" 1
+    (json_list_length "calls" (get "/api/ai/calls?status=ok"));
+  Alcotest.(check int) "stats status ok includes unset (otlp-u6rw)" 1
+    (json_list_length "stats"
+      (get "/api/traces/stats?groupBy=operation&agg=count&status=ok"));
+  let logs = post "/v1/logs"
+    {|{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"0","observedTimeUnixNano":"1000000501","body":{"stringValue":"hello"}}]}]}]}|} in
+  Alcotest.(check int) "log ingested" 200 (Eta_http.Server.Response.status logs);
+  let logs_json = get "/api/logs?limit=10" in
+  let rows = member "logs" logs_json in
+  let log = match rows with `List (head :: _) -> head | _ -> Alcotest.fail "missing log" in
+  Alcotest.(check bool) "log ns output (otlp-e9t0, otlp-l754)" true
+    (member "timestampUnixNano" log = `String "1000000501");
+  Alcotest.(check bool) "fractional log ms (otlp-l754)" true
+    (member "timestampMs" log = `Float 1000.000501);
+  Alcotest.(check bool) "observed log timestamp persisted (otlp-e9t0)" true
+    (member "observedTimestampUnixNano" log = `String "1000000501");
+  let _ = post "/v1/logs"
+    {|{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"stringValue":"ingest fallback"}}]}]}]}|} in
+  let fallback = get "/api/logs/search?body=ingest%20fallback" in
+  let row = match member "logs" fallback with
+    | `List (first :: _) -> first | _ -> Alcotest.fail "missing fallback log" in
+  Alcotest.(check bool) "missing log time uses ingest clock (otlp-e9t0)" true
+    (match member "timestampUnixNano" row with
+     | `String text -> Option.value (int_of_string_opt text) ~default:0 > 0
+     | _ -> false);
+  let _ = post "/v1/traces"
+    {|{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","spanId":"eeeeeeeeeeeeeeee","name":"explicit-ok","startTimeUnixNano":"1000000502","endTimeUnixNano":"1000000503","status":{"code":1}}]}]}]}|} in
+  let explicit = get "/api/spans/eeeeeeeeeeeeeeee" in
+  Alcotest.(check bool) "explicit OK survives storage (otlp-a16d)" true
+    (member "status" explicit = `String "ok");
+  Alcotest.(check bool) "unspecified kind stays null (otlp-5oj4)" true
+    (member "kind" explicit = `Null);
+  Alcotest.(check int) "OK filter includes OK and UNSET (otlp-u6rw)" 2
+    (json_list_length "spans" (get "/api/spans/search?status=ok"))
+
+let test_otlp_store_retry () =
+  let config = temp_config () in
+  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let store = run_store (Store.open_ config) in
+  run_store (Store.close store);
+  let response = run_server_effect
+    (Inn.Server.handler config store
+      (request ~method_:"POST" ~target:"/v1/traces" ~body:trace_fixture ())) in
+  Alcotest.(check int) "closed store returns retryable (otlp-2wg5)" 503
+    (Eta_http.Server.Response.status response);
+  Alcotest.(check bool) "OTLP UNAVAILABLE" true
+    (member "code" (response_json response) = `Int 14);
+  Alcotest.(check (option string)) "Retry-After" (Some "1")
+    (Eta_http.Core.Header.get "retry-after"
+      (Eta_http.Server.Response.headers response))
+
 let () =
   Alcotest.run "inn"
     [
@@ -1515,6 +1653,10 @@ let () =
         [
           Alcotest.test_case "decodes traces, logs, and metrics" `Quick
             test_otlp_decodes_traces_logs_and_metrics;
+          Alcotest.test_case "decoder contracts (otlp-r73z, otlp-6ul3, otlp-8avj, otlp-l0be, otlp-e9t0, otlp-beaj)" `Quick test_otlp_conformance_decoder;
+          Alcotest.test_case "HTTP contracts (otlp-dtfh, otlp-2k5g, otlp-ohmj, otlp-qso2, otlp-l754, otlp-zc8b, otlp-u6rw)" `Quick test_otlp_conformance_handler;
+          Alcotest.test_case "store unavailable retries (otlp-2wg5)" `Quick
+            test_otlp_store_retry;
         ] );
       ( "store",
         [

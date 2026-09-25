@@ -106,11 +106,21 @@ POST /v1/logs
 POST /v1/metrics
 ```
 
-Successful ingest responses:
+Send OTLP JSON with `Content-Type: application/json`. An empty export succeeds with
+HTTP 200 and `{}`. A batch with individually rejected spans returns HTTP 200
+with `{"partialSuccess":{"rejectedSpans":1,"errorMessage":"..."}}`;
+logs and metrics use `rejectedLogRecords` and `rejectedDataPoints`. Bad JSON
+returns 400 with an OTLP `code` and `message`; unsupported content types
+return 415, oversized bodies 413, and store failures 503 with `Retry-After: 1`.
+Protobuf, gzip, and gRPC are not supported.
 
-```json
-{"accepted":1}
-```
+Span and log responses include fractional millisecond timestamps and exact
+`...UnixNano` strings. Span durations retain sub-millisecond precision. Span
+`kind` is lowercase (or null); `status` is `unset`, `ok`, or `error`.
+`status=ok` includes unset spans. Attributes retain their JSON value types,
+while `attr.<key>=<value>` filters compare the string form of values. Spans
+include links and logs without a timestamp use the observed timestamp or
+ingestion time.
 
 ## Query API
 

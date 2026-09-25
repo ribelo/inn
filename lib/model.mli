@@ -1,8 +1,13 @@
-type attrs = (string * string) list
+type attrs = (string * Yojson.Safe.t) list
+
+type span_kind = Internal | Server | Client | Producer | Consumer
+type span_status = Unset | Ok | Error
+
+type span_link = { trace_id : string; span_id : string; attributes : attrs }
 
 type span_event = {
   name : string;
-  timestamp_ms : int;
+  timestamp_ns : int;
   attributes : attrs;
 }
 
@@ -13,15 +18,16 @@ type span = {
   service_name : string;
   scope_name : string option;
   operation_name : string;
-  kind : string option;
-  start_time_ms : int;
-  end_time_ms : int;
+  kind : span_kind option;
+  start_time_ns : int;
+  end_time_ns : int;
   duration_ms : float;
-  status : string;
+  status : span_status;
   status_message : string option;
   attributes : attrs;
   resource : attrs;
   events : span_event list;
+  links : span_link list;
 }
 
 type log_record = {
@@ -31,7 +37,8 @@ type log_record = {
   scope_name : string option;
   severity_text : string;
   severity_number : int option;
-  timestamp_ms : int;
+  timestamp_ns : int;
+  observed_timestamp_ns : int option;
   body : string;
   attributes : attrs;
   resource : attrs;
@@ -44,8 +51,8 @@ type metric_point = {
   description : string option;
   unit_ : string option;
   kind : string;
-  start_time_ms : int option;
-  timestamp_ms : int;
+  start_time_ns : int option;
+  timestamp_ns : int;
   value : string;
   attributes : attrs;
   resource : attrs;
@@ -56,8 +63,8 @@ type trace_summary = {
   trace_id : string;
   service_name : string;
   root_operation_name : string;
-  started_at_ms : int;
-  ended_at_ms : int;
+  started_at_ns : int;
+  ended_at_ns : int;
   duration_ms : float;
   span_count : int;
   error_count : int;
@@ -108,6 +115,11 @@ type facet_item = {
   count : int;
 }
 
+val attr_string_value : Yojson.Safe.t -> string
+val span_kind_to_string : span_kind -> string
+val span_kind_of_string : string -> span_kind option
+val span_status_to_string : span_status -> string
+val span_status_of_string : string -> span_status option
 val attrs_to_json : attrs -> Yojson.Safe.t
 val attrs_json_string : attrs -> string
 val span_to_json : span -> Yojson.Safe.t

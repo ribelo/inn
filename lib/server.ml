@@ -25,8 +25,20 @@ let error_response status code message =
         ("message", `String message);
       ])
 
-let accepted_response accepted =
-  json_response (`Assoc [ ("accepted", `Int accepted) ])
+let otlp_error ?(headers = None) status code message =
+  let response = json_response ~status
+    (`Assoc [ ("code", `Int code); ("message", `String message) ]) in
+  match headers with
+  | None -> response
+  | Some headers ->
+      S.Response.make ~status ~headers ~body:(S.Response.body response)
+        ~trailers:(S.Response.trailers response) ()
+
+let otlp_response rejected_field (decoded : _ Otlp.decoded) =
+  if decoded.rejected = 0 then json_response (`Assoc [])
+  else json_response (`Assoc [ ("partialSuccess", `Assoc [
+    (rejected_field, `Int decoded.rejected);
+    ("errorMessage", `String decoded.error_message) ]) ])
 
 let method_not_allowed () =
   error_response 405 "method_not_allowed" "method is not allowed for this endpoint"
@@ -132,15 +144,26 @@ Query API:
        config.base_url config.base_url config.base_url config.base_url)
 
 let path_item method_ summary =
+  let otlp_ingest = String.equal method_ "POST" in
+  let responses =
+    if otlp_ingest then
+      [ ("200", "OTLP JSON export response: {} or partialSuccess");
+        ("400", "Malformed OTLP JSON (code 3)");
+        ("413", "OTLP JSON body exceeds size limit");
+        ("415", "Only OTLP JSON is supported");
+        ("503", "Store unavailable; retry after one second") ]
+    else [ ("200", "OK") ]
+  in
   `Assoc
     [
       (String.lowercase_ascii method_,
        `Assoc
-         [
-           ("summary", `String summary);
-           ( "responses",
-             `Assoc [ ("200", `Assoc [ ("description", `String "OK") ]) ] );
-         ]);
+         ([ ("summary", `String summary);
+            ("responses", `Assoc (List.map (fun (code, description) ->
+              code, `Assoc [ ("description", `String description) ]) responses)) ]
+          @ if otlp_ingest then
+              [ ("requestBody", `Assoc [ ("content", `Assoc [ ("application/json", `Assoc []) ]) ]) ]
+            else []));
     ]
 
 let openapi config =
@@ -193,14 +216,21 @@ let store_json eff encode =
       Eta.Effect.pure
         (error_response 500 "store_error" (store_error_message error))
 
-let store_accepted eff =
+let add_response_header name value response =
+  let headers = H.Core.Header.unsafe_add name value (S.Response.headers response) in
+  S.Response.make ~headers ~status:(S.Response.status response)
+    ~body:(S.Response.body response)
+    ~trailers:(S.Response.trailers response)
+    ()
+
+let store_accepted rejected_field decoded eff =
   let open Eta.Syntax in
   let* result = Eta.Effect.fold ~ok:(fun value -> Ok value) ~error:(fun error -> Error error) eff in
   match result with
-  | Ok accepted -> Eta.Effect.pure (accepted_response accepted)
+  | Ok _accepted -> Eta.Effect.pure (otlp_response rejected_field decoded)
   | Error error ->
-      Eta.Effect.pure
-        (error_response 500 "store_error" (store_error_message error))
+      let response = otlp_error 503 14 (store_error_message error) in
+      Eta.Effect.pure (add_response_header "retry-after" "1" response)
 
 let param name params = List.assoc_opt name params
 
@@ -251,13 +281,25 @@ let valid_ai_agg = function
 let json_list name encode values =
   `Assoc [ (name, `List (List.map encode values)) ]
 
-let ingest req decode ingest =
+let ingest req rejected_field decode ingest =
   let open Eta.Syntax in
-  let* body = Service.Extractors.body_text ~max_bytes:max_body_bytes req in
-  match decode body with
-  | Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_otlp" message)
-  | Ok values -> store_accepted (ingest values)
+  let content_type = Service.Req.header req "content-type" in
+  match content_type with
+  | Some value when not (String.equal
+       (String.lowercase_ascii (String.trim (List.hd (String.split_on_char ';' value))))
+       "application/json") ->
+      Eta.Effect.pure (otlp_error 415 3 "only OTLP JSON (application/json) is supported")
+  | _ ->
+      let* body_result = Eta.Effect.fold
+        ~ok:(fun value -> Ok value) ~error:(fun error -> Error error)
+        (Service.Extractors.body_text ~max_bytes:max_body_bytes req) in
+      match body_result with
+      | Error { S.Error.kind = Request_body_too_large _; _ } ->
+          Eta.Effect.pure (otlp_error 413 8 "OTLP JSON body is too large")
+      | Error error -> Eta.Effect.fail error
+      | Ok body -> match decode (if String.trim body = "" then "{}" else body) with
+          | Error message -> Eta.Effect.pure (otlp_error 400 3 message)
+          | Ok decoded -> store_accepted rejected_field decoded (ingest decoded.items)
 
 let services store _req =
   store_json (Store.list_services store) (fun services ->
@@ -337,7 +379,7 @@ let attr_any keys attrs =
   List.find_map
     (fun key ->
       match List.assoc_opt key attrs with
-      | Some value -> Some value
+      | Some value -> Some (Model.attr_string_value value)
       | None -> None)
     keys
 
@@ -417,14 +459,14 @@ let is_ai_span (span : Model.span) =
 let span_search_text (span : Model.span) =
   let attrs = span_all_attrs span in
   let attr_text =
-    attrs |> List.map (fun (key, value) -> key ^ "=" ^ value) |> String.concat "\n"
+    attrs |> List.map (fun (key, value) -> key ^ "=" ^ Model.attr_string_value value) |> String.concat "\n"
   in
   let event_text =
     span.events
     |> List.map (fun (event : Model.span_event) ->
            event.Model.name ^ "\n"
            ^ (event.attributes
-             |> List.map (fun (key, value) -> key ^ "=" ^ value)
+             |> List.map (fun (key, value) -> key ^ "=" ^ Model.attr_string_value value)
              |> String.concat "\n"))
     |> String.concat "\n"
   in
@@ -465,7 +507,7 @@ let ai_call_to_json (span : Model.span) =
        ("spanId", `String span.span_id);
        ("serviceName", `String span.service_name);
        ("operationName", `String span.operation_name);
-       ("status", `String span.status);
+       ("status", `String (Model.span_status_to_string span.status));
        ("durationMs", `Float span.duration_ms);
        ("attributes", Model.attrs_to_json span.attributes);
        ("resource", Model.attrs_to_json span.resource);
@@ -512,7 +554,7 @@ let ai_calls store req =
             |> List.filter is_ai_span
             |> List.filter (ai_call_matches params)
             |> List.sort (fun (left : Model.span) (right : Model.span) ->
-                   compare right.Model.start_time_ms left.Model.start_time_ms)
+                   compare right.Model.start_time_ns left.Model.start_time_ns)
             |> fun spans ->
             let rec take acc count = function
               | _ when count <= 0 -> List.rev acc
@@ -612,7 +654,7 @@ let ai_stats store req =
                             Option.value (ai_function_id attrs) ~default:"unknown"
                         | "sessionId" ->
                             Option.value (ai_session_id attrs) ~default:"unknown"
-                        | "status" -> span.Model.status
+                        | "status" -> Model.span_status_to_string span.Model.status
                         | _ -> "unknown"
                       in
                       spans
@@ -858,13 +900,6 @@ let metrics store req =
 
 let stats store _req = store_json (Store.stats store) Model.stats_to_json
 
-let add_response_header name value response =
-  let headers = H.Core.Header.unsafe_add name value (S.Response.headers response) in
-  S.Response.make ~headers ~status:(S.Response.status response)
-    ~body:(S.Response.body response)
-    ~trailers:(S.Response.trailers response)
-    ()
-
 let method_not_allowed_handler ~allowed _request =
   method_not_allowed ()
   |> add_response_header "allow" (String.concat ", " allowed)
@@ -901,11 +936,11 @@ let handler config store =
   add_route router ~methods:[ "GET" ] "/openapi.json" (fun _req ->
       Eta.Effect.pure (openapi config));
   add_route router ~methods:[ "POST" ] "/v1/traces" (fun req ->
-      ingest req Otlp.decode_traces_json (Store.ingest_traces store));
+      ingest req "rejectedSpans" Otlp.decode_traces_json (Store.ingest_traces store));
   add_route router ~methods:[ "POST" ] "/v1/logs" (fun req ->
-      ingest req Otlp.decode_logs_json (Store.ingest_logs store));
+      ingest req "rejectedLogRecords" Otlp.decode_logs_json (Store.ingest_logs store));
   add_route router ~methods:[ "POST" ] "/v1/metrics" (fun req ->
-      ingest req Otlp.decode_metrics_json (Store.ingest_metrics store));
+      ingest req "rejectedDataPoints" Otlp.decode_metrics_json (Store.ingest_metrics store));
   add_route router ~methods:[ "GET" ] "/services" (services store);
   add_route router ~methods:[ "GET" ] "/traces" (traces store);
   add_route router ~methods:[ "GET" ] "/traces/search" (search_traces store);

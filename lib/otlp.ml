@@ -1,3 +1,5 @@
+type 'a decoded = { items : 'a list; rejected : int; error_message : string }
+
 type payload = {
   spans : Model.span list;
   logs : Model.log_record list;
@@ -40,20 +42,17 @@ let int64_of_json = function
   | `Int value -> Some (Int64.of_int value)
   | _ -> None
 
-let ns_to_ms json =
-  match int64_of_json json with
-  | None -> 0
-  | Some ns -> Int64.(to_int (div ns 1_000_000L))
+let ns_of_json json =
+  match json with
+  | `String value | `Intlit value -> Option.value (int_of_string_opt value) ~default:0
+  | `Int value -> value
+  | _ -> 0
 
-let time_member_ms name json =
-  match member name json with
-  | Some value -> ns_to_ms value
-  | None -> 0
+let time_member_ns name json =
+  match member name json with Some value -> ns_of_json value | None -> 0
 
-let optional_time_member_ms name json =
-  match member name json with
-  | Some value -> Some (ns_to_ms value)
-  | None -> None
+let optional_time_member_ns name json =
+  Option.map ns_of_json (member name json)
 
 let rec any_value_to_json json =
   match json with
@@ -68,12 +67,14 @@ let rec any_value_to_json json =
           member "kvlistValue" json )
       with
       | Some (`String value), _, _, _, _, _, _ -> `String value
-      | _, Some (`String value), _, _, _, _, _ -> `String value
+      | _, Some (`String value), _, _, _, _, _ -> (match int_of_string_opt value with
+          | Some number -> `Int number
+          | None -> if Option.is_some (Int64.of_string_opt value) then `Intlit value else `String value)
       | _, Some (`Int value), _, _, _, _, _ -> `Int value
-      | _, Some (`Intlit value), _, _, _, _, _ -> `String value
+      | _, Some (`Intlit value), _, _, _, _, _ -> `Intlit value
       | _, _, Some (`Float value), _, _, _, _ -> `Float value
       | _, _, Some (`Int value), _, _, _, _ -> `Int value
-      | _, _, Some (`String value), _, _, _, _ -> `String value
+      | _, _, Some (`String value), _, _, _, _ -> (match float_of_string_opt value with Some number -> `Float number | None -> `String value)
       | _, _, _, Some (`Bool value), _, _, _ -> `Bool value
       | _, _, _, _, Some (`String value), _, _ -> `String value
       | _, _, _, _, _, Some array_value, _ ->
@@ -89,32 +90,32 @@ let rec any_value_to_json json =
       | _ -> json)
   | value -> value
 
-let any_value_to_string json =
-  match any_value_to_json json with
-  | `String value -> value
-  | `Int value -> string_of_int value
-  | `Intlit value -> value
-  | `Float value -> string_of_float value
-  | `Bool value -> string_of_bool value
-  | `Null -> ""
-  | value -> Yojson.Safe.to_string value
+let any_value_to_string json = Model.attr_string_value (any_value_to_json json)
 
 let attrs json =
   list_member "attributes" json
   |> List.filter_map (fun attr ->
          match (string_member "key" attr, member "value" attr) with
-         | Some key, Some value -> Some (key, any_value_to_string value)
+         | Some key, Some value -> Some (key, any_value_to_json value)
          | _ -> None)
 
 let service_name resource_attrs =
-  let value =
-    match List.assoc_opt "service.name" resource_attrs with
+  let value = match List.assoc_opt "service.name" resource_attrs with
     | Some _ as value -> value
-    | None -> List.assoc_opt "service_name" resource_attrs
-  in
+    | None -> List.assoc_opt "service_name" resource_attrs in
   match value with
-  | Some value when value <> "" -> value
+  | Some value when Model.attr_string_value value <> "" -> Model.attr_string_value value
   | _ -> "unknown"
+
+let valid_id length value =
+  String.length value = length
+  && String.exists (fun c -> c <> '0') value
+  && String.for_all (function
+       | '0'..'9' | 'a'..'f' | 'A'..'F' -> true | _ -> false) value
+
+let normalized_id length = function
+  | Some value when valid_id length value -> Some (String.lowercase_ascii value)
+  | _ -> None
 
 let scope_name scope =
   match member "scope" scope with
@@ -123,58 +124,68 @@ let scope_name scope =
 
 let span_status span =
   match member "status" span with
-  | Some status -> (
+  | Some status ->
       let message = string_member "message" status in
-      match int_member "code" status with
-      | Some 2 -> ("error", message)
-      | _ -> ("ok", message))
-  | None -> ("ok", None)
+      let code = match string_member "code" status with
+        | Some ("1" | "STATUS_CODE_OK") -> Model.Ok
+        | Some ("2" | "STATUS_CODE_ERROR") -> Model.Error
+        | _ -> Model.Unset in
+      (code, message)
+  | None -> (Model.Unset, None)
 
 let span_event event =
   {
     Model.name = Option.value (string_member "name" event) ~default:"event";
-    timestamp_ms = time_member_ms "timeUnixNano" event;
+    timestamp_ns = time_member_ns "timeUnixNano" event;
     attributes = attrs event;
   }
 
+let span_link link =
+  match normalized_id 32 (string_member "traceId" link),
+        normalized_id 16 (string_member "spanId" link) with
+  | Some trace_id, Some span_id -> Some { Model.trace_id; span_id; attributes = attrs link }
+  | _ -> None
+
 let decode_span ~resource ~service_name ~scope_name span =
-  let trace_id = Option.value (string_member "traceId" span) ~default:"" in
-  let span_id = Option.value (string_member "spanId" span) ~default:"" in
-  let start_time_ms = time_member_ms "startTimeUnixNano" span in
-  let end_time_ms = time_member_ms "endTimeUnixNano" span in
-  let status, status_message = span_status span in
-  {
-    Model.trace_id = trace_id;
-    span_id;
-    parent_span_id = string_member "parentSpanId" span;
-    service_name;
-    scope_name;
-    operation_name = Option.value (string_member "name" span) ~default:"";
-    kind = string_member "kind" span;
-    start_time_ms;
-    end_time_ms;
-    duration_ms = float_of_int (max 0 (end_time_ms - start_time_ms));
-    status;
-    status_message;
-    attributes = attrs span;
-    resource;
-    events = List.map span_event (list_member "events" span);
-  }
+  match normalized_id 32 (string_member "traceId" span),
+        normalized_id 16 (string_member "spanId" span) with
+  | Some trace_id, Some span_id ->
+      let start_time_ns = time_member_ns "startTimeUnixNano" span in
+      let end_time_ns = time_member_ns "endTimeUnixNano" span in
+      let status, status_message = span_status span in
+      let kind = match string_member "kind" span with
+        | Some ("1" | "SPAN_KIND_INTERNAL") -> Some Model.Internal
+        | Some ("2" | "SPAN_KIND_SERVER") -> Some Model.Server
+        | Some ("3" | "SPAN_KIND_CLIENT") -> Some Model.Client
+        | Some ("4" | "SPAN_KIND_PRODUCER") -> Some Model.Producer
+        | Some ("5" | "SPAN_KIND_CONSUMER") -> Some Model.Consumer
+        | _ -> None in
+      Some {
+        Model.trace_id; span_id;
+        parent_span_id = normalized_id 16 (string_member "parentSpanId" span);
+        service_name; scope_name;
+        operation_name = Option.value (string_member "name" span) ~default:"";
+        kind; start_time_ns; end_time_ns;
+        duration_ms = float_of_int (max 0 (end_time_ns - start_time_ns)) /. 1_000_000.;
+        status; status_message; attributes = attrs span; resource;
+        events = List.map span_event (list_member "events" span);
+        links = List.filter_map span_link (list_member "links" span);
+      }
+  | _ -> None
 
 let decode_traces json =
-  list_member "resourceSpans" json
-  |> List.concat_map (fun resource_spans ->
-         let resource =
-           match member "resource" resource_spans with
-           | Some resource -> attrs resource
-           | None -> []
-         in
-         let service_name = service_name resource in
-         list_member "scopeSpans" resource_spans
-         |> List.concat_map (fun scope_spans ->
-                let scope_name = scope_name scope_spans in
-                list_member "spans" scope_spans
-                |> List.map (decode_span ~resource ~service_name ~scope_name)))
+  let spans = list_member "resourceSpans" json
+    |> List.concat_map (fun group ->
+      let resource = match member "resource" group with
+        | Some resource -> attrs resource | None -> [] in
+      let service_name = service_name resource in
+      list_member "scopeSpans" group |> List.concat_map (fun scope ->
+        let scope_name = scope_name scope in
+        list_member "spans" scope
+        |> List.map (decode_span ~resource ~service_name ~scope_name))) in
+  let accepted = List.filter_map Fun.id spans in
+  { items = accepted; rejected = List.length spans - List.length accepted;
+    error_message = "span traceId must be 32 hex characters and spanId 16 hex characters, neither all zero" }
 
 let decode_log ~resource ~service_name ~scope_name log =
   let body =
@@ -183,17 +194,26 @@ let decode_log ~resource ~service_name ~scope_name log =
     | None -> ""
   in
   {
-    Model.trace_id = string_member "traceId" log;
-    span_id = string_member "spanId" log;
+    Model.trace_id = (let id = normalized_id 32 (string_member "traceId" log) in
+      match id with Some _ -> id | None ->
+        let values = attrs log in
+        let attr_id = match List.assoc_opt "traceId" values with
+          | Some _ as x -> x | None -> List.assoc_opt "trace_id" values in
+        normalized_id 32 (Option.map Model.attr_string_value attr_id));
+    span_id = (let id = normalized_id 16 (string_member "spanId" log) in
+      match id with Some _ -> id | None ->
+        let values = attrs log in
+        let attr_id = match List.assoc_opt "spanId" values with
+          | Some _ as x -> x | None -> List.assoc_opt "span_id" values in
+        normalized_id 16 (Option.map Model.attr_string_value attr_id));
     service_name;
     scope_name;
     severity_text =
       Option.value (string_member "severityText" log) ~default:"UNSPECIFIED";
     severity_number = int_member "severityNumber" log;
-    timestamp_ms =
-      (match member "timeUnixNano" log with
-      | Some value -> ns_to_ms value
-      | None -> time_member_ms "observedTimeUnixNano" log);
+    timestamp_ns = (let ns = time_member_ns "timeUnixNano" log in
+      if ns <> 0 then ns else time_member_ns "observedTimeUnixNano" log);
+    observed_timestamp_ns = optional_time_member_ns "observedTimeUnixNano" log;
     body;
     attributes = attrs log;
     resource;
@@ -238,8 +258,8 @@ let metric_points_for_data ~resource ~service_name ~scope_name metric kind data 
         description = string_member "description" metric;
         unit_ = string_member "unit" metric;
         kind;
-        start_time_ms = optional_time_member_ms "startTimeUnixNano" point;
-        timestamp_ms = time_member_ms "timeUnixNano" point;
+        start_time_ns = optional_time_member_ns "startTimeUnixNano" point;
+        timestamp_ns = time_member_ns "timeUnixNano" point;
         value = point_value point;
         attributes = attrs point;
         resource;
@@ -271,22 +291,8 @@ let decode_metrics json =
                 |> List.concat_map
                      (decode_metric ~resource ~service_name ~scope_name)))
 
-let require_non_empty kind values =
-  match values with
-  | [] -> Error ("OTLP payload contained no " ^ kind)
-  | _ -> Ok values
-
-let decode_traces_json text =
-  match parse_json text with
-  | Error _ as error -> error
-  | Ok json -> require_non_empty "spans" (decode_traces json)
-
-let decode_logs_json text =
-  match parse_json text with
-  | Error _ as error -> error
-  | Ok json -> require_non_empty "logs" (decode_logs json)
-
-let decode_metrics_json text =
-  match parse_json text with
-  | Error _ as error -> error
-  | Ok json -> require_non_empty "metric points" (decode_metrics json)
+let decode_traces_json text = Result.map decode_traces (parse_json text)
+let decode_logs_json text = Result.map (fun json ->
+  { items = decode_logs json; rejected = 0; error_message = "" }) (parse_json text)
+let decode_metrics_json text = Result.map (fun json ->
+  { items = decode_metrics json; rejected = 0; error_message = "" }) (parse_json text)

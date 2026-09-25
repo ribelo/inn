@@ -101,7 +101,7 @@ type metric_filter = {
    every change to the statements in [schemas]. [open_] recreates any database
    whose stored version differs, so a schema change without a bump would be
    silently skipped on an existing database (schm-hnis). *)
-let schema_version = 2
+let schema_version = 3
 
 let schema_version_text = string_of_int schema_version
 
@@ -131,14 +131,15 @@ module Spans = struct
   let scope_name = column "scope_name" (Q.nullable Q.text)
   let operation_name = column "operation_name" Q.text
   let kind = column "kind" (Q.nullable Q.text)
-  let start_time_ms = column "start_time_ms" Q.int
-  let end_time_ms = column "end_time_ms" Q.int
+  let start_time_ns = column "start_time_ns" Q.int
+  let end_time_ns = column "end_time_ns" Q.int
   let duration_ms = column "duration_ms" Q.float
   let status = column "status" Q.text
   let status_message = column "status_message" (Q.nullable Q.text)
   let attributes_json = column "attributes_json" Q.text
   let resource_json = column "resource_json" Q.text
   let events_json = column "events_json" Q.text
+  let links_json = column "links_json" Q.text
   let ingested_at_ms = column "ingested_at_ms" Q.int
 end
 
@@ -169,7 +170,8 @@ module Logs = struct
   let scope_name = column "scope_name" (Q.nullable Q.text)
   let severity_text = column "severity_text" Q.text
   let severity_number = column "severity_number" (Q.nullable Q.int)
-  let timestamp_ms = column "timestamp_ms" Q.int
+  let timestamp_ns = column "timestamp_ns" Q.int
+  let observed_timestamp_ns = column "observed_timestamp_ns" (Q.nullable Q.int)
   let body = column "body" Q.text
   let attributes_json = column "attributes_json" Q.text
   let resource_json = column "resource_json" Q.text
@@ -199,8 +201,8 @@ module Trace_summaries = struct
   let trace_id = column "trace_id" Q.text
   let service_name = column "service_name" Q.text
   let root_operation_name = column "root_operation_name" Q.text
-  let started_at_ms = column "started_at_ms" Q.int
-  let ended_at_ms = column "ended_at_ms" Q.int
+  let started_at_ns = column "started_at_ns" Q.int
+  let ended_at_ns = column "ended_at_ns" Q.int
   let duration_ms = column "duration_ms" Q.float
   let span_count = column "span_count" Q.int
   let error_count = column "error_count" Q.int
@@ -221,8 +223,8 @@ module Metric_points = struct
   let description = column "description" (Q.nullable Q.text)
   let unit_ = column "unit" (Q.nullable Q.text)
   let kind = column "kind" Q.text
-  let start_time_ms = column "start_time_ms" (Q.nullable Q.int)
-  let timestamp_ms = column "timestamp_ms" Q.int
+  let start_time_ns = column "start_time_ns" (Q.nullable Q.int)
+  let timestamp_ns = column "timestamp_ns" Q.int
   let value = column "value" Q.text
   let attributes_json = column "attributes_json" Q.text
   let resource_json = column "resource_json" Q.text
@@ -286,7 +288,7 @@ let event_to_json (event : Model.span_event) =
   `Assoc
     [
       ("name", `String event.Model.name);
-      ("timestampMs", `Int event.timestamp_ms);
+      ("timestampUnixNano", `String (string_of_int event.timestamp_ns));
       ("attributes", Model.attrs_to_json event.attributes);
     ]
 
@@ -295,13 +297,27 @@ let events_json events = Yojson.Safe.to_string (`List (List.map event_to_json ev
 let attrs_of_json text =
   match Yojson.Safe.from_string text with
   | `Assoc fields ->
-      List.filter_map
-        (function
-          | key, `String value -> Some (key, value)
-          | key, value -> Some (key, Yojson.Safe.to_string value))
-        fields
+      fields
   | _ -> []
   | exception _ -> []
+
+let links_of_json text =
+  match Yojson.Safe.from_string text with
+  | `List links -> List.filter_map (function
+      | `Assoc fields -> (match List.assoc_opt "traceId" fields, List.assoc_opt "spanId" fields with
+          | Some (`String trace_id), Some (`String span_id) ->
+              let attributes = match List.assoc_opt "attributes" fields with
+                | Some json -> attrs_of_json (Yojson.Safe.to_string json) | None -> [] in
+              Some { Model.trace_id; span_id; attributes }
+          | _ -> None)
+      | _ -> None) links
+  | _ -> []
+  | exception _ -> []
+
+let links_json links =
+  Yojson.Safe.to_string (`List (List.map (fun (link : Model.span_link) ->
+    `Assoc [ ("traceId", `String link.trace_id); ("spanId", `String link.span_id);
+             ("attributes", Model.attrs_to_json link.attributes) ]) links))
 
 let events_of_json text =
   match Yojson.Safe.from_string text with
@@ -315,8 +331,9 @@ let events_of_json text =
                 | Some (`String value) -> value
                 | _ -> "event"
               in
-              let timestamp_ms =
-                match find "timestampMs" with
+              let timestamp_ns =
+                match find "timestampUnixNano" with
+                | Some (`String value) -> Option.value (int_of_string_opt value) ~default:0
                 | Some (`Int value) -> value
                 | _ -> 0
               in
@@ -325,7 +342,7 @@ let events_of_json text =
                 | Some json -> attrs_of_json (Yojson.Safe.to_string json)
                 | None -> []
               in
-              Some { Model.name; timestamp_ms; attributes }
+              Some { Model.name; timestamp_ns; attributes }
           | _ -> None)
         events
   | _ -> []
@@ -393,20 +410,21 @@ let schemas =
         column Spans.scope_name;
         column ~not_null:true Spans.operation_name;
         column Spans.kind;
-        column ~not_null:true Spans.start_time_ms;
-        column ~not_null:true Spans.end_time_ms;
+        column ~not_null:true Spans.start_time_ns;
+        column ~not_null:true Spans.end_time_ns;
         column ~not_null:true Spans.duration_ms;
         column ~not_null:true Spans.status;
         column Spans.status_message;
         column ~not_null:true Spans.attributes_json;
         column ~not_null:true Spans.resource_json;
         column ~not_null:true Spans.events_json;
+        column ~not_null:true Spans.links_json;
         column ~not_null:true Spans.ingested_at_ms;
       ];
     create_index ~if_not_exists:true ~name:"idx_spans_service" Spans.table
       [ Q.Column.any Spans.service_name ];
     create_index ~if_not_exists:true ~name:"idx_spans_start_time" Spans.table
-      [ Q.Column.any Spans.start_time_ms ];
+      [ Q.Column.any Spans.start_time_ns ];
     create_index ~if_not_exists:true ~name:"idx_spans_trace" Spans.table
       [ Q.Column.any Spans.trace_id ];
     create_index ~if_not_exists:true ~name:"idx_spans_span_id" Spans.table
@@ -434,7 +452,8 @@ let schemas =
         column Logs.scope_name;
         column ~not_null:true Logs.severity_text;
         column Logs.severity_number;
-        column ~not_null:true Logs.timestamp_ms;
+        column ~not_null:true Logs.timestamp_ns;
+        column Logs.observed_timestamp_ns;
         column ~not_null:true Logs.body;
         column ~not_null:true Logs.attributes_json;
         column ~not_null:true Logs.resource_json;
@@ -443,7 +462,7 @@ let schemas =
     create_index ~if_not_exists:true ~name:"idx_logs_service" Logs.table
       [ Q.Column.any Logs.service_name ];
     create_index ~if_not_exists:true ~name:"idx_logs_timestamp" Logs.table
-      [ Q.Column.any Logs.timestamp_ms ];
+      [ Q.Column.any Logs.timestamp_ns ];
     create_index ~if_not_exists:true ~name:"idx_logs_trace" Logs.table
       [ Q.Column.any Logs.trace_id ];
     create_index ~if_not_exists:true ~name:"idx_logs_span" Logs.table
@@ -469,8 +488,8 @@ let schemas =
         column ~primary_key:true Trace_summaries.trace_id;
         column ~not_null:true Trace_summaries.service_name;
         column ~not_null:true Trace_summaries.root_operation_name;
-        column ~not_null:true Trace_summaries.started_at_ms;
-        column ~not_null:true Trace_summaries.ended_at_ms;
+        column ~not_null:true Trace_summaries.started_at_ns;
+        column ~not_null:true Trace_summaries.ended_at_ns;
         column ~not_null:true Trace_summaries.duration_ms;
         column ~not_null:true Trace_summaries.span_count;
         column ~not_null:true Trace_summaries.error_count;
@@ -479,7 +498,7 @@ let schemas =
     create_index ~if_not_exists:true ~name:"idx_trace_summaries_service"
       Trace_summaries.table [ Q.Column.any Trace_summaries.service_name ];
     create_index ~if_not_exists:true ~name:"idx_trace_summaries_started"
-      Trace_summaries.table [ Q.Column.any Trace_summaries.started_at_ms ];
+      Trace_summaries.table [ Q.Column.any Trace_summaries.started_at_ns ];
     create_index ~if_not_exists:true ~name:"idx_trace_summaries_updated"
       Trace_summaries.table [ Q.Column.any Trace_summaries.updated_at_ms ];
     create_table ~if_not_exists:true Metric_points.table
@@ -491,8 +510,8 @@ let schemas =
         column Metric_points.description;
         column Metric_points.unit_;
         column ~not_null:true Metric_points.kind;
-        column Metric_points.start_time_ms;
-        column ~not_null:true Metric_points.timestamp_ms;
+        column Metric_points.start_time_ns;
+        column ~not_null:true Metric_points.timestamp_ns;
         column ~not_null:true Metric_points.value;
         column ~not_null:true Metric_points.attributes_json;
         column ~not_null:true Metric_points.resource_json;
@@ -502,7 +521,7 @@ let schemas =
     create_index ~if_not_exists:true ~name:"idx_metric_points_service"
       Metric_points.table [ Q.Column.any Metric_points.service_name ];
     create_index ~if_not_exists:true ~name:"idx_metric_points_timestamp"
-      Metric_points.table [ Q.Column.any Metric_points.timestamp_ms ];
+      Metric_points.table [ Q.Column.any Metric_points.timestamp_ns ];
     create_index ~if_not_exists:true ~name:"idx_metric_points_name"
       Metric_points.table [ Q.Column.any Metric_points.name ];
     create_index ~if_not_exists:true ~name:"idx_metric_points_ingested"
@@ -768,14 +787,14 @@ let span_projection =
                scope_name,
                operation_name,
                kind,
-               start_time_ms ),
-             ( end_time_ms,
+               start_time_ns ),
+             ( end_time_ns,
                duration_ms,
                status,
                status_message,
                attributes_json,
                resource_json,
-               events_json ) ) ->
+               events_json, links_json ) ) ->
         {
           Model.trace_id;
           span_id;
@@ -783,23 +802,25 @@ let span_projection =
           service_name;
           scope_name;
           operation_name;
-          kind;
-          start_time_ms;
-          end_time_ms;
+          kind = Option.bind kind Model.span_kind_of_string;
+          start_time_ns;
+          end_time_ns;
           duration_ms;
-          status;
+          status = Option.value (Model.span_status_of_string status) ~default:Model.Unset;
           status_message;
           attributes = attrs_of_json attributes_json;
           resource = attrs_of_json resource_json;
           events = events_of_json events_json;
+          links = links_of_json links_json;
         })
       (t2
          (t8 (one Spans.trace_id) (one Spans.span_id) (one Spans.parent_span_id)
             (one Spans.service_name) (one Spans.scope_name)
-            (one Spans.operation_name) (one Spans.kind) (one Spans.start_time_ms))
-         (t7 (one Spans.end_time_ms) (one Spans.duration_ms) (one Spans.status)
+            (one Spans.operation_name) (one Spans.kind) (one Spans.start_time_ns))
+         (t8 (one Spans.end_time_ns) (one Spans.duration_ms) (one Spans.status)
             (one Spans.status_message) (one Spans.attributes_json)
-            (one Spans.resource_json) (one Spans.events_json))))
+            (one Spans.resource_json) (one Spans.events_json)
+            (one Spans.links_json))))
 
 let log_projection =
   Q.Projection.(
@@ -810,9 +831,9 @@ let log_projection =
                scope_name,
                severity_text,
                severity_number,
-               timestamp_ms,
+               timestamp_ns,
                body ),
-             (attributes_json, resource_json) ) ->
+             (attributes_json, resource_json, observed_timestamp_ns) ) ->
         {
           Model.trace_id;
           span_id;
@@ -820,7 +841,8 @@ let log_projection =
           scope_name;
           severity_text;
           severity_number;
-          timestamp_ms;
+          timestamp_ns;
+          observed_timestamp_ns;
           body;
           attributes = attrs_of_json attributes_json;
           resource = attrs_of_json resource_json;
@@ -828,8 +850,9 @@ let log_projection =
       (t2
          (t8 (one Logs.trace_id) (one Logs.span_id) (one Logs.service_name)
             (one Logs.scope_name) (one Logs.severity_text)
-            (one Logs.severity_number) (one Logs.timestamp_ms) (one Logs.body))
-         (t2 (one Logs.attributes_json) (one Logs.resource_json))))
+            (one Logs.severity_number) (one Logs.timestamp_ns) (one Logs.body))
+         (t3 (one Logs.attributes_json) (one Logs.resource_json)
+           (one Logs.observed_timestamp_ns))))
 
 let metric_projection =
   Q.Projection.(
@@ -840,8 +863,8 @@ let metric_projection =
                description,
                unit_,
                kind,
-               start_time_ms,
-               timestamp_ms ),
+               start_time_ns,
+               timestamp_ns ),
              (value, attributes_json, resource_json, raw_json) ) ->
         let raw_json =
           match Yojson.Safe.from_string raw_json with
@@ -855,8 +878,8 @@ let metric_projection =
           description;
           unit_;
           kind;
-          start_time_ms;
-          timestamp_ms;
+          start_time_ns;
+          timestamp_ns;
           value;
           attributes = attrs_of_json attributes_json;
           resource = attrs_of_json resource_json;
@@ -866,7 +889,7 @@ let metric_projection =
          (t8 (one Metric_points.service_name) (one Metric_points.scope_name)
             (one Metric_points.name) (one Metric_points.description)
             (one Metric_points.unit_) (one Metric_points.kind)
-            (one Metric_points.start_time_ms) (one Metric_points.timestamp_ms))
+            (one Metric_points.start_time_ns) (one Metric_points.timestamp_ns))
          (t4 (one Metric_points.value) (one Metric_points.attributes_json)
             (one Metric_points.resource_json) (one Metric_points.raw_json))))
 
@@ -876,8 +899,8 @@ let trace_summary_projection =
       (fun ( trace_id,
              service_name,
              root_operation_name,
-             started_at_ms,
-             ended_at_ms,
+             started_at_ns,
+             ended_at_ns,
              duration_ms,
              span_count,
              error_count ) ->
@@ -885,15 +908,15 @@ let trace_summary_projection =
           Model.trace_id;
           service_name;
           root_operation_name;
-          started_at_ms;
-          ended_at_ms;
+          started_at_ns;
+          ended_at_ns;
           duration_ms;
           span_count;
           error_count;
         })
       (t8 (one Trace_summaries.trace_id) (one Trace_summaries.service_name)
          (one Trace_summaries.root_operation_name)
-         (one Trace_summaries.started_at_ms) (one Trace_summaries.ended_at_ms)
+         (one Trace_summaries.started_at_ns) (one Trace_summaries.ended_at_ns)
          (one Trace_summaries.duration_ms) (one Trace_summaries.span_count)
          (one Trace_summaries.error_count)))
 
@@ -901,7 +924,7 @@ let span_query trace_id =
     Q.Select.(
       from Spans.table span_projection
       |> where Q.Expr.(eq Spans.trace_id trace_id)
-      |> order_by Spans.start_time_ms)
+      |> order_by Spans.start_time_ns)
 
 let select_spans_for_trace_pool runner trace_id =
   q_select_pool runner (span_query trace_id)
@@ -913,20 +936,20 @@ let span_id_query span_id =
   Q.Select.(
     from Spans.table span_projection
     |> where Q.Expr.(eq Spans.span_id span_id)
-    |> order_by ~desc:true Spans.start_time_ms
+    |> order_by ~desc:true Spans.start_time_ns
     |> limit 1)
 
 let logs_for_trace_query trace_id =
   Q.Select.(
     from Logs.table log_projection
     |> where Q.Expr.(eq Logs.trace_id (Some trace_id))
-    |> order_by Logs.timestamp_ms)
+    |> order_by Logs.timestamp_ns)
 
 let logs_for_span_query span_id =
   Q.Select.(
     from Logs.table log_projection
     |> where Q.Expr.(eq Logs.span_id (Some span_id))
-    |> order_by Logs.timestamp_ms)
+    |> order_by Logs.timestamp_ns)
 
 let sorted_unique values = List.sort_uniq String.compare values
 
@@ -955,7 +978,7 @@ let attr_group_key group_by =
          (String.length group_by - String.length attr_group_prefix))
   else None
 
-let attr_value key attrs = List.assoc_opt key attrs
+let attr_value key attrs = Option.map Model.attr_string_value (List.assoc_opt key attrs)
 
 let add_count table key =
   let count = Option.value (Hashtbl.find_opt table key) ~default:0 in
@@ -1067,7 +1090,7 @@ let insert_span_attrs runner owner_id attrs =
       |> value Span_attributes.id (attr_row_id owner_id index key)
       |> value Span_attributes.owner_id owner_id
       |> value Span_attributes.key key
-      |> value Span_attributes.value attr_value
+      |> value Span_attributes.value (Model.attr_string_value attr_value)
       |> compile)
   in
   let* _ =
@@ -1085,7 +1108,7 @@ let insert_log_attrs runner owner_id attrs =
       |> value Log_attributes.id (attr_row_id owner_id index key)
       |> value Log_attributes.owner_id owner_id
       |> value Log_attributes.key key
-      |> value Log_attributes.value attr_value
+      |> value Log_attributes.value (Model.attr_string_value attr_value)
       |> compile)
   in
   let* _ =
@@ -1103,7 +1126,7 @@ let insert_metric_attrs runner owner_id attrs =
       |> value Metric_attributes.id (attr_row_id owner_id index key)
       |> value Metric_attributes.owner_id owner_id
       |> value Metric_attributes.key key
-      |> value Metric_attributes.value attr_value
+      |> value Metric_attributes.value (Model.attr_string_value attr_value)
       |> compile)
   in
   let* _ =
@@ -1122,7 +1145,7 @@ let refresh_trace_summary ~now_ms runner trace_id =
       let ordered =
         List.sort
           (fun (left : Model.span) right ->
-            compare left.start_time_ms right.start_time_ms)
+            compare left.start_time_ns right.start_time_ns)
           spans
       in
       let root =
@@ -1130,20 +1153,20 @@ let refresh_trace_summary ~now_ms runner trace_id =
         | Some span -> span
         | None -> List.hd ordered
       in
-      let started_at_ms =
+      let started_at_ns =
         List.fold_left
-          (fun acc (span : Model.span) -> min acc span.start_time_ms)
-          root.start_time_ms spans
+          (fun acc (span : Model.span) -> min acc span.start_time_ns)
+          root.start_time_ns spans
       in
-      let ended_at_ms =
+      let ended_at_ns =
         List.fold_left
-          (fun acc (span : Model.span) -> max acc span.end_time_ms)
-          root.end_time_ms spans
+          (fun acc (span : Model.span) -> max acc span.end_time_ns)
+          root.end_time_ns spans
       in
       let error_count =
         List.fold_left
           (fun acc (span : Model.span) ->
-            if String.equal span.status "error" then acc + 1 else acc)
+            if span.status = Model.Error then acc + 1 else acc)
           0 spans
       in
       let insert =
@@ -1152,10 +1175,10 @@ let refresh_trace_summary ~now_ms runner trace_id =
           |> value Trace_summaries.trace_id trace_id
           |> value Trace_summaries.service_name root.service_name
           |> value Trace_summaries.root_operation_name root.operation_name
-          |> value Trace_summaries.started_at_ms started_at_ms
-          |> value Trace_summaries.ended_at_ms ended_at_ms
+          |> value Trace_summaries.started_at_ns started_at_ns
+          |> value Trace_summaries.ended_at_ns ended_at_ns
           |> value Trace_summaries.duration_ms
-               (float_of_int (ended_at_ms - started_at_ms))
+               (float_of_int (ended_at_ns - started_at_ns) /. 1_000_000.)
           |> value Trace_summaries.span_count (List.length spans)
           |> value Trace_summaries.error_count error_count
           |> value Trace_summaries.updated_at_ms now_ms
@@ -1167,9 +1190,9 @@ let refresh_trace_summary ~now_ms runner trace_id =
           table Trace_summaries.table
           |> set Trace_summaries.service_name root.service_name
           |> set Trace_summaries.root_operation_name root.operation_name
-          |> set Trace_summaries.started_at_ms started_at_ms
-          |> set Trace_summaries.ended_at_ms ended_at_ms
-          |> set Trace_summaries.duration_ms (float_of_int (ended_at_ms - started_at_ms))
+          |> set Trace_summaries.started_at_ns started_at_ns
+          |> set Trace_summaries.ended_at_ns ended_at_ns
+          |> set Trace_summaries.duration_ms (float_of_int (ended_at_ns - started_at_ns) /. 1_000_000.)
           |> set Trace_summaries.span_count (List.length spans)
           |> set Trace_summaries.error_count error_count
           |> set Trace_summaries.updated_at_ms now_ms
@@ -1477,15 +1500,16 @@ let ingest_traces t spans =
         |> value Spans.service_name span.service_name
         |> value Spans.scope_name span.scope_name
         |> value Spans.operation_name span.operation_name
-        |> value Spans.kind span.kind
-        |> value Spans.start_time_ms span.start_time_ms
-        |> value Spans.end_time_ms span.end_time_ms
+        |> value Spans.kind (Option.map Model.span_kind_to_string span.kind)
+        |> value Spans.start_time_ns span.start_time_ns
+        |> value Spans.end_time_ns span.end_time_ns
         |> value Spans.duration_ms span.duration_ms
-        |> value Spans.status span.status
+        |> value Spans.status (Model.span_status_to_string span.status)
         |> value Spans.status_message span.status_message
         |> value Spans.attributes_json (Model.attrs_json_string span.attributes)
         |> value Spans.resource_json (Model.attrs_json_string span.resource)
         |> value Spans.events_json (events_json span.events)
+        |> value Spans.links_json (links_json span.links)
         |> value Spans.ingested_at_ms now_ms
         |> on_conflict_do_nothing [ Q.Column.any Spans.id ]
         |> compile)
@@ -1499,15 +1523,16 @@ let ingest_traces t spans =
         |> set Spans.service_name span.service_name
         |> set Spans.scope_name span.scope_name
         |> set Spans.operation_name span.operation_name
-        |> set Spans.kind span.kind
-        |> set Spans.start_time_ms span.start_time_ms
-        |> set Spans.end_time_ms span.end_time_ms
+        |> set Spans.kind (Option.map Model.span_kind_to_string span.kind)
+        |> set Spans.start_time_ns span.start_time_ns
+        |> set Spans.end_time_ns span.end_time_ns
         |> set Spans.duration_ms span.duration_ms
-        |> set Spans.status span.status
+        |> set Spans.status (Model.span_status_to_string span.status)
         |> set Spans.status_message span.status_message
         |> set Spans.attributes_json (Model.attrs_json_string span.attributes)
         |> set Spans.resource_json (Model.attrs_json_string span.resource)
         |> set Spans.events_json (events_json span.events)
+        |> set Spans.links_json (links_json span.links)
         |> set Spans.ingested_at_ms now_ms
         |> where Q.Expr.(eq Spans.id id)
         |> compile)
@@ -1532,6 +1557,7 @@ let ingest_logs t logs =
   let now_ms = t.now_ms () in
   let insert_log runner (log : Model.log_record) =
     let id = fresh_id "log" in
+    let timestamp_ns = if log.timestamp_ns = 0 then now_ms * 1_000_000 else log.timestamp_ns in
     let query =
       Q.Insert.(
         into Logs.table
@@ -1542,7 +1568,8 @@ let ingest_logs t logs =
         |> value Logs.scope_name log.scope_name
         |> value Logs.severity_text log.severity_text
         |> value Logs.severity_number log.severity_number
-        |> value Logs.timestamp_ms log.timestamp_ms
+        |> value Logs.timestamp_ns timestamp_ns
+        |> value Logs.observed_timestamp_ns log.observed_timestamp_ns
         |> value Logs.body log.body
         |> value Logs.attributes_json (Model.attrs_json_string log.attributes)
         |> value Logs.resource_json (Model.attrs_json_string log.resource)
@@ -1574,8 +1601,8 @@ let ingest_metrics t points =
         |> value Metric_points.description point.description
         |> value Metric_points.unit_ point.unit_
         |> value Metric_points.kind point.kind
-        |> value Metric_points.start_time_ms point.start_time_ms
-        |> value Metric_points.timestamp_ms point.timestamp_ms
+        |> value Metric_points.start_time_ns point.start_time_ns
+        |> value Metric_points.timestamp_ns point.timestamp_ns
         |> value Metric_points.value point.value
         |> value Metric_points.attributes_json
              (Model.attrs_json_string point.attributes)
@@ -1634,7 +1661,7 @@ let list_trace_summaries ?service ?(limit = 100) t =
     Q.Select.(
       from Trace_summaries.table trace_summary_projection
       |> where predicate
-      |> order_by ~desc:true Trace_summaries.started_at_ms)
+      |> order_by ~desc:true Trace_summaries.started_at_ns)
     |> Q.Select.limit max_rows
   in
   q_select t.pool query
@@ -1688,6 +1715,7 @@ let span_search_predicate (filter : span_search_filter) owner_ids parent_span_id
   let predicate =
     match filter.status with
     | None -> predicate
+    | Some "ok" -> Q.Expr.and_ predicate (Q.Expr.not_ (Q.Expr.eq Spans.status "error"))
     | Some status -> Q.Expr.and_ predicate (Q.Expr.eq Spans.status status)
   in
   let predicate =
@@ -1727,7 +1755,7 @@ let search_spans (filter : span_search_filter) t =
             Q.Select.(
               from Spans.table span_projection
               |> where (span_search_predicate filter owner_ids parent_span_ids)
-              |> order_by ~desc:true Spans.start_time_ms
+              |> order_by ~desc:true Spans.start_time_ns
               |> limit filter.limit))
 
 let trace_summary_search_query (filter : trace_search_filter) trace_ids =
@@ -1747,7 +1775,7 @@ let trace_summary_search_query (filter : trace_search_filter) trace_ids =
   Q.Select.(
     from Trace_summaries.table trace_summary_projection
     |> where predicate
-    |> order_by ~desc:true Trace_summaries.started_at_ms
+    |> order_by ~desc:true Trace_summaries.started_at_ns
     |> limit filter.limit)
 
 let search_traces (filter : trace_search_filter) t =
@@ -1799,7 +1827,7 @@ let list_logs (filter : log_filter) t =
     Q.Select.(
       from Logs.table log_projection
       |> where (log_predicate filter)
-      |> order_by ~desc:true Logs.timestamp_ms
+      |> order_by ~desc:true Logs.timestamp_ns
       |> limit filter.limit)
 
 let log_search_predicate (filter : log_search_filter) owner_ids =
@@ -1850,7 +1878,7 @@ let search_logs (filter : log_search_filter) t =
         Q.Select.(
           from Logs.table log_projection
           |> where (log_search_predicate filter owner_ids)
-          |> order_by ~desc:true Logs.timestamp_ms
+          |> order_by ~desc:true Logs.timestamp_ns
           |> limit filter.limit)
 
 let trace_attr_lookup t trace_ids key =
@@ -2000,7 +2028,7 @@ let count_span_facets spans field key =
         | Some wanted ->
             List.iter
               (fun (key, value) ->
-                if String.equal key wanted then add_count counts value)
+                if String.equal key wanted then add_count counts (Model.attr_string_value value))
               attrs)
     | _ -> ()
   in
@@ -2009,7 +2037,7 @@ let count_span_facets spans field key =
       match field with
       | "service" -> add_count counts span.service_name
       | "operation" -> add_count counts span.operation_name
-      | "status" -> add_count counts span.status
+      | "status" -> add_count counts (Model.span_status_to_string span.status)
       | "attribute_keys" | "attribute_values" ->
           count_attrs (span.resource @ span.attributes)
       | _ -> ())
@@ -2027,7 +2055,7 @@ let count_log_facets logs field key =
         | Some wanted ->
             List.iter
               (fun (key, value) ->
-                if String.equal key wanted then add_count counts value)
+                if String.equal key wanted then add_count counts (Model.attr_string_value value))
               attrs)
     | _ -> ()
   in
@@ -2099,7 +2127,7 @@ let list_metric_points (filter : metric_filter) t =
     Q.Select.(
       from Metric_points.table metric_projection
       |> where (metric_predicate filter)
-      |> order_by ~desc:true Metric_points.timestamp_ms
+      |> order_by ~desc:true Metric_points.timestamp_ns
       |> limit filter.limit)
 
 let count_rows runner table =
