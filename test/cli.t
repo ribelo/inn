@@ -4,3 +4,10 @@
   $ python3 check_trace_cli.py ../bin/main.exe
   tree-d24c: inn trace prints a tree and --json, against a live server
   desc-85u9: inn docs lists, reads, and fails loudly on an unknown name
+  $ python3 check_service.py ../bin/main.exe
+  svc-pehm svc-dh98: SIGTERM exits 0, the reopened store still has its data, and the startup log names the effective configuration
+  $ python3 check_hints.py ../bin/main.exe
+  svc-xd4x: the CLI and MCP connect hints name systemctl --user start inn and inn server
+  $ python3 check_install.py
+  svc-k4u6 svc-is5q: the documented install command stages bin/inn, renames it into place, restarts inn.service, and never runs opam install/upgrade/pin
+  $ python3 check_effect_guide.py

@@ -193,7 +193,7 @@ let friendly_http_error config message =
     || contains_substring ~needle:"ECONNREFUSED" message
   then
     Printf.sprintf
-      "could not connect to Inn server at %s\nStart it with `inn daemon`, or use `--base-url URL` to query a different server."
+      "could not connect to Inn server at %s\nStart it with `systemctl --user start inn` (the systemd user service), `inn daemon`, or `inn server`; use `--base-url URL` to query a different server."
       config.Inn.Config.base_url
   else message
 

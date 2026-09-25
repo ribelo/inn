@@ -22,32 +22,20 @@ column lists, which resolves the two heterogeneous-list gaps below. Inn wraps it
 columns with `Q.Column.any`. The query accuracy spec adopts composite indexes and
 single-statement upserts.
 
+Eta commit `d64f1e88` adds `Eta_sql_dsl.Expr.sum_int_nullable`,
+`sum_float_nullable`, `avg_nullable`, `min_nullable`, `max_nullable`, and
+`coalesce`, also exposed as `Eta_sql.Expr.*` and `Eta_sql.Projection.*`. The
+nullable aggregates accept a column whose declared type is already nullable,
+ignore NULL inputs, and decode an all-NULL group as `None`. Inn's AI call stats
+now use `Q.Projection.sum_int_nullable Ai_calls.input_tokens` (and the output and
+total token columns), so the non-nullable `Q.Table.alias` view described below is
+gone and the columns keep their real `Q.nullable` declaration end to end.
 
-None of the gaps below is resolved by local Eta master at `d38804d0` (checked
-against its SQL public interfaces). Inn therefore keeps its typed builders and
-the workarounds described here.
+None of the remaining gaps below is resolved by local Eta master at `d64f1e88`
+(checked against its SQL public interfaces). Inn therefore keeps its typed
+builders and the workarounds described here.
 
 ## Remaining Gaps
-
-### Aggregates Over Nullable Columns
-
-The AI call table stores token counts as nullable columns, because "not
-reported" and "zero tokens" are different answers. The typed aggregate
-builders only accept non-nullable columns:
-
-{[
-(* Eta master: [tokens] is declared [Q.nullable Q.int]. *)
-let tokens = Q.Table.column Ai_calls.table "input_tokens" (Q.nullable Q.int)
-let total = Q.Projection.sum_int tokens   (* (_, int) column expected *)
-]}
-
-`sum_int` is `('scope, int) column -> ('scope, int option) t`, and there is no
-`SUM`, `COALESCE`, or `cast` expression for a nullable column, so a nullable
-token column cannot be aggregated without changing its declared type. Inn
-reads the same physical column through `Q.Table.alias` with a non-nullable
-declaration: SQL `SUM` ignores NULL, so the sum is exact and a group with no
-reported tokens decodes as `NULL`/`None`. A `sum_int` (or `coalesce`) that
-accepts `('scope, 'a option) column` would remove the alias.
 
 ### Spin on a File That Is Not a SQLite Database
 

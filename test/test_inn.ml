@@ -3994,6 +3994,42 @@ let test_guide_content () =
       "/v1/metrics";
     ]
 
+(* The first fenced block of the given language, including the newline that
+   ends its last line. *)
+let fenced_block language text =
+  let fence = "```" ^ language in
+  let rec find = function
+    | [] -> None
+    | line :: rest when String.equal (String.trim line) fence -> collect [] rest
+    | _ :: rest -> find rest
+  and collect acc = function
+    | [] -> None
+    | line :: rest when String.equal (String.trim line) "```" ->
+        Some (String.concat "\n" (List.rev acc) ^ "\n")
+    | line :: rest -> collect (line :: acc) rest
+  in
+  find (String.split_on_char '\n' text)
+
+(* docs/guides/eta.md documents the exporter with one OCaml snippet, and
+   test/eta_guide_snippet.ml is that same snippet compiled against the real Eta
+   API (the stanza is enabled on the local-Eta build path). Keeping the two
+   texts identical is what stops the guide from drifting away from an API it
+   does not compile against. *)
+let test_eta_guide_snippet_is_compiled () =
+  let guide =
+    read_repository_file [ "../docs/guides/eta.md"; "docs/guides/eta.md" ]
+  in
+  let source =
+    read_repository_file
+      [ "eta_guide_snippet.ml"; "../test/eta_guide_snippet.ml" ]
+  in
+  match fenced_block "ocaml" guide with
+  | None -> Alcotest.fail "docs/guides/eta.md has no ocaml snippet"
+  | Some block ->
+      Alcotest.(check string)
+        "the guide's Eta snippet is test/eta_guide_snippet.ml verbatim" source
+        block
+
 let test_health_identity () =
   (* desc-8syr: version, an ISO 8601 start time, and an uptime.
      desc-lqpr: the same real version everywhere. *)
@@ -4201,6 +4237,9 @@ let () =
             `Quick test_docs_endpoints;
           Alcotest.test_case "guide instructions (desc-wy48, desc-od3y, desc-62du)"
             `Quick test_guide_content;
+          Alcotest.test_case
+            "the Eta guide snippet is the compiled source (guide-eta-snippet)"
+            `Quick test_eta_guide_snippet_is_compiled;
           Alcotest.test_case "health identity (desc-8syr, desc-lqpr)" `Quick
             test_health_identity;
           Alcotest.test_case

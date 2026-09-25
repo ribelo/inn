@@ -28,7 +28,7 @@ mkdir -p "$mirror"
 cp -rs "$eta_root/lib" "$mirror/lib"
 ln -s "$eta_root/dune-project" "$mirror/dune-project"
 
-packages=eta,eta_blocking,eta_sql_driver,eta_sql_dsl,eta_sql,eta_eio,eta_observability,eta_http,eta_http_h1,eta_http_h2,eta_http_tls_openssl,eta_http_ws,eta_stream,eta_http_eio,eta_router,eta_http_service,eta_http_service_eio
+packages=eta,eta_blocking,eta_sql_driver,eta_sql_dsl,eta_sql,eta_eio,eta_observability,eta_otel,eta_http,eta_http_h1,eta_http_h2,eta_http_tls_openssl,eta_http_ws,eta_stream,eta_http_eio,eta_router,eta_http_service,eta_http_service_eio
 dune build --root "$mirror" --only-packages "$packages" @install
 dune install --root "$mirror" --only-packages "$packages" --prefix "$prefix"
 
@@ -37,5 +37,9 @@ if [[ "$(ocamlfind query eta_sql)" != "$prefix/lib/eta_sql" ]]; then
   echo 'Local Eta installation did not take precedence over the shared switch.' >&2
   exit 1
 fi
+# The Eta guide's exporter snippet is compiled against this local Eta (the
+# shared switch still has the pre-endpoint eta_otel), so its test is enabled
+# only on this path. test/eta_guide_snippet.ml mirrors docs/guides/eta.md.
+export INN_ETA_GUIDE_SNIPPET=1
 dune build --root "$inn_root" --build-dir "$inn_root/_dev/inn-build"
 dune runtest --force --root "$inn_root" --build-dir "$inn_root/_dev/inn-build"

@@ -1,7 +1,7 @@
 (test
  (name test_inn)
  (package inn)
- (deps ../README.md)
+ (deps ../README.md ../docs/guides/eta.md eta_guide_snippet.ml)
  (libraries inn alcotest eta eta_eio eta_http eta_http_eio eio_main unix)
  ; The suite starts many short-lived Eio runtimes. Each io_uring ring locks
  ; memory against a per-user cap that this sandbox sets to 8 MiB, so under
@@ -15,5 +15,33 @@
  (package inn)
  (libraries inn alcotest yojson))
 
+; The Eta guide's exporter snippet, compiled against the real Eta API. The
+; Alcotest suite checks that docs/guides/eta.md carries exactly this source, so
+; the guide cannot drift from an API it does not compile against. The shared
+; switch still has the pre-endpoint eta_otel, so the stanza is enabled on the
+; local-Eta build path only (scripts/test-local-eta.sh sets the variable).
+(executable
+ (name eta_guide_snippet)
+ (enabled_if (= %{env:INN_ETA_GUIDE_SNIPPET=0} 1))
+ (flags (:standard -w -32))
+ (libraries eta eta_eio eta_observability eta_otel eta_http eta_http_eio
+   eio_main))
+
+(rule
+ (alias runtest)
+ (enabled_if (= %{env:INN_ETA_GUIDE_SNIPPET=0} 1))
+ (action (run ./eta_guide_snippet.exe)))
+
 (cram
- (deps ../bin/main.exe check_mcp.py check_cli.py check_trace_cli.py))
+ (deps
+  ../bin/main.exe
+  ../scripts/install-inn-service.sh
+  ../README.md
+  ../docs/guides/effect.md
+  check_mcp.py
+  check_cli.py
+  check_trace_cli.py
+  check_service.py
+  check_hints.py
+  check_install.py
+  check_effect_guide.py))

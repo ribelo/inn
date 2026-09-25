@@ -2180,22 +2180,12 @@ let span_search_predicate ?(attr_contains = []) ?min_duration_ms
   Q.Expr.and_ p (keyset_predicate ~sort_key:Spans.start_time_ns ~tie_breaker:Spans.id filter.cursor)
 
 (* AI call summaries are read from their own table, so a filter or an
-   aggregate never scans non-AI spans (acc-gkoz, aic-yfcd). *)
+   aggregate never scans non-AI spans (acc-gkoz, aic-yfcd). Token totals are
+   summed over the nullable token columns themselves: [sum_int_nullable]
+   ignores NULL and decodes an all-NULL group as [None], so no alias is needed
+   (Eta d64f1e88; see .spec/ETA_SQL_DOGFOODING.md). *)
 
 let none_if_empty value = if String.equal value "" then None else Some value
-
-(* Eta SQL aggregates [sum_int] and [avg] only over columns declared
-   non-nullable, and the typed DSL has no SUM over [Q.nullable]. SUM ignores
-   NULL, so reading the same physical token columns as non-nullable is exact:
-   the aggregate is NULL, decoded as [None], only when every value in the group
-   is NULL. The alias keeps the table identity and renders the same qualified
-   names, so this view is only used inside aggregates. Reported in
-   .spec/ETA_SQL_DOGFOODING.md. *)
-let ai_token_columns = Q.Table.alias Ai_calls.table "ai_calls"
-
-let ai_input_tokens_column = Q.Table.column ai_token_columns "input_tokens" Q.int
-let ai_output_tokens_column = Q.Table.column ai_token_columns "output_tokens" Q.int
-let ai_total_tokens_column = Q.Table.column ai_token_columns "total_tokens" Q.int
 
 let ai_call_projection =
   Q.Projection.(
@@ -2678,9 +2668,9 @@ let ai_stats ?(attr_contains = []) ?min_duration_ms
             Q.Projection.(
               t6 (one col) (count ())
                 (avg Q.Numeric.float Ai_calls.duration_ms)
-                (sum_int ai_input_tokens_column)
-                (sum_int ai_output_tokens_column)
-                (sum_int ai_total_tokens_column))
+                (sum_int_nullable Ai_calls.input_tokens)
+                (sum_int_nullable Ai_calls.output_tokens)
+                (sum_int_nullable Ai_calls.total_tokens))
           |> where predicate |> group_by col)
     in
     let* error_groups =

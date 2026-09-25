@@ -336,8 +336,9 @@ let http_tool ~request ~base_url path =
       Error
         (Printf.sprintf
            "could not connect to Inn server at %s\n\
-            Start it with `inn daemon`, or use `--base-url URL` to query a \
-            different server.\n\
+            Start it with `systemctl --user start inn` (the systemd user \
+            service), `inn daemon`, or `inn server`; use `--base-url URL` to \
+            query a different server.\n\
             Details: %s"
            base_url message)
 

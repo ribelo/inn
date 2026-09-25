@@ -1092,6 +1092,9 @@ let check_bind_available config =
   Fun.protect
     ~finally:(fun () -> Unix.close fd)
     (fun () ->
+      (* The real listener reuses the address too, so a restart is not blocked
+         by connections still in TIME_WAIT. *)
+      Unix.setsockopt fd Unix.SO_REUSEADDR true;
       Unix.bind fd (unix_addr config.host config.port);
       Unix.listen fd 1)
 
@@ -1156,6 +1159,55 @@ let close_store ~sw ~clock store =
           (Format.asprintf "inn: closing the store failed: %a"
              (Eta.Cause.pp Store.pp_error) cause)
 
+(* Startup lines record the effective configuration, so
+   [journalctl --user -u inn] shows the listen address, the database path, and
+   the retention settings the running process actually uses (svc-dh98). *)
+let log_startup config =
+  prerr_endline
+    (Printf.sprintf "inn server listening on http://%s:%d" config.Config.host
+       config.port);
+  prerr_endline
+    (Printf.sprintf
+       "inn server configuration: database=%s traces_retention=%dh \
+        logs_retention=%dh metrics_retention=%dh prune_interval=%ds \
+        max_db_size=%dMB"
+       config.db_path config.traces_retention_hours config.logs_retention_hours
+       config.metrics_retention_hours config.prune_interval_seconds
+       config.max_db_size_mb)
+
+(* svc-pehm: SIGTERM (and SIGINT) cancels the serving switch. The accept loop,
+   every in-flight connection, and the pruner all run under that switch, and the
+   [Fun.protect] finaliser in [run] then closes the store on the still-live
+   outer switch, so the process exits 0 -- which is what the unit's
+   [Restart=on-failure] expects -- instead of leaving a hung process and an
+   unclean WAL behind. Eta's [Serve.h1] stop path only stops accepting new
+   connections and never returns while a connection fiber lingers, so the
+   handler fails the switch ourselves instead of relying on that promise. *)
+exception Shutdown
+
+let rec is_shutdown = function
+  | Shutdown -> true
+  | Eio.Cancel.Cancelled inner -> is_shutdown inner
+  | _ -> false
+
+(* The handler only records the signal: a signal handler runs at an arbitrary
+   allocation point, so the switch is failed from a daemon fiber that polls the
+   flag, never from the handler itself. *)
+let install_shutdown_handler ~sw ~clock =
+  let fired = Atomic.make false in
+  let on_signal (_ : int) = Atomic.set fired true in
+  Sys.Safe.set_signal Sys.sigterm (Sys.Signal_handle on_signal);
+  Sys.Safe.set_signal Sys.sigint (Sys.Signal_handle on_signal);
+  Eio.Fiber.fork_daemon ~sw (fun () ->
+      let rec wait () =
+        if not (Atomic.get fired) then (
+          Eio.Time.sleep clock 0.02;
+          wait ())
+      in
+      wait ();
+      Eio.Switch.fail sw Shutdown;
+      `Stop_daemon)
+
 let run ~sw ~env config =
   check_bind_available config;
   mark_started ();
@@ -1165,12 +1217,21 @@ let run ~sw ~env config =
   Fun.protect
     ~finally:(fun () -> close_store ~sw ~clock store)
     (fun () ->
-      (* The pruner runs under its own switch, so it is cancelled and awaited
-         before the store it uses is closed. *)
-      Eio.Switch.run (fun pruner_sw ->
-          start_pruner ~sw:pruner_sw ~clock ~config store;
-          let addr = Serve.tcp_addr ~host:config.Config.host ~port:config.port in
-          prerr_endline
-            (Printf.sprintf "inn server listening on http://%s:%d" config.host
-               config.port);
-          Serve.h1 ~sw ~net ~clock ~addr (handler config store)))
+      try
+        (* The serving fibers run under their own switch so that a failed
+           switch tears down the accept loop and the pruner while the finaliser
+           above still closes the store on the outer, live switch. *)
+        Eio.Switch.run (fun serve_sw ->
+            install_shutdown_handler ~sw:serve_sw ~clock;
+            (* The pruner runs under the same switch as the server, so ending
+               the switch cancels and awaits it before the finaliser above
+               closes the store it uses. *)
+            start_pruner ~sw:serve_sw ~clock ~config store;
+            log_startup config;
+            let addr =
+              Serve.tcp_addr ~host:config.Config.host ~port:config.port
+            in
+            Eta_http_eio.Server.run_h1 ~sw:serve_sw ~net ~clock ~addr
+              (handler config store))
+      with exn when is_shutdown exn ->
+        prerr_endline "inn server: shutting down on SIGTERM")

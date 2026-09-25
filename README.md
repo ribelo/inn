@@ -67,6 +67,11 @@ installs packages into the shared switch and does not edit Eta. Missing OCaml
 dependencies must be addressed outside this workflow, not installed into the
 shared switch.
 
+The same run compiles the Eta guide's exporter snippet
+(`test/eta_guide_snippet.ml`) against that local Eta and fails when
+`docs/guides/eta.md` no longer carries it verbatim, so the guide cannot drift
+from the API it documents.
+
 The Alcotest suite runs with `EIO_BACKEND=posix` (set by `test/dune`). Each
 short-lived Eio runtime otherwise creates an io_uring ring, and ring creation
 fails with `ENOMEM` under a small per-user locked-memory cap, which hides real
@@ -96,10 +101,44 @@ inn stop
 inn restart
 ```
 
+`inn server` logs its listen address, its database path, and its retention
+settings to stderr at startup, so `journalctl --user -u inn` shows the
+configuration the running process actually uses. On SIGTERM (and SIGINT) it
+cancels the serving fibers and the pruner, closes the store, and exits 0, so a
+restart never leaves a hung process or an unclean WAL behind.
+
 Default server address:
 
 ```text
 http://127.0.0.1:27687
+```
+
+### systemd user service
+
+The home-manager `shell-stack.nix` module already runs Inn as the `inn`
+systemd user service, whose `ExecStart` is
+`~/.cache/opam/5.4.0+ox/bin/inn server`. Install that binary and restart the
+service in one step after any Inn change:
+
+```sh
+./scripts/install-inn-service.sh
+```
+
+The script builds Inn against the local Eta checkout, exactly as
+`./scripts/test-local-eta.sh` does (set `ETA_PATH=/path/to/Eta` when the
+checkout is elsewhere), and installs only the `inn` executable into the shared
+OxCaml switch at `$OPAMROOT/5.4.0+ox/bin/inn` (`OPAMROOT` defaults to
+`~/.cache/opam`). It copies the binary to a temporary file in that same
+directory and renames it into place, so the service never observes a half
+written executable. It then restarts `inn.service` when the unit exists and
+waits for `$INN_BASE_URL/health` (default `http://127.0.0.1:27687`) to answer.
+It never runs `opam install`, `opam upgrade`, or `opam pin`, so the Eta
+installed in the shared switch is left exactly as it is and pie and grip keep
+building against it.
+
+```sh
+systemctl --user status inn
+journalctl --user -u inn -n 20
 ```
 
 ## Ingest API
@@ -437,11 +476,9 @@ transactions. Raw SQL is not used in the application storage path. The one
 exception is SQLite pragmas, which have no typed API: `page_count`,
 `freelist_count`, `page_size`, `auto_vacuum`, and `incremental_vacuum` all run
 through one store helper that uses `Eta_sql.Pool.Raw`, the escape hatch
-`Eta_sql.mli` documents for pragmas. AI token totals are summed over columns
-declared `Q.nullable`, which the typed aggregates reject: `sum_int` and `avg`
-accept only non-nullable columns and the DSL has no SUM over a nullable column.
-Because SQL `SUM` ignores NULL, the AI stats read the same physical token
-columns through a same-table alias declared non-nullable, so a group with no
-reported tokens still decodes as `None`. Known Eta SQL API gaps found while
-building Inn are recorded in
+`Eta_sql.mli` documents for pragmas. AI token totals are summed over the
+nullable token columns with `Q.Projection.sum_int_nullable`: NULL inputs are
+ignored and a group with no reported tokens decodes as `None`, so the columns
+keep their `Q.nullable` declaration and no alias is needed (Eta `d64f1e88`).
+Known Eta SQL API gaps found while building Inn are recorded in
 [.spec/ETA_SQL_DOGFOODING.md](.spec/ETA_SQL_DOGFOODING.md).
