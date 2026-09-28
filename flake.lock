@@ -14,16 +14,18 @@
         "oxcaml": [
           "oxcaml"
         ],
+        "oxcaml-lsp": "oxcaml-lsp",
+        "oxcaml-merlin-src": "oxcaml-merlin-src",
         "oxcaml-opam-repository": [
           "oxcaml-opam-repository"
         ]
       },
       "locked": {
-        "lastModified": 1790578867,
-        "narHash": "sha256-CYjK7MTwKDiawl/mYm9sQiYJqaPmMC0Xe7PNAjPfE+0=",
+        "lastModified": 1790587711,
+        "narHash": "sha256-YaCzEAQPNI3XartegxlHiS3nW5CxBDHRp6xY0+keeGw=",
         "ref": "eta-next",
-        "rev": "00501a5c8ef159c7e372c84822a8b7728229759e",
-        "revCount": 3044,
+        "rev": "14f80b766bfb47d4a51c70db86a8e218bc5c4530",
+        "revCount": 3047,
         "type": "git",
         "url": "file:///home/ribelo/projects/ribelo/ocaml/Eta"
       },
@@ -261,6 +263,40 @@
         "owner": "oxcaml",
         "ref": "5.4.0-ox2",
         "repo": "oxcaml",
+        "type": "github"
+      }
+    },
+    "oxcaml-lsp": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784755478,
+        "narHash": "sha256-dCxyrBcpzt0u9QCvwsJmSe8OONrM3MbhyRvM4koXv2M=",
+        "owner": "oxcaml",
+        "repo": "ocaml-lsp",
+        "rev": "f617d31c54fdc19270cbab4a21e2ebd260182f66",
+        "type": "github"
+      },
+      "original": {
+        "owner": "oxcaml",
+        "repo": "ocaml-lsp",
+        "rev": "f617d31c54fdc19270cbab4a21e2ebd260182f66",
+        "type": "github"
+      }
+    },
+    "oxcaml-merlin-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1783350791,
+        "narHash": "sha256-Z8uILVCHQxUQYFA+h+oapja0hbSsV9plrRFZGw6kbB4=",
+        "owner": "oxcaml",
+        "repo": "oxcaml",
+        "rev": "2bc3d7bd8298793af4f807724dce6bfd57df1b84",
+        "type": "github"
+      },
+      "original": {
+        "owner": "oxcaml",
+        "repo": "oxcaml",
+        "rev": "2bc3d7bd8298793af4f807724dce6bfd57df1b84",
         "type": "github"
       }
     },

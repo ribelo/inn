@@ -22,7 +22,8 @@
 ; The Eta guide's exporter snippet, compiled against the real Eta API. The
 ; Alcotest suite checks that docs/guides/eta.md carries exactly this source, so
 ; the guide cannot drift from an API it does not compile against. Enable
-; the compiled example on the eta-next build path with INN_ETA_GUIDE_SNIPPET=1.
+; the compiled example, and the check that runs it against a real isolated Inn,
+; with INN_ETA_GUIDE_SNIPPET=1.
 
 (executable
  (name eta_guide_snippet)
@@ -52,3 +53,14 @@
   check_hints.py
   check_install.py
   check_effect_guide.py))
+
+; The compiled example, pointed at a real Inn on a free port and a temporary
+; state directory, must leave the counter and the histogram in GET /metrics.
+
+(rule
+ (alias runtest)
+ (enabled_if
+  (= %{env:INN_ETA_GUIDE_SNIPPET=0} 1))
+ (deps ../bin/main.exe eta_guide_snippet.exe check_eta_guide.py)
+ (action
+  (run python3 check_eta_guide.py ../bin/main.exe eta_guide_snippet.exe)))

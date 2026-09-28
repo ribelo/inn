@@ -37,9 +37,10 @@ if [[ "$(ocamlfind query eta_sql)" != "$prefix/lib/eta_sql" ]]; then
   echo 'Local Eta installation did not take precedence over the shared switch.' >&2
   exit 1
 fi
-# The Eta guide's exporter snippet is compiled against this local Eta (the
-# shared switch still has the pre-endpoint eta_otel), so its test is enabled
-# only on this path. test/eta_guide_snippet.ml mirrors docs/guides/eta.md.
+# The Eta guide's exporter snippet and its isolated-Inn check are compiled
+# against this local Eta. The shared switch carries the same eta_otel, so the
+# same tests can be enabled there with INN_ETA_GUIDE_SNIPPET=1.
+# test/eta_guide_snippet.ml mirrors docs/guides/eta.md.
 export INN_ETA_GUIDE_SNIPPET=1
 dune build --root "$inn_root" --build-dir "$inn_root/_dev/inn-build"
 dune runtest --force --root "$inn_root" --build-dir "$inn_root/_dev/inn-build"
