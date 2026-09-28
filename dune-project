@@ -15,11 +15,7 @@
   (dune (>= 3.0))
   cmdliner
   eta
-  eta_eio
   eta_http
-  eta_http_eio
-  eta_http_service
-  eta_http_service_eio
   eta_sql
   eio
   eio_main

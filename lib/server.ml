@@ -1,7 +1,7 @@
 module H = Eta_http
 module S = Eta_http.Server
-module Service = Eta_http_service
-module Serve = Eta_http_service_eio.Serve
+module Service = Eta_http.Service
+module Serve = Eta_http.Service.Serve
 
 let max_body_bytes = 32 * 1024 * 1024
 
@@ -9,7 +9,7 @@ let daemon_instance_id = Atomic.make None
 let set_instance_id value = Atomic.set daemon_instance_id (Some value)
 
 let text_headers =
-  H.Core.Header.unsafe_of_list [ ("content-type", "text/plain; charset=utf-8") ]
+  H.Header.unsafe_of_list [ ("content-type", "text/plain; charset=utf-8") ]
 
 let json_response ?(status = 200) json =
   Service.Json.response ~status ~newline:true json
@@ -107,30 +107,19 @@ let draining_response () =
     [ ("ready", `Bool false); ("store", `String "draining") ]
 
 let ready config store =
-  let open Eta.Syntax in
-  let* result =
-    if Atomic.get draining then Eta.Effect.pure None
-    else
-      Eta.Effect.map Option.some
-        (Eta.Effect.fold ~ok:(fun value -> Ok value)
-           ~error:(fun error -> Error error)
-           (Store.ping store))
-  in
-  match result with
-  | None -> Eta.Effect.pure (draining_response ())
-  | Some (Ok ()) when Atomic.get draining ->
-      Eta.Effect.pure (draining_response ())
-  | Some (Ok ()) ->
-      Eta.Effect.pure
-        (json_response
-           (`Assoc
-             (health_fields config
-             @ [ ("ready", `Bool true); ("store", `String "ok") ])))
-  | Some (Error error) ->
-      Eta.Effect.pure
-        (error_response_with_details 503 "not_ready"
-           ("the store did not answer: " ^ store_error_message error)
-           [ ("ready", `Bool false); ("store", `String "error") ])
+  if Atomic.get draining then Ok (draining_response ())
+  else
+    match Store.ping store with
+    | Ok () when Atomic.get draining -> Ok (draining_response ())
+    | Ok () ->
+        Ok (json_response
+              (`Assoc
+                (health_fields config
+                @ [ ("ready", `Bool true); ("store", `String "ok") ])))
+    | Error error ->
+        Ok (error_response_with_details 503 "not_ready"
+              ("the store did not answer: " ^ store_error_message error)
+              [ ("ready", `Bool false); ("store", `String "error") ])
 
 (* The inventory and the OpenAPI document are rendered from the same
    declarations the router registers and the query parser validates against, so
@@ -156,7 +145,7 @@ let endpoints config =
       ])
 
 let markdown_headers =
-  H.Core.Header.unsafe_of_list [ ("content-type", "text/markdown; charset=utf-8") ]
+  H.Header.unsafe_of_list [ ("content-type", "text/markdown; charset=utf-8") ]
 
 (* GET /docs and GET /docs/{name} serve the guides embedded at build time
    (desc-bqwh, desc-7wwz). *)
@@ -221,44 +210,34 @@ let root_text config =
        "inn local telemetry server\n\nPOST /v1/traces\nPOST /v1/logs\nPOST /v1/metrics\nGET /health\nGET /healthz\nGET /ready\nGET /api/services\nGET /api/traces\nGET /api/traces/search\nGET /api/traces/stats\nGET /api/traces/<trace-id>\nGET /api/traces/<trace-id>/spans\nGET /api/traces/<trace-id>/logs\nGET /api/spans/search\nGET /api/spans/<span-id>\nGET /api/spans/<span-id>/logs\nGET /api/logs\nGET /api/logs/search\nGET /api/logs/stats\nGET /api/ai/calls\nGET /api/ai/calls/<span-id>\nGET /api/ai/stats\nGET /api/metrics\nGET /api/facets?type=logs&field=severity\nGET /api/stats\nGET /docs\nGET /docs/<name>\nGET /instructions\nGET /endpoints\nGET /openapi.json\n\nstate: %s\ndatabase: %s\n"
        config.Config.state_dir config.db_path)
 
-let store_json eff encode =
-  let open Eta.Syntax in
-  let* result = Eta.Effect.fold ~ok:(fun value -> Ok value) ~error:(fun error -> Error error) eff in
+let store_json result encode =
   match result with
-  | Ok value -> Eta.Effect.pure (json_response (encode value))
+  | Ok value -> Ok (json_response (encode value))
   | Error error ->
-      Eta.Effect.pure
-        (error_response 500 "store_error" (store_error_message error))
+      Ok (error_response 500 "store_error" (store_error_message error))
 
 let add_response_header name value response =
-  let headers = H.Core.Header.unsafe_add name value (S.Response.headers response) in
+  let headers = H.Header.unsafe_add name value (S.Response.headers response) in
   S.Response.make ~headers ~status:(S.Response.status response)
     ~body:(S.Response.body response)
     ~trailers:(S.Response.trailers response)
     ()
 
-let store_accepted rejected_field decoded eff =
-  let open Eta.Syntax in
-  let* result = Eta.Effect.fold ~ok:(fun value -> Ok value) ~error:(fun error -> Error error) eff in
+let store_accepted rejected_field decoded result =
   match result with
-  | Ok _accepted -> Eta.Effect.pure (otlp_response rejected_field decoded)
+  | Ok _accepted -> Ok (otlp_response rejected_field decoded)
   | Error error ->
       let response = otlp_error 503 14 (store_error_message error) in
-      Eta.Effect.pure (add_response_header "retry-after" "1" response)
+      Ok (add_response_header "retry-after" "1" response)
 
 let param name params = List.assoc_opt name params
 
 let with_query req f =
-  let open Eta.Syntax in
-  let* result = Eta.Effect.fold
-      ~ok:(fun value -> Ok value)
-      ~error:(fun error -> Error error)
-      (Service.Extractors.Query.all req) in
-  match result with
+  match Service.Extractors.Query.all req with
   | Ok params -> f params
   | Error { S.Error.kind = Bad_request { message }; _ } ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Error error -> Eta.Effect.fail error
+      Ok (error_response 400 "invalid_query" message)
+  | Error error -> Error error
 
 let attr_prefix = "attr."
 
@@ -321,7 +300,7 @@ let with_search_filters ?(duration = false) ?(severity = false)
   | Ok min_duration_ms, Ok min_severity, Ok attr_contains ->
       f min_duration_ms min_severity attr_contains
   | Error message, _, _ | _, Error message, _ | _, _, Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
 
 let json_list name encode values =
   `Assoc [ (name, `List (List.map encode values)) ]
@@ -356,35 +335,32 @@ let summary_json name encode (policy : List_policy.request) values =
     ]
 
 let ingest req rejected_field decode ingest =
-  let open Eta.Syntax in
   let content_type = Service.Req.header req "content-type" in
   match content_type with
   | Some value when not (String.equal
        (String.lowercase_ascii (String.trim (List.hd (String.split_on_char ';' value))))
        "application/json") ->
-      Eta.Effect.pure (otlp_error 415 3 "only OTLP JSON (application/json) is supported")
+      Ok (otlp_error 415 3 "only OTLP JSON (application/json) is supported")
   | _ ->
-      let* body_result = Eta.Effect.fold
-        ~ok:(fun value -> Ok value) ~error:(fun error -> Error error)
-        (Service.Extractors.body_text ~max_bytes:max_body_bytes req) in
+      let body_result = Service.Extractors.body_text ~max_bytes:max_body_bytes req in
       match body_result with
       | Error { S.Error.kind = Request_body_too_large _; _ } ->
-          Eta.Effect.pure (otlp_error 413 8 "OTLP JSON body is too large")
-      | Error error -> Eta.Effect.fail error
+          Ok (otlp_error 413 8 "OTLP JSON body is too large")
+      | Error error -> Error error
       | Ok body -> match decode (if String.trim body = "" then "{}" else body) with
-          | Error message -> Eta.Effect.pure (otlp_error 400 3 message)
+          | Error message -> Ok (otlp_error 400 3 message)
           | Ok decoded -> store_accepted rejected_field decoded (ingest decoded.items)
 
 let services store req =
   with_query req @@ fun params ->
   match List_policy.resolve_lookback ~now_ms:(Store.now_ms store) params with
   | Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
   | Ok (window, lookback) ->
       let signal = param "signal" params in
       match signal with
       | Some value when not (List.mem value Endpoint.service_signals) ->
-          Eta.Effect.pure
+          Ok
             (error_response 400 "invalid_query"
                (Endpoint.allowed_values "signal" Endpoint.service_signals))
       | _ ->
@@ -405,7 +381,7 @@ let traces store req =
       ~now_ms:(Store.now_ms store) params
   with
   | Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
   | Ok policy ->
       store_json
         (Store.list_trace_summaries ?service:(param "service" params)
@@ -414,34 +390,26 @@ let traces store req =
         (page_json "traces" Model.trace_summary_to_json policy)
 
 let trace store trace_id _req =
-  let open Eta.Syntax in
-  let* result = Eta.Effect.fold
-      ~ok:(fun value -> Ok value)
-      ~error:(fun error -> Error error)
-      (Store.get_trace store trace_id) in
+  let result = (Store.get_trace store trace_id) in
   match result with
   | Error error ->
-      Eta.Effect.pure
+      Ok
         (error_response 500 "store_error" (store_error_message error))
   | Ok None ->
-      Eta.Effect.pure
+      Ok
         (error_response 404 "trace_not_found" "trace was not found")
-  | Ok (Some trace) -> Eta.Effect.pure (json_response (Model.trace_to_json trace))
+  | Ok (Some trace) -> Ok (json_response (Model.trace_to_json trace))
 
 let span store span_id _req =
-  let open Eta.Syntax in
-  let* result = Eta.Effect.fold
-      ~ok:(fun value -> Ok value)
-      ~error:(fun error -> Error error)
-      (Store.get_span_node store span_id) in
+  let result = (Store.get_span_node store span_id) in
   match result with
   | Error error ->
-      Eta.Effect.pure
+      Ok
         (error_response 500 "store_error" (store_error_message error))
   | Ok None ->
-      Eta.Effect.pure (error_response 404 "span_not_found" "span was not found")
+      Ok (error_response 404 "span_not_found" "span was not found")
   | Ok (Some node) ->
-      Eta.Effect.pure (json_response (Model.span_node_to_json node))
+      Ok (json_response (Model.span_node_to_json node))
 
 let trace_spans store trace_id req =
   with_query req @@ fun params ->
@@ -450,7 +418,7 @@ let trace_spans store trace_id req =
       ~now_ms:(Store.now_ms store) params
   with
   | Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
   | Ok policy ->
       store_json
         (Store.list_trace_spans store ~window:policy.List_policy.window
@@ -464,7 +432,7 @@ let trace_logs store trace_id req =
       ~now_ms:(Store.now_ms store) params
   with
   | Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
   | Ok policy ->
       with_search_filters ~contains:true params @@ fun _ _ attr_contains ->
       let filter : Store.log_search_filter = {
@@ -482,7 +450,7 @@ let span_logs store span_id req =
       ~now_ms:(Store.now_ms store) params
   with
   | Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
   | Ok policy ->
       with_search_filters ~contains:true params @@ fun _ _ attr_contains ->
       let filter : Store.log_search_filter = {
@@ -524,7 +492,7 @@ let ai_calls store req =
     List_policy.list_request ~kind:List_policy.Ai_call
       ~now_ms:(Store.now_ms store) params
   with
-  | Error message -> Eta.Effect.pure (error_response 400 "invalid_query" message)
+  | Error message -> Ok (error_response 400 "invalid_query" message)
   | Ok policy ->
       with_search_filters ~duration:true ~contains:true params @@
       fun min_duration_ms _ attr_contains ->
@@ -535,23 +503,21 @@ let ai_calls store req =
 
 (* The hint is best-effort: a store failure while looking up the parent must
    not turn the 404 into a 500. *)
-let optional_store eff =
-  Eta.Effect.fold ~ok:(fun value -> Ok value) ~error:(fun _ -> Error ()) eff
-  |> Eta.Effect.map (function Ok value -> value | Error () -> None)
+let optional_store = function
+  | Ok value -> value
+  | Error _ -> None
 
 let ai_call_hint store kind (span : Model.span) =
-  let open Eta.Syntax in
-  let* parent =
+  let parent =
     match span.Model.parent_span_id with
-    | None -> Eta.Effect.pure None
+    | None -> None
     | Some parent_id -> optional_store (Store.get_span store parent_id)
   in
-  let* parent_is_call =
+  let parent_is_call =
     match parent with
-    | None -> Eta.Effect.pure false
+    | None -> false
     | Some (parent : Model.span) ->
-        optional_store (Store.span_ai_kind store parent.Model.span_id)
-        |> Eta.Effect.map (fun parent_kind -> parent_kind = Some "call")
+        optional_store (Store.span_ai_kind store parent.Model.span_id) = Some "call"
   in
   let label =
     match kind with
@@ -564,8 +530,7 @@ let ai_call_hint store kind (span : Model.span) =
     | Some (parent : Model.span) when parent_is_call -> Some parent
     | _ -> None
   in
-  Eta.Effect.pure
-    [
+  [
       ("kind", `String kind);
       ( "aiCallSpanId",
         match parent_call with
@@ -614,79 +579,68 @@ let ai_call_detail_json config (detail : Model.ai_call_detail) span logs =
 (* The detail classifies from the stored kind, not from the span alone: a
    nested provider span's parent is outside the span (aic-t8tl). *)
 let ai_call config store span_id _req =
-  let open Eta.Syntax in
-  let* kind_result =
-    Eta.Effect.fold ~ok:(fun value -> Ok value)
-      ~error:(fun error -> Error error)
-      (Store.span_ai_kind store span_id)
+  let kind_result =
+    (Store.span_ai_kind store span_id)
   in
   match kind_result with
   | Error error ->
-      Eta.Effect.pure
+      Ok
         (error_response 500 "store_error" (store_error_message error))
   | Ok None ->
-      Eta.Effect.pure
+      Ok
         (error_response 404 "ai_call_not_found"
            ("AI call was not found for span " ^ span_id))
   | Ok (Some kind) when not (String.equal kind "call") ->
-      let* span_result =
-        Eta.Effect.fold ~ok:(fun value -> Ok value)
-          ~error:(fun error -> Error error)
-          (Store.get_span store span_id)
+      let span_result =
+        (Store.get_span store span_id)
       in
       (match span_result with
       | Error error ->
-          Eta.Effect.pure
+          Ok
             (error_response 500 "store_error" (store_error_message error))
       | Ok None ->
-          Eta.Effect.pure
+          Ok
             (error_response 404 "ai_call_not_found"
                ("AI call was not found for span " ^ span_id))
       | Ok (Some span) ->
-          let* details = ai_call_hint store kind span in
-          Eta.Effect.pure
+          let details = ai_call_hint store kind span in
+          Ok
             (error_response_with_details 404 "ai_call_not_found"
                ("span " ^ span_id ^ " is not an AI call")
                details))
   | Ok (Some _) ->
-      let* span_result =
-        Eta.Effect.fold ~ok:(fun value -> Ok value)
-          ~error:(fun error -> Error error)
-          (Store.get_span store span_id)
+      let span_result =
+        (Store.get_span store span_id)
       in
       (match span_result with
       | Error error ->
-          Eta.Effect.pure
+          Ok
             (error_response 500 "store_error" (store_error_message error))
       | Ok None ->
-          Eta.Effect.pure
+          Ok
             (error_response 404 "ai_call_not_found"
                ("AI call was not found for span " ^ span_id))
       | Ok (Some span) -> (
-          let* children_result =
-            Eta.Effect.fold ~ok:(fun value -> Ok value)
-              ~error:(fun error -> Error error)
-              (Store.list_span_children store span.Model.span_id)
+          let children_result =
+            (Store.list_span_children store span.Model.span_id)
           in
           match children_result with
           | Error error ->
-              Eta.Effect.pure
+              Ok
                 (error_response 500 "store_error" (store_error_message error))
           | Ok children -> (
-              let* logs_result =
-                Eta.Effect.fold ~ok:(fun value -> Ok value)
-                  ~error:(fun error -> Error error)
-                  (Store.list_span_logs store ~window:Model.window_all
+              let logs_result =
+                (Store.list_span_logs store ~window:Model.window_all
                      ~limit:10_000 span.Model.span_id)
               in
               match logs_result with
               | Error error ->
-                  Eta.Effect.pure
+                  Ok
                     (error_response 500 "store_error"
                        (store_error_message error))
               | Ok logs ->
                   let detail = Ai.detail_of_span ~children span in
-                  Eta.Effect.pure
+                  Ok
                     (json_response
                        (ai_call_detail_json config detail span
                           logs.Store.items)))))
@@ -701,19 +655,19 @@ let ai_stats store req =
       List_policy.summary_request ~now_ms:(Store.now_ms store) params )
   with
   | None, _, _ ->
-      Eta.Effect.pure
+      Ok
         (error_response 400 "invalid_query" "groupBy is required")
   | _, None, _ ->
-      Eta.Effect.pure (error_response 400 "invalid_query" "agg is required")
+      Ok (error_response 400 "invalid_query" "agg is required")
   | _, _, Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
   | Some group_by, Some _, Ok _ when not (List.mem group_by Endpoint.ai_group_by)
     ->
-      Eta.Effect.pure
+      Ok
         (error_response 400 "invalid_query"
            (Endpoint.allowed_values "groupBy" Endpoint.ai_group_by))
   | Some _, Some agg, Ok _ when not (List.mem agg Endpoint.ai_agg) ->
-      Eta.Effect.pure
+      Ok
         (error_response 400 "invalid_query" (Endpoint.allowed_values "agg" Endpoint.ai_agg))
   | Some group_by, Some agg, Ok policy ->
       with_search_filters ~duration:true ~contains:true params @@
@@ -737,7 +691,7 @@ let search_spans store req =
       ~now_ms:(Store.now_ms store) params
   with
   | Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
   | Ok policy ->
       with_search_filters ~duration:true ~contains:true params @@
       fun min_duration_ms _ attr_contains ->
@@ -764,7 +718,7 @@ let search_traces store req =
       ~now_ms:(Store.now_ms store) params
   with
   | Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
   | Ok policy ->
       with_search_filters ~duration:true ~contains:true params @@
       fun min_duration_ms _ attr_contains ->
@@ -791,12 +745,12 @@ let trace_stats store req =
       List_policy.summary_request ~now_ms:(Store.now_ms store) params )
   with
   | None, _, _ ->
-      Eta.Effect.pure
+      Ok
         (error_response 400 "invalid_query" "groupBy is required")
   | _, None, _ ->
-      Eta.Effect.pure (error_response 400 "invalid_query" "agg is required")
+      Ok (error_response 400 "invalid_query" "agg is required")
   | _, _, Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
   | Some group_by, Some agg, Ok policy when List.mem agg Endpoint.trace_agg ->
       with_search_filters ~duration:true ~contains:true params @@
       fun min_duration_ms _ attr_contains ->
@@ -815,7 +769,7 @@ let trace_stats store req =
       store_json (Store.trace_stats ~attr_contains ?min_duration_ms filter store)
         (summary_json "stats" Model.stat_item_to_json policy)
   | _, Some _, Ok _ ->
-      Eta.Effect.pure
+      Ok
         (error_response 400 "invalid_query"
            (Endpoint.allowed_values "agg" Endpoint.trace_agg))
 
@@ -826,7 +780,7 @@ let logs store req =
       ~now_ms:(Store.now_ms store) params
   with
   | Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
   | Ok policy ->
       with_search_filters ~severity:true ~contains:true params @@
       fun _ min_severity attr_contains ->
@@ -847,7 +801,7 @@ let search_logs store req =
       ~now_ms:(Store.now_ms store) params
   with
   | Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
   | Ok policy ->
       with_search_filters ~severity:true ~contains:true params @@
       fun _ min_severity attr_contains ->
@@ -880,14 +834,14 @@ let log_stats store req =
       List_policy.summary_request ~now_ms:(Store.now_ms store) params )
   with
   | None, _, _ ->
-      Eta.Effect.pure
+      Ok
         (error_response 400 "invalid_query" "groupBy is required")
   | _, Some agg, _ when not (List.mem agg Endpoint.log_agg) ->
-      Eta.Effect.pure
+      Ok
         (error_response 400 "invalid_query"
            (Endpoint.allowed_values "agg" Endpoint.log_agg))
   | _, _, Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
   | Some group_by, _, Ok policy ->
       with_search_filters ~severity:true ~contains:true params @@
       fun _ min_severity attr_contains ->
@@ -920,12 +874,12 @@ let facets store req =
       List_policy.summary_request ~now_ms:(Store.now_ms store) params )
   with
   | None, _, _ ->
-      Eta.Effect.pure
+      Ok
         (error_response 400 "invalid_query" "type is required")
   | _, None, _ ->
-      Eta.Effect.pure (error_response 400 "invalid_query" "field is required")
+      Ok (error_response 400 "invalid_query" "field is required")
   | _, _, Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
   | Some kind, Some field, Ok policy
     when String.equal kind "traces" || String.equal kind "logs" ->
       let filter =
@@ -941,7 +895,7 @@ let facets store req =
       store_json (Store.facets filter store)
         (summary_json "facets" Model.facet_item_to_json policy)
   | Some _, Some _, Ok _ ->
-      Eta.Effect.pure
+      Ok
         (error_response 400 "invalid_query"
            (Endpoint.allowed_values "type" Endpoint.facet_types))
 
@@ -952,7 +906,7 @@ let metrics store req =
       ~now_ms:(Store.now_ms store) params
   with
   | Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
   | Ok policy ->
       let filter =
         {
@@ -970,7 +924,7 @@ let stats store req =
   with_query req @@ fun params ->
   match List_policy.resolve_lookback ~now_ms:(Store.now_ms store) params with
   | Error message ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
+      Ok (error_response 400 "invalid_query" message)
   | Ok (window, lookback) ->
       store_json (Store.stats ~window store) (fun stats ->
           match Model.stats_to_json stats with
@@ -981,49 +935,43 @@ let stats store req =
           | json -> json)
 
 let method_not_allowed_handler ~allowed _request =
-  method_not_allowed ()
-  |> add_response_header "allow" (String.concat ", " allowed)
-  |> Eta.Effect.pure
+  Ok (method_not_allowed ()
+      |> add_response_header "allow" (String.concat ", " allowed))
 
-let not_found_handler _request = Eta.Effect.pure (not_found ())
+let not_found_handler _request = Ok (not_found ())
 
 let with_route_param name f req =
-  let open Eta.Syntax in
-  let* value = Service.Extractors.Param.string name req in
-  f value req
+  match Service.Extractors.Param.string name req with
+  | Ok value -> f value req
+  | Error error -> Error error
 
 (* Every route comes from one declaration, and only the declared query
    parameters reach a handler, so the router topology, the inventory, and the
    OpenAPI document are the same list (desc-de6o, desc-dmuw). *)
 let declared ~decl route req =
-  let open Eta.Syntax in
-  let* result =
-    Eta.Effect.fold ~ok:(fun value -> Ok value)
-      ~error:(fun error -> Error error)
-      (Service.Extractors.Query.all req)
-  in
+  let result = Service.Extractors.Query.all req in
   match result with
   | Ok params -> (
       match Endpoint.validate_query decl params with
       | Error message ->
-          Eta.Effect.pure (error_response 400 "invalid_query" message)
+          Ok (error_response 400 "invalid_query" message)
       | Ok () -> route req)
   | Error { S.Error.kind = Bad_request { message }; _ } ->
-      Eta.Effect.pure (error_response 400 "invalid_query" message)
-  | Error error -> Eta.Effect.fail error
+      Ok (error_response 400 "invalid_query" message)
+  | Error error -> Error error
 
 let route_for config store (endpoint : Endpoint.t) =
   match endpoint.Endpoint.id with
-  | "root" -> fun _req -> Eta.Effect.pure (root_text config)
-  | "health" | "healthz" -> fun _req -> Eta.Effect.pure (health config)
+  | "root" -> fun _req -> Ok (root_text config)
+  | "health" | "healthz" -> fun _req -> Ok (health config)
   | "ready" -> fun _req -> ready config store
-  | "instructions" -> fun _req -> Eta.Effect.pure (instructions config)
-  | "endpoints" -> fun _req -> Eta.Effect.pure (endpoints config)
-  | "openapi" -> fun _req -> Eta.Effect.pure (openapi config)
-  | "docs_index" -> fun _req -> Eta.Effect.pure (docs_index ())
+  | "instructions" -> fun _req -> Ok (instructions config)
+  | "endpoints" -> fun _req -> Ok (endpoints config)
+  | "openapi" -> fun _req -> Ok (openapi config)
+  | "docs_index" -> fun _req -> Ok (docs_index ())
   | "docs_get" ->
       with_route_param "name" (fun name _req ->
-          Eta.Effect.pure (docs_get name))
+          Ok (docs_get name))
   | "ingest_traces" ->
       fun req ->
         ingest req "rejectedSpans" Otlp.decode_traces_json
@@ -1057,7 +1005,7 @@ let route_for config store (endpoint : Endpoint.t) =
   | "stats" -> stats store
   | id ->
       fun _req ->
-        Eta.Effect.pure
+        Ok
           (error_response 500 "undeclared_endpoint"
              ("no handler is registered for endpoint " ^ id))
 
@@ -1080,12 +1028,9 @@ let handler config store =
   Service.Router.compile ~not_found:not_found_handler
     ~method_not_allowed:method_not_allowed_handler router
 
-let run_store_effect ~sw ~clock eff =
-  let rt = Eta_eio.Runtime.create ~sw ~clock () in
-  match Eta.Runtime.run rt eff with
-  | Eta.Exit.Ok value -> value
-  | Eta.Exit.Error cause ->
-      failwith (Format.asprintf "%a" (Eta.Cause.pp Store.pp_error) cause)
+let run_store_result = function
+  | Ok value -> value
+  | Error error -> failwith (store_error_message error)
 
 let unix_addr host port =
   let ip =
@@ -1113,7 +1058,7 @@ let check_bind_available config =
       Unix.listen fd 1)
 
 let prune_interval config =
-  Eta.Duration.seconds config.Config.prune_interval_seconds
+  float_of_int config.Config.prune_interval_seconds
 
 let report_prune (report : Model.prune_report) =
   let deleted =
@@ -1132,47 +1077,33 @@ let report_prune_failure error =
 (* One prune pass at startup, then one pass per interval. The pruner never
    fails the server: a failed pass is reported and retried on the next interval
    (ret-sj15, ret-sbgj). *)
-let pruner_loop ~config store =
-  let open Eta.Syntax in
+let pruner_loop ~clock ~config store =
   let rec loop () =
-    let* outcome =
-      Store.prune store
-      |> Eta.Effect.fold ~ok:(fun report -> Ok report) ~error:(fun error ->
-             Error error)
-    in
-    let* () =
-      match outcome with
-      | Ok report -> Eta.Effect.sync (fun () -> report_prune report)
-      | Error error -> Eta.Effect.sync (fun () -> report_prune_failure error)
-    in
-    let* () = Eta.Effect.sleep (prune_interval config) in
+    (match Store.prune store with
+    | Ok report -> report_prune report
+    | Error error -> report_prune_failure error);
+    Eio.Time.sleep clock (prune_interval config);
     loop ()
   in
   loop ()
 
 let start_pruner ~sw ~clock ~config store =
   Eio.Fiber.fork_daemon ~sw (fun () ->
-      let rt = Eta_eio.Runtime.create ~sw ~clock () in
-      (match Eta.Runtime.run rt (pruner_loop ~config store) with
-      | Eta.Exit.Ok () -> ()
-      | Eta.Exit.Error cause ->
-          if not (Eta.Cause.is_interrupt_only cause) then
-            prerr_endline
-              (Format.asprintf "inn pruner stopped: %a"
-                 (Eta.Cause.pp Store.pp_error) cause));
+      (try pruner_loop ~clock ~config store with
+      | Eio.Cancel.Cancelled _ as ex -> raise ex
+      | ex ->
+          prerr_endline
+            (Printf.sprintf "inn pruner stopped: %s" (Printexc.to_string ex)));
       `Stop_daemon)
 
 (* The serving switch has cancelled and awaited the pruner before the store
    closes on this still-live outer switch. *)
-let close_store ~sw ~clock store =
-  let rt = Eta_eio.Runtime.create ~sw ~clock () in
-  match Eta.Runtime.run rt (Store.close store) with
-  | Eta.Exit.Ok () -> ()
-  | Eta.Exit.Error cause ->
-      if not (Eta.Cause.is_interrupt_only cause) then
-        prerr_endline
-          (Format.asprintf "inn: closing the store failed: %a"
-             (Eta.Cause.pp Store.pp_error) cause)
+let close_store store =
+  match Store.close store with
+  | Ok () -> ()
+  | Error error ->
+      prerr_endline (Format.asprintf "inn: closing the store failed: %a"
+                      Store.pp_error error)
 
 (* Startup lines record the effective configuration, so
    [journalctl --user -u inn] shows the listen address, the database path, and
@@ -1190,38 +1121,50 @@ let log_startup config =
        config.metrics_retention_hours config.prune_interval_seconds
        config.max_db_size_mb)
 
-(* svc-pehm: Both SIGTERM and SIGINT resolve Serve.h1's stop promise.
-   Serve.h1 closes the listener and idle connections, gives in-flight requests
-   five seconds to finish, and returns normally. The serving switch then
-   cancels and awaits the pruner before the outer finaliser closes the store,
-   giving systemd's Restart=on-failure an exit status of 0. Inn owns signal
-   handlers here so its /ready route can report draining; Eta's readiness
-   wrapper is disabled to preserve Inn's JSON/store-check contract. *)
-let with_shutdown_signals f =
+(* svc-pehm: Both SIGTERM and SIGINT stop accepts, then Serve.h1 drains
+   in-flight requests for five seconds. The serving switch awaits the pruner
+   before the outer finaliser closes the store, so systemd sees a clean exit.
+   Keep Inn's /ready JSON contract instead of introducing Door-owned CLI/config. *)
+let with_shutdown_signals ~sw f =
   let stop, resolver = Eio.Promise.create () in
-  let stopped = Atomic.make false in
-  let on_signal (_ : int) =
+  let signal = Atomic.make 0 in
+  let changed = Eio.Condition.create () in
+  let on_signal signo =
     Atomic.set draining true;
-    if Atomic.compare_and_set stopped false true then
-      Eio.Promise.resolve resolver ()
+    Atomic.set signal signo;
+    Eio.Condition.broadcast changed
   in
-  let previous_term = Sys.signal Sys.sigterm (Sys.Signal_handle on_signal) in
+  (* Eio conditions are domain-local; like Eta_app, this must use Sys.signal,
+     whose callback may close over the condition, rather than Sys.Safe.signal. *)
+  let set_signal = (Sys.signal [@alert "-unsafe_multidomain"]) in
+  let previous_term = set_signal Sys.sigterm (Sys.Signal_handle on_signal) in
   Fun.protect
-    ~finally:(fun () -> ignore (Sys.signal Sys.sigterm previous_term))
+    ~finally:(fun () -> ignore (set_signal Sys.sigterm previous_term))
     (fun () ->
-      let previous_int = Sys.signal Sys.sigint (Sys.Signal_handle on_signal) in
+      let previous_int = set_signal Sys.sigint (Sys.Signal_handle on_signal) in
       Fun.protect
-        ~finally:(fun () -> ignore (Sys.signal Sys.sigint previous_int))
-        (fun () -> f stop))
+        ~finally:(fun () -> ignore (set_signal Sys.sigint previous_int))
+        (fun () ->
+          Eio.Fiber.fork_daemon ~sw (fun () ->
+              (* Check and suspend atomically, including signals that arrived
+                 before this monitor was forked. Only a fiber resolves [stop]. *)
+              ignore
+                (Eio.Condition.loop_no_mutex changed (fun () ->
+                     match Atomic.get signal with
+                     | 0 -> None
+                     | signo -> Some signo));
+              Eio.Promise.resolve resolver ();
+              `Stop_daemon);
+          f stop))
 
 let run ~sw ~env config =
   check_bind_available config;
   mark_started ();
   let net = Eio.Stdenv.net env in
   let clock = Eio.Stdenv.clock env in
-  let store = run_store_effect ~sw ~clock (Store.open_ config) in
+  let store = run_store_result (Store.open_ ~sw config) in
   Fun.protect
-    ~finally:(fun () -> close_store ~sw ~clock store)
+    ~finally:(fun () -> close_store store)
     (fun () ->
       (* Serve.h1 returns after draining. Leaving this switch cancels and
          awaits the pruner before the store closes on the outer switch. *)
@@ -1231,8 +1174,7 @@ let run ~sw ~env config =
           let addr =
             Serve.tcp_addr ~host:config.Config.host ~port:config.port
           in
-          with_shutdown_signals (fun stop ->
+          with_shutdown_signals ~sw:serve_sw (fun stop ->
               Serve.h1 ~sw:serve_sw ~net ~clock ~addr ~stop
-                ~install_signal_handlers:false ~ready_path:None
                 ~drain_timeout:(Eta.Duration.seconds 5)
                 (handler config store))))

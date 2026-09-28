@@ -1,148 +1,84 @@
 # Instrumenting an Eta app for Inn
 
-Inn accepts OTLP/HTTP with JSON bodies, so an Eta app needs no extra collector:
-`Eta_otel` exports Eta's tracer, logger, and meter capabilities straight to
-Inn's `/v1/traces`, `/v1/logs`, and `/v1/metrics` endpoints.
+Inn accepts OTLP/HTTP JSON at `POST /v1/traces`, `POST /v1/logs`, and
+`POST /v1/metrics`. Eta-next's `Eta_otel` exports completed
+`Eta_observability.Logger.span` spans and logger records to the first two
+endpoints. It does **not** expose a meter or export metrics: use another OTLP
+metrics producer if you need metrics. The default Inn base URL is
+`http://127.0.0.1:27687`.
 
-Inn endpoints (default local server `http://127.0.0.1:27687`):
+## Create and settle an exporter
 
-| Signal | Endpoint |
-|---|---|
-| Traces | `POST /v1/traces` |
-| Logs | `POST /v1/logs` |
-| Metrics | `POST /v1/metrics` |
+The HTTP client and exporter share a caller-owned Eio switch. The exporter
+borrows the HTTP client; create the client first, and call `shutdown` before
+leaving the switch. An exporter also registers a switch release hook for
+pending records when the application stops without an explicit shutdown.
 
-There is no auth and no query string. Protobuf, gzip, and gRPC are not
-supported; `Eta_otel` already speaks OTLP/JSON.
-
-## Create the exporter
-
-`Eta_otel.create` needs three things from the application: a runtime factory for
-exporter-owned work, an HTTP client, and the collector endpoint.
+`test/eta_guide_snippet.ml` is compiled against eta-next and checked against
+this example by Inn's test suite:
 
 ```ocaml
-open Eta
-
 let run () =
   Eio_main.run @@ fun stdenv ->
   Eio.Switch.run @@ fun sw ->
-  let net = Eio.Stdenv.net stdenv in
   let clock = Eio.Stdenv.clock stdenv in
-
-  let runtime_factory tracer = Eta_eio.Runtime.create ~sw ~clock ~tracer () in
-  let http_client = Eta_http_eio.Client.make_h1 ~sw ~net () in
-
+  let http_client =
+    Eta_http.Client.create ~sw ~net:(Eio.Stdenv.net stdenv) ~clock ()
+  in
   let exporter =
-    Eta_otel.create ~runtime_factory ~http_client ~clock:(Eta_eio.clock clock)
-      ~endpoint:(Eta_http.Core.Url.of_string "http://127.0.0.1:27687")
-      ~service_name:"my-app" ~service_version:"0.1.0" ()
+    match
+      Eta_otel.create ~sw ~clock ~http_client
+        ~endpoint:"http://127.0.0.1:27687" ~service_name:"my-app"
+        ~resource:[ ("service.version", "0.1.0") ] ()
+    with
+    | Ok exporter -> exporter
+    | Error error -> failwith (Format.asprintf "%a" Eta_otel.pp_error error)
   in
-
-  let rt =
-    Eta_eio.Runtime.create ~sw ~clock
-      ~tracer:(Eta_otel.tracer exporter)
-      ~logger:(Eta_otel.logger exporter)
-      ~meter:(Eta_otel.meter exporter) ()
+  let logger =
+    Eta_observability.Logger.create ~service:"my-app" ~clock
+      ~mono_clock:stdenv#mono_clock ~reporter:(Eta_otel.reporter exporter)
+      ~span_ids:(Eta_otel.span_ids exporter) ()
   in
-
-  let work = Eta_observability.named "http.request" (Effect.pure "ok") in
-  let result = Eta.Runtime.run rt work in
+  let result =
+    Eta_observability.Logger.span logger "http.request" (fun () ->
+        Eta_observability.Logger.info logger "work completed";
+        Ok "ok")
+  in
   let settlement = Eta_otel.shutdown exporter in
   (result, settlement)
 ```
 
-The dune stanza for that program:
+The application's Dune stanza needs `eta`, `eta_http`, `eta_otel`,
+`eta_observability`, and `eio_main`.
 
-```dune
-(executable
- (name app)
- (libraries eta eta_observability eta_eio eta_http_eio eta_otel eio_main))
-```
+`Eta_otel.create` takes the endpoint as a **string**; a path prefix, if
+present, is prepended to `/v1/logs` and `/v1/traces`. Its `~resource`
+adds attributes such as `service.version`; `service.name` comes from
+`~service_name`. Use `~headers` for authentication to a remote
+collector. `~batch_size` and `~max_queue` bound buffering; a full queue
+drops the newest item, reported by `Eta_otel.dropped`. `~on_error`
+receives typed transport/status errors (render with `Eta_otel.pp_error`).
 
-## Configuration that matters
-
-- `~endpoint:(Eta_http.Core.Url.t)` — the collector base URL, for example
-  `Eta_http.Core.Url.of_string "http://127.0.0.1:27687"`. It replaced the old
-  `?host`/`?port` pair; the endpoint's scheme and authority are kept on every
-  OTLP request URL.
-- `?traces_path`, `?logs_path`, `?metrics_path` — default to `/v1/traces`,
-  `/v1/logs`, and `/v1/metrics`, which is exactly what Inn serves, so pointing
-  `~endpoint` at Inn is enough.
-- `?self_metrics_path` — where the exporter's own health metrics go; defaults to
-  the metrics path. Inn accepts them, so leave it alone. Use
-  `~disable_self_metrics:true` only for a collector that rejects OTLP metrics
-  (Inn does not). Setting both `~disable_self_metrics:true` and
-  `~self_metrics_path` raises `Invalid_argument`.
-- `?service_name` and `?service_version` — become `service.name` and
-  `service.version`; every Inn query starts from the service name, so set it.
-- `?resource_attrs` — extra resource attributes on every signal.
-- `?queue_capacity` — per-signal mailbox bound, `1024` by default. When a
-  mailbox is full, telemetry is dropped and counted instead of blocking the
-  application fiber (`Eta_otel.dropped`, `queue_depth`, `in_flight`).
-- `?on_error:(diagnostic -> unit)` — receives a structured diagnostic with the
-  phase, the signal, and the complete cause tree, for example:
-
-```ocaml
-~on_error:(fun (diagnostic : Eta_otel.diagnostic) ->
-  prerr_endline
-    (Printf.sprintf "otlp %s failed in %s"
-       (Eta_otel.signal_to_string diagnostic.signal)
-       (Eta_otel.phase_to_string diagnostic.phase)))
-```
-
-- `?on_send` and `~debug:true` — local debugging of the exporter itself (the
-  request body, or one stderr line per POST).
-
-Export failures are non-fatal: the exporter retries the OTLP retryable statuses
-(`429`, `502`, `503`, `504`), counts drops, and reports through `~on_error`.
-Inn answers `200` with `{}` for a clean export, `200` plus
-`partialSuccess.rejectedSpans` (or `rejectedLogRecords` /
-`rejectedDataPoints`) when individual records were rejected, `400` for
-malformed JSON, `413` for an oversized body, `415` for a non-JSON content type,
-and `503` with `Retry-After: 1` when the store is busy.
-
-## Settle the exporter
-
-`Eta_otel.shutdown` closes admission, drains everything that was admitted, and
-waits for the exporter's own task to finish, so the last spans and logs reach
-Inn before the process exits:
-
-```ocaml
-match Eta_otel.shutdown exporter with
-| Eta.Exit.Ok Eta_otel.Drained -> ()
-| Eta.Exit.Ok (Eta_otel.Deadline_reached { remaining }) ->
-    Printf.eprintf "exporter deadline: %d signals remain\n" remaining
-| Eta.Exit.Error cause ->
-    Printf.eprintf "%a\n" (Eta.Cause.pp Eta_otel.pp_export_error) cause
-```
-
-Use `Eta_otel.flush` instead when the exporter stays open. Both take
-`?timeout_s`. Completion means the captured records settled, not that Inn
-accepted them: a handled export failure stays reported through `~on_error`.
+`Eta_otel.flush exporter` settles earlier records but keeps admission
+open. `Eta_otel.shutdown exporter` closes admission and returns
+`(unit, Eta_otel.error) result`. Both can report an HTTP error; shutdown
+also takes an optional `Eta.Duration.t` timeout and can return
+```Drain_deadline```.
 
 ## Instrument usefully
 
-- `Eta_observability.named "operation" work` for meaningful spans;
-- `Eta_observability.log "message"` (or the logger capability) for correlated
-  log records — they inherit the current span's `traceId` and `spanId`;
-- `Eta_observability.metric_update` with a counter, gauge, histogram, or
-  summary for measurements;
-- attributes for anything you will want to search: put them in span or log
-  attributes rather than only in the message text.
+Use `Eta_observability.Logger.span` around work and log inside it so
+trace/span IDs correlate the completed span and its logs. Nested spans inherit
+the trace ID. Add searchable attributes via `~fields` and
+`Eta_observability.Context.with_fields`, rather than burying them in the
+message. Tag temporary debugging instrumentation with shared keys such as
+`debug.session`, `debug.hypothesis`, and `debug.step`; remove it after
+investigation (see `GET /docs/debug`).
 
-Tag temporary debugging instrumentation with the shared keys so one query finds
-all of it:
-
-```ocaml
-(* #region inn debug *)
-let debug_attrs =
-  [ ("debug.session", "abc123"); ("debug.hypothesis", "cache-miss");
-    ("debug.step", "after-read") ]
-(* #endregion inn debug *)
-```
-
-Remove every marked block once the fix is verified; see `GET /docs/debug` for
-the workflow that uses `attr.debug.session` and `attrContains.debug.label`.
+Inn responds `200` with `{}` for a clean export and `200` with
+`partialSuccess` for individually rejected spans/log records; malformed
+JSON gets `400`, oversized bodies `413`, non-JSON `415`, and a busy
+store `503` with `Retry-After: 1`.
 
 ## Verify
 
@@ -151,36 +87,9 @@ curl -s http://127.0.0.1:27687/health
 curl -s 'http://127.0.0.1:27687/services?lookback=all'
 curl -s 'http://127.0.0.1:27687/traces?service=my-app&lookback=15m'
 curl -s 'http://127.0.0.1:27687/logs?service=my-app&lookback=15m'
-curl -s 'http://127.0.0.1:27687/metrics?service=my-app&lookback=15m'
 ```
 
-If `services` stays empty, check the exporter configuration before the
-instrumentation: a wrong `~endpoint`, an exporter that was never used to build
-the runtime, or a process that exited before `shutdown`.
-
-## Environment-driven bootstrap
-
-Eta also ships `Eta_otel_eio`, an Eio bootstrap over the same exporter core. It
-resolves `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://127.0.0.1:4318`),
-`OTEL_SERVICE_NAME` (default `eta`), and `OTEL_SDK_DISABLED`, so pointing an app
-at Inn can be pure configuration:
-
-```sh
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:27687
-```
-
-- `Eta_otel_eio.init_scoped_from_env ~sw ~net ~clock ()` returns a handle whose
-  `Scoped.runtime` the caller runs on, with `Scoped.tracer`, `Scoped.logger`,
-  `Scoped.meter`, and `Scoped.shutdown` on the caller's switch.
-- `Eta_otel_eio.with_otlp ~sw ~net ~clock body` runs `body` on that runtime and
-  settles the exporter before returning.
-- `Eta_otel_eio.init_from_env ()` starts a private worker thread and returns a
-  `Threaded.t` sink with a producer-side logger and meter for code with no
-  ambient Eta runtime; tracing stays on the scoped API.
-
-Either way, set `OTEL_EXPORTER_OTLP_ENDPOINT` to Inn and the defaults line up:
-`Eta_otel`'s signal paths are already `/v1/traces`, `/v1/logs`, and
-`/v1/metrics`.
-
-Read `GET /docs/debug` next for the investigation workflow, and
-`GET /openapi.json` for every parameter and response schema.
+If services stays empty, check `~endpoint`, whether the logger actually
+emitted records, and whether the process exited before the exporter settled.
+Read `GET /docs/debug` for the investigation workflow and
+`GET /openapi.json` for the query schemas.

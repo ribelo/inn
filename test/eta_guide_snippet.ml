@@ -1,28 +1,28 @@
-open Eta
-
 let run () =
   Eio_main.run @@ fun stdenv ->
   Eio.Switch.run @@ fun sw ->
-  let net = Eio.Stdenv.net stdenv in
   let clock = Eio.Stdenv.clock stdenv in
-
-  let runtime_factory tracer = Eta_eio.Runtime.create ~sw ~clock ~tracer () in
-  let http_client = Eta_http_eio.Client.make_h1 ~sw ~net () in
-
+  let http_client =
+    Eta_http.Client.create ~sw ~net:(Eio.Stdenv.net stdenv) ~clock ()
+  in
   let exporter =
-    Eta_otel.create ~runtime_factory ~http_client ~clock:(Eta_eio.clock clock)
-      ~endpoint:(Eta_http.Core.Url.of_string "http://127.0.0.1:27687")
-      ~service_name:"my-app" ~service_version:"0.1.0" ()
+    match
+      Eta_otel.create ~sw ~clock ~http_client
+        ~endpoint:"http://127.0.0.1:27687" ~service_name:"my-app"
+        ~resource:[ ("service.version", "0.1.0") ] ()
+    with
+    | Ok exporter -> exporter
+    | Error error -> failwith (Format.asprintf "%a" Eta_otel.pp_error error)
   in
-
-  let rt =
-    Eta_eio.Runtime.create ~sw ~clock
-      ~tracer:(Eta_otel.tracer exporter)
-      ~logger:(Eta_otel.logger exporter)
-      ~meter:(Eta_otel.meter exporter) ()
+  let logger =
+    Eta_observability.Logger.create ~service:"my-app" ~clock
+      ~mono_clock:stdenv#mono_clock ~reporter:(Eta_otel.reporter exporter)
+      ~span_ids:(Eta_otel.span_ids exporter) ()
   in
-
-  let work = Eta_observability.named "http.request" (Effect.pure "ok") in
-  let result = Eta.Runtime.run rt work in
+  let result =
+    Eta_observability.Logger.span logger "http.request" (fun () ->
+        Eta_observability.Logger.info logger "work completed";
+        Ok "ok")
+  in
   let settlement = Eta_otel.shutdown exporter in
   (result, settlement)

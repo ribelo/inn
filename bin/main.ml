@@ -171,19 +171,19 @@ let http_request config method_ path =
     Eio.Switch.run @@ fun sw ->
     let net = Eio.Stdenv.net env in
     let clock = Eio.Stdenv.clock env in
-    let rt = Eta_eio.Runtime.create ~sw ~clock () in
-    let client = Eta_http_eio.Client.make_h1_direct ~sw ~net () in
-    let request = H.Request.make method_ url in
-    let program =
-      let open Eta.Syntax in
-      let* response = H.request client request in
-      let* body = H.Body.Stream.read_all response.H.Response.body in
-      Eta.Effect.pure (response.status, Bytes.to_string body)
-    in
-    match Eta.Runtime.run rt program with
-    | Eta.Exit.Ok result -> Ok result
-    | Eta.Exit.Error cause ->
-        Error (Format.asprintf "%a" (Eta.Cause.pp H.Error.pp) cause)
+    let client = H.Client.create ~sw ~net ~clock () in
+    match H.Client.request client ~method_ ~url () with
+    | Ok response -> Ok (response.status, Bytes.to_string response.body)
+    | Error error ->
+        Error
+          (match error with
+          | `Connect message -> "connection refused: " ^ message
+          | `Tls message -> "TLS: " ^ message
+          | `Protocol message -> "HTTP protocol: " ^ message
+          | `Timeout -> "HTTP request timed out"
+          | `Idle_timeout -> "HTTP response idle timeout"
+          | `Body_too_large -> "HTTP response exceeds body limit"
+          | `Closed -> "HTTP connection closed")
   with exn -> Error (Printexc.to_string exn)
 
 let friendly_http_error config message =

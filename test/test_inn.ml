@@ -248,33 +248,39 @@ let cleanup_config config =
     (fun path -> if Sys.file_exists path then Sys.remove path)
     [ config.Config.db_path; config.db_path ^ "-wal"; config.db_path ^ "-shm" ]
 
-let run_store program =
-  Eio_main.run @@ fun env ->
+let active_store_switch = ref None
+
+let run_store_scope f =
+  Eio_main.run @@ fun _env ->
   Eio.Switch.run @@ fun sw ->
-  let rt = Eta_eio.Runtime.create ~sw ~clock:(Eio.Stdenv.clock env) () in
-  match Eta.Runtime.run rt program with
-  | Eta.Exit.Ok value -> value
-  | Eta.Exit.Error cause ->
-      Alcotest.failf "%a" (Eta.Cause.pp Store.pp_error) cause
+  let previous = !active_store_switch in
+  active_store_switch := Some sw;
+  Fun.protect ~finally:(fun () -> active_store_switch := previous) f
+
+let run_store program =
+  let run sw =
+    match program sw with
+    | Ok value -> value
+    | Error error -> Alcotest.failf "%a" Store.pp_error error
+  in
+  match !active_store_switch with
+  | Some sw -> run sw
+  | None -> Eio_main.run @@ fun _env -> Eio.Switch.run run
 
 let run_store_error program =
-  Eio_main.run @@ fun env ->
+  Eio_main.run @@ fun _env ->
   Eio.Switch.run @@ fun sw ->
-  let rt = Eta_eio.Runtime.create ~sw ~clock:(Eio.Stdenv.clock env) () in
-  match Eta.Runtime.run rt program with
-  | Eta.Exit.Ok _ -> None
-  | Eta.Exit.Error cause ->
-      Some (Format.asprintf "%a" (Eta.Cause.pp Store.pp_error) cause)
+  match program sw with
+  | Ok _ -> None
+  | Error error -> Some (Format.asprintf "%a" Store.pp_error error)
 
-let run_store_in ~sw ~clock program =
-  let rt = Eta_eio.Runtime.create ~sw ~clock () in
-  match Eta.Runtime.run rt program with
-  | Eta.Exit.Ok value -> value
-  | Eta.Exit.Error cause ->
-      Alcotest.failf "%a" (Eta.Cause.pp Store.pp_error) cause
+let run_store_in ~sw ~clock:_ program =
+  match program sw with
+  | Ok value -> value
+  | Error error -> Alcotest.failf "%a" Store.pp_error error
 
 let with_store ?now_ms ?report config f =
-  run_store (Store.with_db ?now_ms ?report config f)
+  run_store (fun sw -> Store.with_db ~sw ?now_ms ?report config f)
 
 (* Test-only database probes. The store's public interface cannot produce a
    stale schema version or a foreign database, and it cannot prove that no
@@ -284,7 +290,6 @@ let with_store ?now_ms ?report config f =
 let pp_pool_error ppf = function
   | `Eta_sql error -> Eta_sql.pp_error ppf error
   | `Pool_shutdown -> Format.pp_print_string ppf "pool shutdown"
-  | `Pool_shutdown_timeout -> Format.pp_print_string ppf "pool shutdown timeout"
   | `Timeout -> Format.pp_print_string ppf "timeout"
 
 module Test_meta = struct
@@ -369,28 +374,26 @@ module Test_metric_attributes = struct
 end
 
 let run_test_db path program =
-  Eio_main.run @@ fun env ->
+  Eio_main.run @@ fun _env ->
   Eio.Switch.run @@ fun sw ->
-  let rt = Eta_eio.Runtime.create ~sw ~clock:(Eio.Stdenv.clock env) () in
-  let open Eta.Syntax in
+  let ( let* ) = Result.bind in
   let program =
     let* pool =
       Eta_sql.Pool.create
-        ~default_timeout:(Eta.Duration.ms 5000)
+        ~sw ~default_timeout:5.
         (Eta_sql.Sqlite.default_config path)
     in
     let* value = program pool in
     let* () = Eta_sql.Pool.shutdown pool in
-    Eta.Effect.pure value
+    Result.ok value
   in
-  match Eta.Runtime.run rt program with
-  | Eta.Exit.Ok value -> value
-  | Eta.Exit.Error cause ->
-      Alcotest.failf "%a" (Eta.Cause.pp pp_pool_error) cause
+  match program with
+  | Ok value -> value
+  | Error error -> Alcotest.failf "%a" pp_pool_error error
 
 let write_schema_version path version =
   run_test_db path (fun pool ->
-      let open Eta.Syntax in
+      let ( let* ) = Result.bind in
       let update =
         Eta_sql.Update.(
           table Test_meta.table
@@ -399,11 +402,11 @@ let write_schema_version path version =
           |> compile)
       in
       let* _ = Eta_sql.Pool.Typed.execute_compiled pool update in
-      Eta.Effect.pure ())
+      Result.ok ())
 
 let create_foreign_database path =
   run_test_db path (fun pool ->
-      let open Eta.Syntax in
+      let ( let* ) = Result.bind in
       let schema =
         Eta_sql.Eta_schema.(
           compile
@@ -418,7 +421,7 @@ let create_foreign_database path =
           |> compile)
       in
       let* _ = Eta_sql.Pool.Typed.execute_compiled pool insert in
-      Eta.Effect.pure ())
+      Result.ok ())
 
 let foreign_rows path =
   run_test_db path (fun pool ->
@@ -430,7 +433,7 @@ let foreign_rows path =
 (* Attribute rows whose owner row is gone (ret-hy7e). *)
 let orphan_attribute_rows path =
   run_test_db path (fun pool ->
-      let open Eta.Syntax in
+      let ( let* ) = Result.bind in
       let owners table owner_id =
         Eta_sql.Pool.Typed.select pool
           (Eta_sql.Select.compile
@@ -455,23 +458,19 @@ let orphan_attribute_rows path =
         owners Test_metric_attributes.table Test_metric_attributes.owner_id
       in
       let* metric_ids = ids Test_metric_points.table Test_metric_points.id in
-      Eta.Effect.pure
+      Result.ok
         (count_orphans span_owners span_ids + count_orphans log_owners log_ids
        + count_orphans metric_owners metric_ids))
 
 (* Server helpers -------------------------------------------------------- *)
 
 let run_server_effect program =
-  Eio_main.run @@ fun env ->
-  Eio.Switch.run @@ fun sw ->
-  let rt = Eta_eio.Runtime.create ~sw ~clock:(Eio.Stdenv.clock env) () in
-  match Eta.Runtime.run rt program with
-  | Eta.Exit.Ok value -> value
-  | Eta.Exit.Error cause ->
-      Alcotest.failf "%a" (Eta.Cause.pp Eta_http.Server.Error.pp) cause
+  match program with
+  | Ok value -> value
+  | Error error -> Alcotest.failf "%a" Eta_http.Server.Error.pp error
 
 let request ?(method_ = "GET") ?(target = "/health") ?(body = "")
-    ?(headers = Eta_http.Core.Header.empty) () =
+    ?(headers = Eta_http.Header.empty) () =
   let path, query = Eta_http.Server.Request.split_target target in
   let body =
     if String.equal body "" then Eta_http.Server.Body.empty ()
@@ -479,14 +478,14 @@ let request ?(method_ = "GET") ?(target = "/health") ?(body = "")
       let chunks = ref [ Bytes.of_string body ] in
       Eta_http.Server.Body.of_reader (fun () ->
           match !chunks with
-          | [] -> Eta.Effect.pure None
+          | [] -> Result.ok None
           | chunk :: rest ->
               chunks := rest;
-              Eta.Effect.pure (Some chunk))
+              Result.ok (Some chunk))
   in
   {
     Eta_http.Server.Request.id = lazy "req-test";
-    version = Eta_http.Core.Version.H1_1;
+    version = Eta_http.Version.H1_1;
     scheme = "http";
     authority = Some "127.0.0.1";
     method_;
@@ -495,7 +494,7 @@ let request ?(method_ = "GET") ?(target = "/health") ?(body = "")
     query;
     headers;
     body;
-    trailers = (fun () -> Eta.Effect.pure Eta_http.Core.Header.empty);
+    trailers = (fun () -> Result.ok Eta_http.Header.empty);
     peer = { address = Some "127.0.0.1"; port = Some 43123 };
     tls = false;
     alpn_protocol = Some "http/1.1";
@@ -536,17 +535,10 @@ let free_port () =
       | Unix.ADDR_INET (_, port) -> port
       | Unix.ADDR_UNIX _ -> Alcotest.fail "expected an inet socket")
 
-let http_get_opt ~sw ~net ~clock client url =
-  let rt = Eta_eio.Runtime.create ~sw ~clock () in
-  let program =
-    let open Eta.Syntax in
-    let* response = Eta_http.request client (Eta_http.Request.make "GET" url) in
-    let* body = Eta_http.Body.Stream.read_all response.Eta_http.Response.body in
-    Eta.Effect.pure (response.Eta_http.Response.status, Bytes.to_string body)
-  in
-  match Eta.Runtime.run rt program with
-  | Eta.Exit.Ok value -> Some value
-  | Eta.Exit.Error _ -> None
+let http_get_opt ~sw:_ ~net:_ ~clock:_ client url =
+  match Eta_http.Client.request client ~method_:"GET" ~url () with
+  | Ok response -> Some (response.status, Bytes.to_string response.body)
+  | Error _ -> None
 
 let http_get ~sw ~net ~clock client url =
   match http_get_opt ~sw ~net ~clock client url with
@@ -580,13 +572,13 @@ let test_schema_reopen_keeps_data () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   with_store config (fun store ->
-      let open Eta.Syntax in
+      let ( let* ) = Result.bind in
       let* _ = Store.ingest_traces store [ test_span () ] in
       let* _ = Store.ingest_logs store [ test_log () ] in
-      Eta.Effect.pure ());
+      Result.ok ());
   let stats =
     with_store config (fun store ->
-        let open Eta.Syntax in
+        let ( let* ) = Result.bind in
         let* _ = Store.ingest_metrics store [ test_metric () ] in
         Store.stats store)
   in
@@ -599,9 +591,9 @@ let test_schema_mismatch_recreates_database () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   with_store config (fun store ->
-      let open Eta.Syntax in
+      let ( let* ) = Result.bind in
       let* _ = Store.ingest_logs store [ test_log () ] in
-      Eta.Effect.pure ());
+      Result.ok ());
   write_schema_version config.Config.db_path "0";
   let messages = ref [] in
   let stats, ingested =
@@ -609,10 +601,10 @@ let test_schema_mismatch_recreates_database () =
       ~report:(fun message -> messages := message :: !messages)
       config
       (fun store ->
-        let open Eta.Syntax in
+        let ( let* ) = Result.bind in
         let* stats = Store.stats store in
         let* ingested = Store.ingest_logs store [ test_log ~body:"fresh" () ] in
-        Eta.Effect.pure (stats, ingested))
+        Result.ok (stats, ingested))
   in
   Alcotest.(check int) "old data is gone (schm-s13e)" 0 stats.Model.logs;
   Alcotest.(check int) "store works after recreate (schm-s13e)" 1 ingested;
@@ -634,7 +626,7 @@ let test_schema_refuses_foreign_database () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   create_foreign_database config.Config.db_path;
-  (match run_store_error (Store.open_ config) with
+  (match run_store_error (fun sw -> Store.open_ ~sw config) with
   | Some message ->
       Alcotest.(check bool)
         "error names the missing metadata table (schm-xkk2)" true
@@ -655,7 +647,7 @@ let test_schema_refuses_foreign_database () =
       let channel = open_out_bin other.Config.db_path in
       output_string channel contents;
       close_out channel;
-      (match run_store_error (Store.open_ other) with
+      (match run_store_error (fun sw -> Store.open_ ~sw other) with
       | Some message ->
           Alcotest.(check bool)
             "error says the file is not a database (schm-xkk2)" true
@@ -709,8 +701,8 @@ let test_store_ingests_and_queries_all_signals () =
       read_metrics,
       stats )
     =
-    let open Eta.Syntax in
-    Store.with_db config (fun store ->
+    let ( let* ) = Result.bind in
+    (fun sw -> Store.with_db ~sw config (fun store ->
         let* inserted_spans = Store.ingest_traces store spans in
         let* inserted_logs = Store.ingest_logs store logs in
         let* inserted_metrics = Store.ingest_metrics store metrics in
@@ -718,24 +710,24 @@ let test_store_ingests_and_queries_all_signals () =
         let* summaries =
           Store.list_trace_summaries ~service:"svc" ~window:all_window ~limit:100
             store
-          |> Eta.Effect.map page_items
+          |> Result.map page_items
         in
         let* trace = Store.get_trace store "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in
         let* span = Store.get_span store "bbbbbbbbbbbbbbbb" in
         let* trace_spans =
           Store.list_trace_spans store ~window:all_window ~limit:100
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-          |> Eta.Effect.map page_items
+          |> Result.map page_items
         in
         let* trace_logs =
           Store.list_trace_logs store ~window:all_window ~limit:100
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-          |> Eta.Effect.map page_items
+          |> Result.map page_items
         in
         let* span_logs =
           Store.list_span_logs store ~window:all_window ~limit:100
             "bbbbbbbbbbbbbbbb"
-          |> Eta.Effect.map page_items
+          |> Result.map page_items
         in
         let* searched_spans =
           Store.search_spans
@@ -751,7 +743,7 @@ let test_store_ingests_and_queries_all_signals () =
               limit = 10;
             }
             store
-          |> Eta.Effect.map page_items
+          |> Result.map page_items
         in
         let* searched_traces =
           Store.search_traces
@@ -765,7 +757,7 @@ let test_store_ingests_and_queries_all_signals () =
               limit = 10;
             }
             store
-          |> Eta.Effect.map page_items
+          |> Result.map page_items
         in
         let* searched_logs =
           Store.search_logs
@@ -781,7 +773,7 @@ let test_store_ingests_and_queries_all_signals () =
               limit = 10;
             }
             store
-          |> Eta.Effect.map page_items
+          |> Result.map page_items
         in
         let* trace_stats =
           Store.trace_stats
@@ -847,7 +839,7 @@ let test_store_ingests_and_queries_all_signals () =
               limit = 10;
             }
             store
-          |> Eta.Effect.map page_items
+          |> Result.map page_items
         in
         let* read_metrics =
           Store.list_metric_points
@@ -859,10 +851,10 @@ let test_store_ingests_and_queries_all_signals () =
               limit = 10;
             }
             store
-          |> Eta.Effect.map page_items
+          |> Result.map page_items
         in
         let* stats = Store.stats store in
-        Eta.Effect.pure
+        Result.ok
           ( inserted_spans,
             inserted_logs,
             inserted_metrics,
@@ -882,7 +874,7 @@ let test_store_ingests_and_queries_all_signals () =
             log_facets,
             read_logs,
             read_metrics,
-            stats ))
+            stats )))
     |> run_store
   in
   Alcotest.(check int) "inserted spans" 1 inserted_spans;
@@ -940,7 +932,7 @@ let test_prune_per_signal_ttl () =
   let clock = ref base_time in
   let after_logs, after_traces, stats_after_logs, stats_after_traces =
     with_store ~now_ms:(fun () -> !clock) config (fun store ->
-        let open Eta.Syntax in
+        let ( let* ) = Result.bind in
         let* _ = Store.ingest_traces store [ test_span () ] in
         let* _ = Store.ingest_logs store [ test_log () ] in
         let* _ = Store.ingest_metrics store [ test_metric () ] in
@@ -950,7 +942,7 @@ let test_prune_per_signal_ttl () =
           Store.prune ~now_ms:(base_time + (49 * hour_ms)) store
         in
         let* stats_after_traces = Store.stats store in
-        Eta.Effect.pure
+        Result.ok
           (after_logs, after_traces, stats_after_logs, stats_after_traces))
   in
   Alcotest.(check int)
@@ -979,7 +971,7 @@ let test_prune_uses_ingestion_time () =
   let clock = ref base_time in
   let early, late, left =
     with_store ~now_ms:(fun () -> !clock) config (fun store ->
-        let open Eta.Syntax in
+        let ( let* ) = Result.bind in
         let* _ =
           Store.ingest_logs store
             [
@@ -992,7 +984,7 @@ let test_prune_uses_ingestion_time () =
         let* early = Store.prune ~now_ms:(base_time + (1 * hour_ms)) store in
         let* late = Store.prune ~now_ms:(base_time + (25 * hour_ms)) store in
         let* left = Store.stats store in
-        Eta.Effect.pure (early, late, left))
+        Result.ok (early, late, left))
   in
   Alcotest.(check int)
     "client timestamps do not expire data early (ret-ovry)" 0 early.Model.logs;
@@ -1008,7 +1000,7 @@ let test_prune_keeps_trace_with_fresh_span () =
   let stale_trace = "dddddddddddddddddddddddddddddddd" in
   let report, stats, kept, gone, attr_spans, attr_traces =
     with_store ~now_ms:(fun () -> !clock) config (fun store ->
-        let open Eta.Syntax in
+        let ( let* ) = Result.bind in
         let* _ =
           Store.ingest_traces store
             [
@@ -1049,7 +1041,7 @@ let test_prune_keeps_trace_with_fresh_span () =
               limit = 10;
             }
             store
-          |> Eta.Effect.map page_items
+          |> Result.map page_items
         in
         let* attr_traces =
           Store.search_traces
@@ -1063,9 +1055,9 @@ let test_prune_keeps_trace_with_fresh_span () =
               limit = 10;
             }
             store
-          |> Eta.Effect.map page_items
+          |> Result.map page_items
         in
-        Eta.Effect.pure (report, stats, kept, gone, attr_spans, attr_traces))
+        Result.ok (report, stats, kept, gone, attr_spans, attr_traces))
   in
   Alcotest.(check int)
     "only the stale trace is deleted (ret-4hhb)" 1 report.Model.traces;
@@ -1091,7 +1083,7 @@ let test_prune_batches_large_backlog () =
   let bulk_logs = 5_000 in
   let report, stats =
     with_store ~now_ms:(fun () -> !clock) config (fun store ->
-        let open Eta.Syntax in
+        let ( let* ) = Result.bind in
         let logs =
           List.init bulk_logs (fun index ->
               test_log ~body:(Printf.sprintf "bulk-%d" index) ~attributes:[]
@@ -1100,7 +1092,7 @@ let test_prune_batches_large_backlog () =
         let* _ = Store.ingest_logs store logs in
         let* report = Store.prune ~now_ms:(base_time + (25 * hour_ms)) store in
         let* stats = Store.stats store in
-        Eta.Effect.pure (report, stats))
+        Result.ok (report, stats))
   in
   Alcotest.(check int)
     "a multi-batch backlog is fully pruned (ret-xbij)" bulk_logs
@@ -1113,14 +1105,14 @@ let test_ingest_does_not_prune () =
   let clock = ref base_time in
   let after_ingest, report, after_prune =
     with_store ~now_ms:(fun () -> !clock) config (fun store ->
-        let open Eta.Syntax in
+        let ( let* ) = Result.bind in
         let* _ = Store.ingest_logs store [ test_log ~body:"first" () ] in
         clock := base_time + (25 * hour_ms);
         let* _ = Store.ingest_logs store [ test_log ~body:"second" () ] in
         let* after_ingest = Store.stats store in
         let* report = Store.prune ~now_ms:(base_time + (25 * hour_ms)) store in
         let* after_prune = Store.stats store in
-        Eta.Effect.pure (after_ingest, report, after_prune))
+        Result.ok (after_ingest, report, after_prune))
   in
   Alcotest.(check int)
     "expired data stays until the pruner runs (ret-rkrf)" 2
@@ -1138,7 +1130,7 @@ let test_prune_size_cap_removes_only_oldest () =
   let body = String.make (8 * 1024) 'x' in
   let report, second_report, stats, new_left, old_left =
     with_store ~now_ms:(fun () -> !clock) config (fun store ->
-        let open Eta.Syntax in
+        let ( let* ) = Result.bind in
         let old =
           List.init old_logs (fun index ->
               test_log ~service_name:"old"
@@ -1175,7 +1167,7 @@ let test_prune_size_cap_removes_only_oldest () =
               limit = 1000;
             }
             store
-          |> Eta.Effect.map page_items
+          |> Result.map page_items
         in
         let* old_left =
           Store.list_logs
@@ -1188,9 +1180,9 @@ let test_prune_size_cap_removes_only_oldest () =
               limit = 1000;
             }
             store
-          |> Eta.Effect.map page_items
+          |> Result.map page_items
         in
-        Eta.Effect.pure (report, second_report, stats, new_left, old_left))
+        Result.ok (report, second_report, stats, new_left, old_left))
   in
   Alcotest.(check bool)
     "the size cap triggers (ret-zjzs)" true report.Model.size_cap_triggered;
@@ -1225,7 +1217,7 @@ let test_stats_reports_retention () =
   let clock = ref base_time in
   let stats =
     with_store ~now_ms:(fun () -> !clock) config (fun store ->
-        let open Eta.Syntax in
+        let ( let* ) = Result.bind in
         let* _ = Store.ingest_logs store [ test_log () ] in
         let* _ = Store.prune ~now_ms:(base_time + (7 * hour_ms)) store in
         Store.stats store)
@@ -1266,9 +1258,10 @@ let test_stats_reports_retention () =
 let test_server_handler_ingests_and_queries_services () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  let store = run_store (Store.open_ config) in
+  run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw config) in
   Fun.protect
-    ~finally:(fun () -> run_store (Store.close store))
+    ~finally:(fun () -> run_store (fun _sw -> Store.close store))
     (fun () ->
       let ingest =
         run_server_effect
@@ -1504,11 +1497,11 @@ let test_server_pruner_prunes_without_ingest () =
     ~now_ms:(fun () -> wall_now_ms () - (2 * hour_ms))
     config
     (fun store ->
-      let open Eta.Syntax in
+      let ( let* ) = Result.bind in
       let* _ =
         Store.ingest_logs store [ test_log ~body:"expired while stopped" () ]
       in
-      Eta.Effect.pure ());
+      Result.ok ());
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
   let net = Eio.Stdenv.net env in
@@ -1516,7 +1509,7 @@ let test_server_pruner_prunes_without_ingest () =
   Eio.Fiber.first
     (fun () -> Inn.Server.run ~sw ~env config)
     (fun () ->
-      let client = Eta_http_eio.Client.make_h1_direct ~sw ~net () in
+      let client = Eta_http.Client.create ~sw ~net ~clock () in
       let base_url = Printf.sprintf "http://127.0.0.1:%d" port in
       let stats_json () =
         let status, body = http_get ~sw ~net ~clock client (base_url ^ "/stats") in
@@ -1547,15 +1540,15 @@ let test_server_pruner_prunes_without_ingest () =
       (* A later interval pass prunes data that arrives while the server keeps
          running without any ingest request (ret-sj15). *)
       run_store_in ~sw ~clock
-        (Store.with_db
+        (fun sw -> Store.with_db ~sw
            ~now_ms:(fun () -> wall_now_ms () - (2 * hour_ms))
            config
            (fun store ->
-             let open Eta.Syntax in
+             let ( let* ) = Result.bind in
              let* _ =
                Store.ingest_logs store [ test_log ~body:"expired later" () ]
              in
-             Eta.Effect.pure ()));
+             Result.ok ()));
       Alcotest.(check bool)
         "the expired row becomes visible" true
         (wait_until ~clock ~timeout_seconds:5.0 (fun () -> log_count () = 1));
@@ -1604,13 +1597,14 @@ let test_otlp_conformance_decoder () =
 let test_otlp_conformance_handler () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  let store = run_store (Store.open_ config) in
-  let post ?(headers = Eta_http.Core.Header.empty) path body =
+  run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  let post ?(headers = Eta_http.Header.empty) path body =
     run_server_effect (Inn.Server.handler config store
       (request ~method_:"POST" ~target:path ~body ~headers ())) in
   let get path = run_server_effect
     (Inn.Server.handler config store (request ~target:path ())) |> response_json in
-  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   List.iter (fun path ->
     let response = post path "" in
     Alcotest.(check int) "empty status (otlp-dtfh)" 200 (Eta_http.Server.Response.status response);
@@ -1619,7 +1613,7 @@ let test_otlp_conformance_handler () =
   let invalid = post "/v1/traces" "{" in
   Alcotest.(check int) "bad JSON (otlp-qso2)" 400 (Eta_http.Server.Response.status invalid);
   Alcotest.(check bool) "INVALID_ARGUMENT body" true (member "code" (response_json invalid) = `Int 3);
-  let headers = Eta_http.Core.Header.unsafe_of_list ["content-type", "application/x-protobuf"] in
+  let headers = Eta_http.Header.unsafe_of_list ["content-type", "application/x-protobuf"] in
   let unsupported = post ~headers "/v1/traces" "{}" in
   Alcotest.(check int) "protobuf rejected (otlp-ohmj)" 415 (Eta_http.Server.Response.status unsupported);
   let oversized = post "/v1/traces" (String.make (32 * 1024 * 1024 + 1) ' ') in
@@ -1685,8 +1679,9 @@ let test_otlp_conformance_handler () =
 let test_otlp_store_retry () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  let store = run_store (Store.open_ config) in
-  run_store (Store.close store);
+  run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  run_store (fun _sw -> Store.close store);
   let response = run_server_effect
     (Inn.Server.handler config store
       (request ~method_:"POST" ~target:"/v1/traces" ~body:trace_fixture ())) in
@@ -1695,7 +1690,7 @@ let test_otlp_store_retry () =
   Alcotest.(check bool) "OTLP UNAVAILABLE" true
     (member "code" (response_json response) = `Int 14);
   Alcotest.(check (option string)) "Retry-After" (Some "1")
-    (Eta_http.Core.Header.get "retry-after"
+    (Eta_http.Header.get "retry-after"
       (Eta_http.Server.Response.headers response))
 
 (* Query windows and cursors --------------------------------------------- *)
@@ -1881,9 +1876,10 @@ let test_query_windows () =
   (* win-nzur, win-e7k8, win-m4ld, win-jee9, win-3ghy, win-xl30 *)
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  let store = run_store (Store.open_ ~now_ms:(fun () -> base_time) config) in
+  run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw ~now_ms:(fun () -> base_time) config) in
   Fun.protect
-    ~finally:(fun () -> run_store (Store.close store))
+    ~finally:(fun () -> run_store (fun _sw -> Store.close store))
     (fun () ->
       let ages = [ ("now", 0); ("30m", 30); ("2h", 120); ("3d", 3 * 24 * 60) ] in
       let spans =
@@ -1912,11 +1908,11 @@ let test_query_windows () =
       in
       ignore
         (run_store
-           (let open Eta.Syntax in
+           (fun _sw -> let ( let* ) = Result.bind in
             let* _ = Store.ingest_traces store spans in
             let* _ = Store.ingest_logs store logs in
             let* _ = Store.ingest_metrics store metrics in
-            Eta.Effect.pure ()));
+            Result.ok ()));
       let count path name =
         json_list_length name (server_json config store path)
       in
@@ -2061,9 +2057,10 @@ let test_pagination_walk_logs () =
   (* win-edze, win-7xet, win-fl8w, win-xi3q, win-xpfn *)
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  let store = run_store (Store.open_ ~now_ms:(fun () -> base_time) config) in
+  run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw ~now_ms:(fun () -> base_time) config) in
   Fun.protect
-    ~finally:(fun () -> run_store (Store.close store))
+    ~finally:(fun () -> run_store (fun _sw -> Store.close store))
     (fun () ->
       let walk_body index = Printf.sprintf "walk-%03d" index in
       let logs =
@@ -2071,7 +2068,7 @@ let test_pagination_walk_logs () =
             test_log ~service_name:"walk" ~body:(walk_body index)
               ~timestamp_ms:(base_time - (index * 60_000)) ())
       in
-      ignore (run_store (Store.ingest_logs store logs));
+      ignore (run_store (fun _sw -> Store.ingest_logs store logs));
       let bodies json =
         List.map
           (fun item ->
@@ -2097,7 +2094,7 @@ let test_pagination_walk_logs () =
       let cursor1 = next_cursor page1 in
       ignore
         (run_store
-           (Store.ingest_logs store
+           (fun _sw -> Store.ingest_logs store
               (List.init 5 (fun index ->
                    test_log ~service_name:"walk"
                      ~body:(Printf.sprintf "late-%d" index)
@@ -2157,9 +2154,10 @@ let test_pagination_endpoints () =
   (* win-5hgv, win-ggl7, win-7xet, win-xl30 *)
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  let store = run_store (Store.open_ ~now_ms:(fun () -> base_time) config) in
+  run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw ~now_ms:(fun () -> base_time) config) in
   Fun.protect
-    ~finally:(fun () -> run_store (Store.close store))
+    ~finally:(fun () -> run_store (fun _sw -> Store.close store))
     (fun () ->
       let trace_id index = Printf.sprintf "%032x" (index + 1) in
       let span_id index = Printf.sprintf "%016x" (index + 1) in
@@ -2194,11 +2192,11 @@ let test_pagination_endpoints () =
       in
       ignore
         (run_store
-           (let open Eta.Syntax in
+           (fun _sw -> let ( let* ) = Result.bind in
             let* _ = Store.ingest_traces store spans in
             let* _ = Store.ingest_logs store logs in
             let* _ = Store.ingest_metrics store metrics in
-            Eta.Effect.pure ()));
+            Result.ok ()));
       let string_field name json =
         match json_member name json with `String value -> value | _ -> ""
       in
@@ -2245,8 +2243,9 @@ let test_exact_queries_above_old_caps () =
   (* acc-879n, acc-laac, acc-whoa, acc-gkoz, acc-efzp. *)
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  let store = run_store (Store.open_ ~now_ms:(fun () -> base_time) config) in
-  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw ~now_ms:(fun () -> base_time) config) in
+  Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let span_count = 12_050 and log_count = 188_025 in
   let spans = List.init span_count (fun i ->
     let ai = i <= 100 in
@@ -2273,9 +2272,9 @@ let test_exact_queries_above_old_caps () =
     match rows with [] -> [] | _ ->
       let batch, rest = take size [] rows in
       batch :: batches size rest in
-  List.iter (fun batch -> ignore (run_store (Store.ingest_traces store batch)))
+  List.iter (fun batch -> ignore (run_store (fun _sw -> Store.ingest_traces store batch)))
     (batches 500 spans);
-  List.iter (fun batch -> ignore (run_store (Store.ingest_logs store batch)))
+  List.iter (fun batch -> ignore (run_store (fun _sw -> Store.ingest_logs store batch)))
     (batches 1_000 logs);
   let response path field = json_list field (server_json config store path) in
   let count_group rows group expected =
@@ -2330,8 +2329,9 @@ let test_search_filters_and_exact_stats () =
   (* sf-*, acc-*: literal filters, typed joins, complete aggregates. *)
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  let store = run_store (Store.open_ ~now_ms:(fun () -> base_time) config) in
-  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw ~now_ms:(fun () -> base_time) config) in
+  Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let trace_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in
   let trace_b = "cccccccccccccccccccccccccccccccc" in
   let root = test_span ~trace_id:trace_a ~span_id:"1111111111111111"
@@ -2359,10 +2359,10 @@ let test_search_filters_and_exact_stats () =
     severity_text = "wArN"; severity_number = None } in
   let log_d = { (test_log ~body:"case fourth" ()) with
     severity_text = "error"; severity_number = Some 17 } in
-  ignore (run_store (let open Eta.Syntax in
+  ignore (run_store (fun _sw -> let ( let* ) = Result.bind in
     let* _ = Store.ingest_traces store [root; child; other] in
     let* _ = Store.ingest_logs store [log_a; log_b; log_c; log_d] in
-    Eta.Effect.pure ()));
+    Result.ok ()));
   let n path field = List.length (json_list field (server_json config store path)) in
   Alcotest.(check int) "sf literal wildcards in spans" 2
     (n "/spans/search?lookback=all&attrContains.tag=%25_%5CB" "spans");
@@ -2698,7 +2698,7 @@ end
 
 let delete_trace_summary path trace_id =
   run_test_db path (fun pool ->
-      let open Eta.Syntax in
+      let ( let* ) = Result.bind in
       let delete =
         Eta_sql.Delete.(
           from Test_trace_summaries.table
@@ -2706,7 +2706,7 @@ let delete_trace_summary path trace_id =
           |> compile)
       in
       let* _ = Eta_sql.Pool.Typed.execute_compiled pool delete in
-      Eta.Effect.pure ())
+      Result.ok ())
 
 let test_trace_tree_handlers () =
   (* tree-o79f, tree-uv04, tree-ddll, tree-6vac, tree-3w92, tree-sih1 *)
@@ -2714,9 +2714,10 @@ let test_trace_tree_handlers () =
   Fun.protect
     ~finally:(fun () -> cleanup_config config)
     (fun () ->
-      let store = run_store (Store.open_ ~now_ms:(fun () -> base_time) config) in
+      run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw ~now_ms:(fun () -> base_time) config) in
       Fun.protect
-        ~finally:(fun () -> run_store (Store.close store))
+        ~finally:(fun () -> run_store (fun _sw -> Store.close store))
         (fun () ->
           let trace_id = "dddddddddddddddddddddddddddddddd" in
           let root_id = "d000000000000001"
@@ -2738,9 +2739,9 @@ let test_trace_tree_handlers () =
           in
           ignore
             (run_store
-               (let open Eta.Syntax in
+               (fun _sw -> let ( let* ) = Result.bind in
                 let* _ = Store.ingest_traces store [ root; child; running ] in
-                Eta.Effect.pure ()));
+                Result.ok ()));
           let detail = server_json config store ("/traces/" ^ trace_id) in
           let spans = json_list "spans" detail in
           Alcotest.(check (list string))
@@ -3168,9 +3169,10 @@ let test_ai_call_store_and_handlers () =
   Fun.protect
     ~finally:(fun () -> cleanup_config config)
     (fun () ->
-      let store = run_store (Store.open_ ~now_ms:(fun () -> base_time) config) in
+      run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw ~now_ms:(fun () -> base_time) config) in
       Fun.protect
-        ~finally:(fun () -> run_store (Store.close store))
+        ~finally:(fun () -> run_store (fun _sw -> Store.close store))
         (fun () ->
           let trace_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" in
           let call_id = "e000000000000001"
@@ -3222,10 +3224,10 @@ let test_ai_call_store_and_handlers () =
           in
           ignore
             (run_store
-               (let open Eta.Syntax in
+               (fun _sw -> let ( let* ) = Result.bind in
                 let* _ = Store.ingest_traces store [ eta; tool; nested; failing ] in
                 let* _ = Store.ingest_logs store [ log ] in
-                Eta.Effect.pure ()));
+                Result.ok ()));
           let calls path = json_list "calls" (server_json config store path) in
           let all = calls "/ai/calls?lookback=all" in
           Alcotest.(check int)
@@ -3609,8 +3611,9 @@ let test_declarations_drive_the_router () =
      inventory, and the OpenAPI document. *)
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  let store = run_store (Store.open_ config) in
-  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let inventory =
     json_list "endpoints" (server_json config store "/endpoints")
   in
@@ -3769,7 +3772,7 @@ let test_declarations_drive_the_router () =
         true
         (Eta_http.Server.Response.status response <> 405);
       (match
-         Eta_http.Core.Header.get "content-type"
+         Eta_http.Header.get "content-type"
            (Eta_http.Server.Response.headers response)
        with
       | Some content_type when contains content_type "application/json" ->
@@ -3785,8 +3788,9 @@ let test_declared_responses_match_handlers () =
      and an undeclared query parameter is rejected with the supported list. *)
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  let store = run_store (Store.open_ config) in
-  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   List.iter
     (fun (endpoint : Inn.Endpoint.t) ->
       let required =
@@ -3846,8 +3850,9 @@ let test_hidden_routes_are_documented () =
   (* desc-dmuw: nothing the server serves stays out of the inventory. *)
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  let store = run_store (Store.open_ config) in
-  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let inventory =
     json_list "endpoints" (server_json config store "/endpoints")
   in
@@ -3890,8 +3895,9 @@ let test_docs_endpoints () =
   (* desc-bqwh, desc-7wwz *)
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  let store = run_store (Store.open_ config) in
-  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let guides = json_list "guides" (server_json config store "/docs") in
   Alcotest.(check int)
     "the index lists every guide" (List.length Inn.Docs.guides)
@@ -3921,7 +3927,7 @@ let test_docs_endpoints () =
         (guide.name ^ " is served as Markdown")
         true
         (match
-           Eta_http.Core.Header.get "content-type"
+           Eta_http.Header.get "content-type"
              (Eta_http.Server.Response.headers response)
          with
         | Some value -> contains value "text/markdown"
@@ -3988,10 +3994,10 @@ let test_guide_content () =
     ];
   check (guide "eta")
     [
-      "Eta_otel.create"; "Eta_http.Core.Url.of_string"; "Eta_eio.Runtime.create";
-      "Eta_otel.tracer"; "Eta_otel.logger"; "Eta_otel.meter";
-      "Eta_otel.shutdown"; "~endpoint"; "eta_otel"; "/v1/traces"; "/v1/logs";
-      "/v1/metrics";
+      "Eta_otel.create"; "Eta_http.Client.create";
+      "Eta_observability.Logger.span"; "Eta_otel.reporter";
+      "Eta_otel.span_ids"; "Eta_otel.shutdown"; "~endpoint"; "eta_otel";
+      "/v1/traces"; "/v1/logs"; "/v1/metrics";
     ]
 
 (* The first fenced block of the given language, including the newline that
@@ -4035,8 +4041,9 @@ let test_health_identity () =
      desc-lqpr: the same real version everywhere. *)
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  let store = run_store (Store.open_ config) in
-  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let health = server_json config store "/health" in
   let healthz = server_json config store "/healthz" in
   let started_at = json_string_field "startedAt" health in
@@ -4099,8 +4106,9 @@ let test_instructions_point_at_the_docs () =
   (* desc-qv27 *)
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  let store = run_store (Store.open_ config) in
-  Fun.protect ~finally:(fun () -> run_store (Store.close store)) @@ fun () ->
+  run_store_scope @@ fun () ->
+  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let body = response_body_string (server_get config store "/instructions") in
   List.iter
     (fun fragment ->

@@ -349,7 +349,6 @@ end
 let pp_error ppf = function
   | `Eta_sql error -> Q.pp_error ppf error
   | `Pool_shutdown -> Format.pp_print_string ppf "pool shutdown"
-  | `Pool_shutdown_timeout -> Format.pp_print_string ppf "pool shutdown timeout"
   | `Timeout -> Format.pp_print_string ppf "timeout"
   | `Invalid_store message -> Format.fprintf ppf "invalid store: %s" message
 
@@ -446,42 +445,42 @@ let q_select_pool runner query =
 
 let q_schema runner schema =
   Q.Pool.Typed.run_schema runner (Q.Eta_schema.compile schema)
-  |> Eta.Effect.map_error widen_pool_error
+  |> Result.map_error widen_pool_error
 
 let q_exec runner query =
-  Q.Pool.Typed.execute_compiled runner query |> Eta.Effect.map_error widen_pool_error
+  Q.Pool.Typed.execute_compiled runner query |> Result.map_error widen_pool_error
 
 let q_select runner query =
   Q.Pool.Typed.select runner (Q.Select.compile query)
-  |> Eta.Effect.map_error widen_pool_error
+  |> Result.map_error widen_pool_error
 
-let rec effect_iter list f =
-  let open Eta.Syntax in
+let rec result_iter list f =
+  let open Result.Syntax in
   match list with
-  | [] -> Eta.Effect.unit
+  | [] -> Ok ()
   | item :: rest ->
       let* () = f item in
-      effect_iter rest f
+      result_iter rest f
 
-let rec effect_fold list init f =
-  let open Eta.Syntax in
+let rec result_fold list init f =
+  let open Result.Syntax in
   match list with
-  | [] -> Eta.Effect.pure init
+  | [] -> Ok init
   | item :: rest ->
       let* init = f init item in
-      effect_fold rest init f
+      result_fold rest init f
 
 let one_or_none operation rows =
   match rows with
-  | [] -> Eta.Effect.pure None
-  | [ row ] -> Eta.Effect.pure (Some row)
-  | _ -> Eta.Effect.fail (`Invalid_store (operation ^ " returned more than one row"))
+  | [] -> Ok None
+  | [ row ] -> Ok (Some row)
+  | _ -> Error (`Invalid_store (operation ^ " returned more than one row"))
 
 let scalar operation rows =
   match rows with
-  | [ row ] -> Eta.Effect.pure row
-  | [] -> Eta.Effect.fail (`Invalid_store (operation ^ " returned no rows"))
-  | _ -> Eta.Effect.fail (`Invalid_store (operation ^ " returned more than one row"))
+  | [ row ] -> Ok row
+  | [] -> Error (`Invalid_store (operation ^ " returned no rows"))
+  | _ -> Error (`Invalid_store (operation ^ " returned more than one row"))
 
 let schemas =
   let open Q.Eta_schema in
@@ -708,8 +707,8 @@ let schema_fingerprint =
   Digest.to_hex (Digest.string (String.concat "\n" schema_statements))
 
 let init_schema runner =
-  let open Eta.Syntax in
-  let* () = effect_iter schemas (q_schema_pool runner) in
+  let open Result.Syntax in
+  let* () = result_iter schemas (q_schema_pool runner) in
   let query =
     Q.Insert.(
       into Meta.table
@@ -719,7 +718,7 @@ let init_schema runner =
       |> compile)
   in
   let* _ = q_exec_pool runner query in
-  Eta.Effect.unit
+  Ok ()
 
 let sqlite_config path =
   {
@@ -737,10 +736,10 @@ let sqlite_config path =
    SQL", so every pragma Inn runs goes through these two helpers, and no other
    raw SQL exists in the store. *)
 let sqlite_pragma_int runner pragma =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* rows =
     Q.Pool.Raw.query runner ("PRAGMA " ^ pragma) []
-    |> Eta.Effect.map_error widen_pool_error
+    |> Result.map_error widen_pool_error
   in
   let column_value row =
     match Q.Row.fields row with
@@ -748,32 +747,32 @@ let sqlite_pragma_int runner pragma =
     | [] -> None
   in
   match List.filter_map column_value rows with
-  | value :: _ -> Eta.Effect.pure value
+  | value :: _ -> Ok value
   | [] ->
-      Eta.Effect.fail
+      Error
         (`Invalid_store
           (Printf.sprintf "PRAGMA %s did not return an integer value" pragma))
 
 let sqlite_pragma runner pragma =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   (* [PRAGMA incremental_vacuum] steps once per freed page, so the pragma is
      folded rather than executed; [Raw.execute] rejects a row-returning
      statement. *)
   let* () =
     Q.Pool.Raw.fold runner ("PRAGMA " ^ pragma) [] ~init:()
       ~f:(fun () _ -> ())
-    |> Eta.Effect.map_error widen_pool_error
+    |> Result.map_error widen_pool_error
   in
-  Eta.Effect.unit
+  Ok ()
 
 (* Live data is the pages in use, not the file size: SQLite never shrinks the
    file on delete alone, so the file size is a poor size-cap input (ret-zjzs). *)
 let live_bytes runner =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* page_count = sqlite_pragma_int runner "page_count" in
   let* freelist_count = sqlite_pragma_int runner "freelist_count" in
   let* page_size = sqlite_pragma_int runner "page_size" in
-  Eta.Effect.pure ((page_count - freelist_count) * page_size)
+  Ok ((page_count - freelist_count) * page_size)
 
 (* Schema state of the file at the configured database path. The check reads
    the file before any schema statement runs, so a database that is not Inn's
@@ -793,14 +792,16 @@ let local_sqlite_config ?(mode = Sqlite.Read_write) path =
   { (sqlite_config path) with mode; journal_mode = None }
 
 let with_local_pool ?mode path f =
-  Eta.Effect.with_resource
-    ~acquire:
-      (Q.Pool.create ~default_timeout:(Eta.Duration.ms 5000) ~max_size:1
-         (local_sqlite_config ?mode path)
-      |> Eta.Effect.map_error widen_pool_error)
-    ~release:(fun pool ->
-      Q.Pool.shutdown pool |> Eta.Effect.map_error widen_pool_error)
-    f
+  Eio.Switch.run (fun sw ->
+      let open Result.Syntax in
+      let* pool =
+        Q.Pool.create ~sw ~default_timeout:5.0 ~max_size:1
+          (local_sqlite_config ?mode path)
+        |> Result.map_error widen_pool_error
+      in
+      let result = f pool in
+      let closed = Q.Pool.shutdown pool |> Result.map_error widen_pool_error in
+      match result with Error _ -> result | Ok value -> Result.map (fun () -> value) closed)
 
 let sqlite_magic = "SQLite format 3\000"
 
@@ -819,16 +820,16 @@ let file_is_sqlite path =
       else String.equal (really_input_string channel 16) sqlite_magic)
 
 let read_database_state path =
-  if not (Sys.file_exists path) then Eta.Effect.pure Database_absent
+  if not (Sys.file_exists path) then Ok Database_absent
   else if not (file_is_sqlite path) then
-    Eta.Effect.fail
+    Error
       (`Invalid_store
         (Printf.sprintf "refusing to open %s: it is not an SQLite database" path))
   else
-    let open Eta.Syntax in
-    let* result =
+    let open Result.Syntax in
+    let result =
       with_local_pool path (fun pool ->
-          let open Eta.Syntax in
+          let open Result.Syntax in
           let* tables =
             q_select pool
               Q.Select.(
@@ -841,7 +842,7 @@ let read_database_state path =
               tables
           in
           if not (List.mem "inn_meta" tables) then
-            Eta.Effect.pure
+            Ok
               (if tables = [] then Database_fresh else Database_foreign)
           else
             let* versions =
@@ -853,20 +854,18 @@ let read_database_state path =
             in
             match versions with
             | [ stored ] when String.equal stored schema_version_text ->
-                Eta.Effect.pure Database_current
-            | [ stored ] -> Eta.Effect.pure (Database_stale stored)
-            | [] -> Eta.Effect.pure (Database_stale "none")
+                Ok Database_current
+            | [ stored ] -> Ok (Database_stale stored)
+            | [] -> Ok (Database_stale "none")
             | _ ->
-                Eta.Effect.fail
+                Error
                   (`Invalid_store
                     "inn_meta holds more than one schema_version row"))
-      |> Eta.Effect.fold ~ok:(fun state -> Ok state) ~error:(fun error ->
-             Error error)
     in
     match result with
-    | Ok state -> Eta.Effect.pure state
+    | Ok state -> Ok state
     | Error error ->
-        Eta.Effect.fail
+        Error
           (`Invalid_store
             (Printf.sprintf "cannot read %s as an SQLite database: %s" path
                (Format.asprintf "%a" pp_error error)))
@@ -880,52 +879,49 @@ let remove_database_files path =
 
 let default_report line = prerr_endline ("inn: " ^ line)
 
-let open_ ?(now_ms = wall_now_ms) ?(report = default_report) config =
-  let open Eta.Syntax in
+let open_ ~sw ?(now_ms = wall_now_ms) ?(report = default_report) config =
+  let open Result.Syntax in
   let path = config.Config.db_path in
-  let* () =
-    Eta.Effect.sync (fun () -> mkdir_p (Filename.dirname path))
-  in
+  mkdir_p (Filename.dirname path);
   let* state = read_database_state path in
   let* () =
     match state with
-    | Database_current -> Eta.Effect.unit
+    | Database_current -> Ok ()
     | Database_foreign ->
-        Eta.Effect.fail
+        Error
           (`Invalid_store
             (Printf.sprintf
                "refusing to recreate %s: it has tables but no inn_meta table, so it is not an Inn database"
                path))
     | Database_stale stored ->
-        let* () =
-          Eta.Effect.sync (fun () ->
-              report
-                (Printf.sprintf
-                   "schema version %s at %s does not match version %d; deleting the old database and creating a fresh one"
-                   stored path schema_version))
-        in
-        Eta.Effect.sync (fun () -> remove_database_files path)
+        report
+          (Printf.sprintf
+             "schema version %s at %s does not match version %d; deleting the old database and creating a fresh one"
+             stored path schema_version);
+        remove_database_files path;
+        Ok ()
     | Database_absent | Database_fresh ->
-        Eta.Effect.sync (fun () -> remove_database_files path)
+        remove_database_files path;
+        Ok ()
   in
   let* () =
     (* [auto_vacuum] must be set while the database is still empty, and before
        any other connection switches it to WAL, or SQLite ignores it. *)
     match state with
-    | Database_current -> Eta.Effect.unit
+    | Database_current -> Ok ()
     | _ ->
         with_local_pool ~mode:Sqlite.Read_write_create path (fun pool ->
             sqlite_pragma pool "auto_vacuum = INCREMENTAL")
   in
   let* pool =
-    Q.Pool.create ~default_timeout:(Eta.Duration.ms 5000) ~max_size:4
+    Q.Pool.create ~sw ~default_timeout:5.0 ~max_size:4
       (sqlite_config path)
-    |> Eta.Effect.map_error widen_pool_error
+    |> Result.map_error widen_pool_error
   in
-  let* () = init_schema pool |> Eta.Effect.map_error widen_pool_error in
-  Eta.Effect.pure { config; pool; now_ms; last_prune = None }
+  let* () = init_schema pool |> Result.map_error widen_pool_error in
+  Ok { config; pool; now_ms; last_prune = None }
 
-let close t = Q.Pool.shutdown t.pool |> Eta.Effect.map_error widen_pool_error
+let close t = Q.Pool.shutdown t.pool |> Result.map_error widen_pool_error
 
 (* The query window is resolved against this clock, so handler tests can drive
    both ingestion and lookback with the same injected time. *)
@@ -939,12 +935,14 @@ let ping t =
       from Meta.table Q.Projection.(one Meta.value)
       |> where Q.Expr.(eq Meta.key "schema_version")
       |> limit 1)
-  |> Eta.Effect.map (fun _ -> ())
+  |> Result.map (fun _ -> ())
 
-let with_db ?now_ms ?report config f =
-  Eta.Effect.with_resource
-    ~acquire:(open_ ?now_ms ?report config)
-    ~release:close f
+let with_db ~sw ?now_ms ?report config f =
+  let open Result.Syntax in
+  let* store = open_ ~sw ?now_ms ?report config in
+  let result = f store in
+  let closed = close store in
+  match result with Error _ -> result | Ok value -> Result.map (fun () -> value) closed
 
 let span_projection =
   Q.Projection.(
@@ -1322,7 +1320,7 @@ let parent_span_ids_for_operation runner ?service operation =
       |> where predicate)
 
 let insert_span_attrs runner owner_id attrs =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let delete =
     Q.Delete.(
       from Span_attributes.table
@@ -1340,14 +1338,14 @@ let insert_span_attrs runner owner_id attrs =
       |> compile)
   in
   let* _ =
-    effect_fold attrs 0 (fun index attr ->
+    result_fold attrs 0 (fun index attr ->
         let* _ = q_exec_pool runner (insert index attr) in
-        Eta.Effect.pure (index + 1))
+        Ok (index + 1))
   in
-  Eta.Effect.unit
+  Ok ()
 
 let insert_log_attrs runner owner_id attrs =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let insert index (key, attr_value) =
     Q.Insert.(
       into Log_attributes.table
@@ -1358,14 +1356,14 @@ let insert_log_attrs runner owner_id attrs =
       |> compile)
   in
   let* _ =
-    effect_fold attrs 0 (fun index attr ->
+    result_fold attrs 0 (fun index attr ->
         let* _ = q_exec_pool runner (insert index attr) in
-        Eta.Effect.pure (index + 1))
+        Ok (index + 1))
   in
-  Eta.Effect.unit
+  Ok ()
 
 let insert_metric_attrs runner owner_id attrs =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let insert index (key, attr_value) =
     Q.Insert.(
       into Metric_attributes.table
@@ -1376,21 +1374,21 @@ let insert_metric_attrs runner owner_id attrs =
       |> compile)
   in
   let* _ =
-    effect_fold attrs 0 (fun index attr ->
+    result_fold attrs 0 (fun index attr ->
         let* _ = q_exec_pool runner (insert index attr) in
-        Eta.Effect.pure (index + 1))
+        Ok (index + 1))
   in
-  Eta.Effect.unit
+  Ok ()
 
 (* One trace refresh owns every derived row of a trace: the span's stored AI
    classification (which can change when a late parent or child arrives), the
    denormalized AI call summaries, the trace summary (tree order, running
    state, warnings), and the participating services. *)
 let refresh_trace ~now_ms runner trace_id =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* spans = select_spans_for_trace_pool runner trace_id in
   match spans with
-  | [] -> Eta.Effect.unit
+  | [] -> Ok ()
   | spans ->
       let tree = Trace_tree.assemble spans in
       let classifications = Ai.classify_spans spans in
@@ -1410,7 +1408,7 @@ let refresh_trace ~now_ms runner trace_id =
         Option.value (Hashtbl.find_opt children_by_parent span_id) ~default:[]
       in
       let* () =
-        effect_iter classifications (fun ((span : Model.span), kind) ->
+        result_iter classifications (fun ((span : Model.span), kind) ->
             let* _ =
               q_exec_pool runner
                 Q.Update.(
@@ -1420,7 +1418,7 @@ let refresh_trace ~now_ms runner trace_id =
                   |> where Q.Expr.(eq Spans.id (span_row_id span))
                   |> compile)
             in
-            Eta.Effect.unit)
+            Ok ())
       in
       let* _ =
         q_exec_pool runner
@@ -1430,7 +1428,7 @@ let refresh_trace ~now_ms runner trace_id =
             |> compile)
       in
       let* () =
-        effect_iter classifications (fun ((span : Model.span), kind) ->
+        result_iter classifications (fun ((span : Model.span), kind) ->
             match kind with
             | Ai.Ai_call ->
                 let children = children_of span.span_id in
@@ -1469,8 +1467,8 @@ let refresh_trace ~now_ms runner trace_id =
                     |> compile)
                 in
                 let* _ = q_exec_pool runner insert in
-                Eta.Effect.unit
-            | _ -> Eta.Effect.unit)
+                Ok ()
+            | _ -> Ok ())
       in
       let insert =
         Q.Insert.(
@@ -1506,13 +1504,13 @@ let refresh_trace ~now_ms runner trace_id =
         |> compile) in
       let services = List.sort_uniq String.compare
         (List.map (fun (span : Model.span) -> span.service_name) spans) in
-      effect_iter services (fun service_name ->
+      result_iter services (fun service_name ->
         let* _ = q_exec_pool runner Q.Insert.(
           into Trace_services.table
           |> value Trace_services.trace_id trace_id
           |> value Trace_services.service_name service_name
           |> compile) in
-        Eta.Effect.unit)
+        Ok ())
 
 (* Retention deletes owner rows in bounded batches. Every batch is a
    subquery delete limited to [prune_batch_size] rows, so no statement ever
@@ -1553,7 +1551,7 @@ let delete_log_batch runner ~batch cutoff =
     | Some cutoff -> expired_log_ids_select ~batch cutoff
     | None -> oldest_log_ids_select ~batch
   in
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* _ =
     q_exec_pool runner
       Q.Delete.(
@@ -1585,7 +1583,7 @@ let delete_metric_batch runner ~batch cutoff =
     | Some cutoff -> expired_metric_ids_select ~batch cutoff
     | None -> oldest_metric_ids_select ~batch
   in
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* _ =
     q_exec_pool runner
       Q.Delete.(
@@ -1629,7 +1627,7 @@ let delete_trace_batch runner ~batch cutoff =
     | Some cutoff -> expired_trace_ids_select ~batch cutoff
     | None -> oldest_trace_ids_select ~batch
   in
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* _ =
     q_exec_pool runner
       Q.Delete.(
@@ -1665,47 +1663,47 @@ let delete_trace_batch runner ~batch cutoff =
         |> where Q.Expr.(in_select Trace_summaries.trace_id trace_ids)
         |> compile)
   in
-  Eta.Effect.pure (traces, spans)
+  Ok (traces, spans)
 
 let in_batch t delete =
-  Q.Pool.with_transaction t.pool delete |> Eta.Effect.map_error widen_pool_error
+  Q.Pool.with_transaction t.pool delete |> Result.map_error widen_pool_error
 
 let delete_log_batches t ?cutoff () =
   let rec loop deleted =
-    let open Eta.Syntax in
+    let open Result.Syntax in
     let* count =
       in_batch t (fun tx -> delete_log_batch tx ~batch:prune_batch_size cutoff)
     in
-    if count <= 0 then Eta.Effect.pure deleted else loop (deleted + count)
+    if count <= 0 then Ok deleted else loop (deleted + count)
   in
   loop 0
 
 let delete_metric_batches t ?cutoff () =
   let rec loop deleted =
-    let open Eta.Syntax in
+    let open Result.Syntax in
     let* count =
       in_batch t (fun tx ->
           delete_metric_batch tx ~batch:prune_batch_size cutoff)
     in
-    if count <= 0 then Eta.Effect.pure deleted else loop (deleted + count)
+    if count <= 0 then Ok deleted else loop (deleted + count)
   in
   loop 0
 
 let delete_trace_batches t ?cutoff () =
   let rec loop traces spans =
-    let open Eta.Syntax in
+    let open Result.Syntax in
     let* batch =
       in_batch t (fun tx -> delete_trace_batch tx ~batch:prune_batch_size cutoff)
     in
     let batch_traces, batch_spans = batch in
-    if batch_traces <= 0 then Eta.Effect.pure (traces, spans)
+    if batch_traces <= 0 then Ok (traces, spans)
     else loop (traces + batch_traces) (spans + batch_spans)
   in
   loop 0 0
 
 let prune_time_retention t now_ms =
   let hour_ms = 60 * 60 * 1000 in
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* logs =
     delete_log_batches t
       ~cutoff:(now_ms - (t.config.Config.logs_retention_hours * hour_ms))
@@ -1721,25 +1719,25 @@ let prune_time_retention t now_ms =
       ~cutoff:(now_ms - (t.config.Config.traces_retention_hours * hour_ms))
       ()
   in
-  Eta.Effect.pure { traces; spans; logs; metric_points }
+  Ok { traces; spans; logs; metric_points }
 
 (* The size cap acts on live data, not on the file size, and stops as soon as
    live data is under the cap (ret-zjzs, ret-bizv). *)
 let prune_size_retention t =
   let max_bytes = t.config.Config.max_db_size_mb * 1024 * 1024 in
   let batch = size_pressure_batch_size in
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* live = live_bytes t.pool in
-  if live <= max_bytes then Eta.Effect.pure None
+  if live <= max_bytes then Ok None
   else
     let rec loop counts =
       let* live = live_bytes t.pool in
-      if live <= max_bytes then Eta.Effect.pure counts
+      if live <= max_bytes then Ok counts
       else
         let* logs = in_batch t (fun tx -> delete_log_batch tx ~batch None) in
         let counts = { counts with logs = counts.logs + logs } in
         let* live = live_bytes t.pool in
-        if live <= max_bytes then Eta.Effect.pure counts
+        if live <= max_bytes then Ok counts
         else
           let* metric_points =
             in_batch t (fun tx -> delete_metric_batch tx ~batch None)
@@ -1748,7 +1746,7 @@ let prune_size_retention t =
             { counts with metric_points = counts.metric_points + metric_points }
           in
           let* live = live_bytes t.pool in
-          if live <= max_bytes then Eta.Effect.pure counts
+          if live <= max_bytes then Ok counts
           else
             let* traces, spans =
               in_batch t (fun tx -> delete_trace_batch tx ~batch None)
@@ -1760,11 +1758,11 @@ let prune_size_retention t =
                 spans = counts.spans + spans;
               }
             in
-            if logs + metric_points + traces = 0 then Eta.Effect.pure counts
+            if logs + metric_points + traces = 0 then Ok counts
             else loop counts
     in
     let* counts = loop zero_prune_counts in
-    Eta.Effect.pure (Some counts)
+    Ok (Some counts)
 
 let add_prune_counts left right =
   {
@@ -1776,7 +1774,7 @@ let add_prune_counts left right =
 
 let prune ?now_ms t =
   let now = match now_ms with Some value -> value | None -> t.now_ms () in
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* time_counts = prune_time_retention t now in
   let* size_counts = prune_size_retention t in
   let counts =
@@ -1789,7 +1787,7 @@ let prune ?now_ms t =
   in
   let* () =
     if deleted > 0 then sqlite_pragma t.pool "incremental_vacuum"
-    else Eta.Effect.unit
+    else Ok ()
   in
   let report =
     {
@@ -1802,12 +1800,12 @@ let prune ?now_ms t =
     }
   in
   t.last_prune <- Some report;
-  Eta.Effect.pure report
+  Ok report
 
 let last_prune t = t.last_prune
 
 let ingest_traces t spans =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let now_ms = t.now_ms () in
   let touched = Hashtbl.create 16 in
   (* The batch classifies what it can see; [refresh_trace] re-classifies against
@@ -1863,19 +1861,19 @@ let ingest_traces t spans =
     let* _ = q_exec_pool runner insert in
     let* () = insert_span_attrs runner id (span.resource @ span.attributes) in
     Hashtbl.replace touched span.trace_id ();
-    Eta.Effect.unit
+    Ok ()
   in
   let* () =
     Q.Pool.with_transaction t.pool (fun tx ->
-        let* () = effect_iter spans (insert_span tx) in
+        let* () = result_iter spans (insert_span tx) in
         let trace_ids = List.of_seq (Hashtbl.to_seq_keys touched) in
-        effect_iter trace_ids (refresh_trace ~now_ms tx))
-    |> Eta.Effect.map_error widen_pool_error
+        result_iter trace_ids (refresh_trace ~now_ms tx))
+    |> Result.map_error widen_pool_error
   in
-  Eta.Effect.pure (List.length spans)
+  Ok (List.length spans)
 
 let ingest_logs t logs =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let now_ms = t.now_ms () in
   let insert_log runner (log : Model.log_record) =
     let id = fresh_id "log" in
@@ -1904,13 +1902,13 @@ let ingest_logs t logs =
   in
   let* () =
     Q.Pool.with_transaction t.pool (fun tx ->
-        effect_iter logs (insert_log tx))
-    |> Eta.Effect.map_error widen_pool_error
+        result_iter logs (insert_log tx))
+    |> Result.map_error widen_pool_error
   in
-  Eta.Effect.pure (List.length logs)
+  Ok (List.length logs)
 
 let ingest_metrics t points =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let now_ms = t.now_ms () in
   let insert_point runner (point : Model.metric_point) =
     let id = fresh_id "metric" in
@@ -1939,10 +1937,10 @@ let ingest_metrics t points =
   in
   let* () =
     Q.Pool.with_transaction t.pool (fun tx ->
-        effect_iter points (insert_point tx))
-    |> Eta.Effect.map_error widen_pool_error
+        result_iter points (insert_point tx))
+    |> Result.map_error widen_pool_error
   in
-  Eta.Effect.pure (List.length points)
+  Ok (List.length points)
 
 let trace_service_predicate trace_id service =
   let participating = Q.Select.(
@@ -1953,7 +1951,7 @@ let trace_service_predicate trace_id service =
 
 let list_services_runner ?window ?(include_metrics = false) runner =
   let window = Option.value window ~default:Model.window_all in
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* span_services =
     q_select runner
       Q.Select.(
@@ -1977,9 +1975,9 @@ let list_services_runner ?window ?(include_metrics = false) runner =
         |> where (window_predicate Metric_points.timestamp_ns window)
         |> distinct
         |> order_by Metric_points.service_name)
-    else Eta.Effect.pure []
+    else Ok []
   in
-  Eta.Effect.pure
+  Ok
     (List.sort_uniq String.compare
        (span_services @ log_services @ metric_services))
 
@@ -2011,7 +2009,7 @@ let list_trace_summaries ?service ~window ?cursor ~limit t =
       |> limit max_rows)
   in
   q_select t.pool query
-  |> Eta.Effect.map (page_of_rows ~limit ~position:trace_position)
+  |> Result.map (page_of_rows ~limit ~position:trace_position)
 
 let summary_of_tree trace_id (tree : Trace_tree.t) : Model.trace_summary =
   {
@@ -2031,7 +2029,7 @@ let summary_of_tree trace_id (tree : Trace_tree.t) : Model.trace_summary =
    (tree-ddll): the tree is the source of truth for the response, and the
    summary is only the stored projection of it. *)
 let get_trace t trace_id =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* summaries =
     q_select t.pool
       Q.Select.(
@@ -2042,7 +2040,7 @@ let get_trace t trace_id =
   let* summary = one_or_none "trace summary lookup" summaries in
   let* spans = select_spans_for_trace t.pool trace_id in
   match (summary, spans) with
-  | None, [] -> Eta.Effect.pure None
+  | None, [] -> Ok None
   | summary, spans ->
       let tree = Trace_tree.assemble spans in
       let summary =
@@ -2051,7 +2049,7 @@ let get_trace t trace_id =
         | None -> summary_of_tree trace_id tree
       in
       let* logs = q_select t.pool (logs_for_trace_query trace_id) in
-      Eta.Effect.pure
+      Ok
         (Some
            {
              Model.summary;
@@ -2061,17 +2059,17 @@ let get_trace t trace_id =
            })
 
 let get_span t span_id =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* spans = q_select t.pool (span_id_query span_id) in
   one_or_none "span lookup" spans
 
 (* The span detail carries the same tree context as the trace it belongs to, so
    one lookup is enough to place a span (tree-o79f). *)
 let get_span_node t span_id =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* spans = q_select t.pool (span_id_query span_id) in
   match spans with
-  | [] -> Eta.Effect.pure None
+  | [] -> Ok None
   | span :: _ ->
       let* siblings = select_spans_for_trace t.pool span.Model.trace_id in
       let tree = Trace_tree.assemble siblings in
@@ -2081,9 +2079,9 @@ let get_span_node t span_id =
           tree.nodes
       in
       (match node with
-      | Some node -> Eta.Effect.pure (Some node)
+      | Some node -> Ok (Some node)
       | None ->
-          Eta.Effect.pure
+          Ok
             (Some
                {
                  Model.span;
@@ -2109,7 +2107,7 @@ let select_spans_for_trace_in_window trace_id window =
    (tree-uv04). A trace is small, so the page is sliced from the assembled
    tree; the cursor carries the position in that tree order. *)
 let list_trace_spans t ~window ?cursor ~limit trace_id =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* spans = q_select t.pool (select_spans_for_trace_in_window trace_id window) in
   let tree = Trace_tree.assemble spans in
   let nodes = tree.nodes in
@@ -2130,15 +2128,15 @@ let list_trace_spans t ~window ?cursor ~limit trace_id =
           }
     | _ -> None
   in
-  Eta.Effect.pure { items; next }
+  Ok { items; next }
 
 let list_trace_logs t ~window ?cursor ~limit trace_id =
   q_select t.pool (logs_for_trace_page_query ~window ~cursor ~limit trace_id)
-  |> Eta.Effect.map (page_of_rows ~limit ~position:log_position)
+  |> Result.map (page_of_rows ~limit ~position:log_position)
 
 let list_span_logs t ~window ?cursor ~limit span_id =
   q_select t.pool (logs_for_span_page_query ~window ~cursor ~limit span_id)
-  |> Eta.Effect.map (page_of_rows ~limit ~position:log_position)
+  |> Result.map (page_of_rows ~limit ~position:log_position)
 
 (* The self-join tests both span and trace IDs; an unrelated trace's matching
    operation cannot qualify a child (srch-ypr2). *)
@@ -2311,7 +2309,7 @@ let search_ai_calls ?(attr_contains = []) ?min_duration_ms
       |> order_by ~desc:true Ai_calls.start_time_ns
       |> order_by ~desc:true Ai_calls.span_id
       |> limit (filter.limit + 1))
-  |> Eta.Effect.map (page_of_rows ~limit:filter.limit ~position:ai_call_position)
+  |> Result.map (page_of_rows ~limit:filter.limit ~position:ai_call_position)
 
 (* The stored AI classification of one span, which is what the 404 hint needs:
    a nested provider span's parent is outside the span itself (aic-t8tl). *)
@@ -2321,7 +2319,7 @@ let span_ai_kind t span_id =
       from Spans.table Q.Projection.(one Spans.ai_kind)
       |> where Q.Expr.(eq Spans.span_id span_id)
       |> limit 1)
-  |> Eta.Effect.map (function [] -> None | kind :: _ -> Some kind)
+  |> Result.map (function [] -> None | kind :: _ -> Some kind)
 
 (* Direct children of one span, for the AI call's tool calls (aic-fy0u). *)
 let list_span_children t span_id =
@@ -2338,7 +2336,7 @@ let search_spans ?(attr_contains = []) ?min_duration_ms (filter : span_search_fi
     |> order_by ~desc:true Spans.start_time_ns
     |> order_by ~desc:true Spans.id
     |> limit (filter.limit + 1))
-  |> Eta.Effect.map (page_of_rows ~limit:filter.limit ~position:span_position)
+  |> Result.map (page_of_rows ~limit:filter.limit ~position:span_position)
 
 let ai_content_keys = [
   "ai.prompt"; "ai.response"; "ai.tool.input"; "ai.tool.output";
@@ -2396,7 +2394,7 @@ let trace_summary_search_query ?(attr_contains = []) ?min_duration_ms ?text
 let search_traces ?(attr_contains = []) ?min_duration_ms ?text
     (filter : trace_search_filter) t =
   q_select t.pool (trace_summary_search_query ~attr_contains ?min_duration_ms ?text filter)
-  |> Eta.Effect.map (page_of_rows ~limit:filter.limit ~position:trace_position)
+  |> Result.map (page_of_rows ~limit:filter.limit ~position:trace_position)
 
 let severity_predicate ?min_severity severity =
   let p = match severity with None -> Q.Expr.true_ | Some x ->
@@ -2453,7 +2451,7 @@ let list_logs ?min_severity (filter : log_filter) t =
       |> order_by ~desc:true Logs.timestamp_ns
       |> order_by ~desc:true Logs.id
       |> limit (filter.limit + 1))
-  |> Eta.Effect.map (page_of_rows ~limit:filter.limit ~position:log_position)
+  |> Result.map (page_of_rows ~limit:filter.limit ~position:log_position)
 
 let log_search_predicate ?(attr_contains = []) ?min_severity
     (filter : log_search_filter) =
@@ -2472,7 +2470,7 @@ let search_logs ?(attr_contains = []) ?min_severity (filter : log_search_filter)
     |> order_by ~desc:true Logs.timestamp_ns
     |> order_by ~desc:true Logs.id
     |> limit (filter.limit + 1))
-  |> Eta.Effect.map (page_of_rows ~limit:filter.limit ~position:log_position)
+  |> Result.map (page_of_rows ~limit:filter.limit ~position:log_position)
 
 module Ranked_trace_duration = struct
   module T = Q.Table.Make (struct let name = "ranked_trace_duration" end)
@@ -2497,7 +2495,7 @@ module Trace_stat_rows = struct
 end
 
 let trace_stats ?(attr_contains = []) ?min_duration_ms (filter : trace_stats_filter) t =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let search_filter : trace_search_filter = {
     service = filter.service; operation = filter.operation;
     status = filter.status; attrs = filter.attrs;
@@ -2507,7 +2505,7 @@ let trace_stats ?(attr_contains = []) ?min_duration_ms (filter : trace_stats_fil
   let stat_for_group group count avg error_count group_pred =
     let* value =
       if filter.agg <> "p95_duration" || count = 0 then
-        Eta.Effect.pure (match filter.agg with
+        Ok (match filter.agg with
           | "avg_duration" -> Option.value avg ~default:0.
           | "error_rate" -> float_of_int error_count /. float_of_int (max 1 count)
           | _ -> float_of_int count)
@@ -2525,8 +2523,8 @@ let trace_stats ?(attr_contains = []) ?min_duration_ms (filter : trace_stats_fil
           from Ranked_trace_duration.table Q.Projection.(one Ranked_trace_duration.duration_ms)
           |> with_cte ~name:"ranked_trace_duration" ranked
           |> where Q.Expr.(eq Ranked_trace_duration.rank wanted)) in
-        Eta.Effect.pure ((match durations with duration :: _ -> duration | [] -> 0.)) in
-    Eta.Effect.pure { Model.group; value; count } in
+        Ok ((match durations with duration :: _ -> duration | [] -> 0.)) in
+    Ok { Model.group; value; count } in
   let summaries col =
     q_select t.pool Q.Select.(
       from Trace_summaries.table Q.Projection.(t3
@@ -2540,19 +2538,19 @@ let trace_stats ?(attr_contains = []) ?min_duration_ms (filter : trace_stats_fil
   let by_column col =
     let* groups = summaries col in
     let* error_groups = if filter.agg = "error_rate" then errors col
-      else Eta.Effect.pure [] in
+      else Ok [] in
     let error_counts = Hashtbl.create (List.length error_groups) in
     List.iter (fun (group, count) -> Hashtbl.replace error_counts group count) error_groups;
     let rec collect = function
-      | [] -> Eta.Effect.pure []
+      | [] -> Ok []
       | (group, count, avg) :: rest ->
           let* item = stat_for_group group count avg
             (Option.value (Hashtbl.find_opt error_counts group) ~default:0)
             (fun () -> Q.Expr.eq col group) in
           let* others = collect rest in
-          Eta.Effect.pure (item :: others) in
+          Ok (item :: others) in
     let* items = collect groups in
-    Eta.Effect.pure (sort_stat_items filter.limit items) in
+    Ok (sort_stat_items filter.limit items) in
   match filter.group_by with
   | "service" -> by_column Trace_summaries.service_name
   | "operation" -> by_column Trace_summaries.root_operation_name
@@ -2564,15 +2562,15 @@ let trace_stats ?(attr_contains = []) ?min_duration_ms (filter : trace_stats_fil
             (count ()) (avg Q.Numeric.float Trace_summaries.duration_ms))
           |> where group_pred) in
         let count, avg = List.hd counts in
-        if count = 0 then Eta.Effect.pure None else
+        if count = 0 then Ok None else
         let* item = stat_for_group group count avg
           (if group = "error" then count else 0) (fun () -> status_pred) in
-        Eta.Effect.pure (Some item) in
+        Ok (Some item) in
       let* ok = per_status "ok" Q.Expr.(eq Trace_summaries.error_count 0) in
       let* error = per_status "error" Q.Expr.(gt Trace_summaries.error_count 0) in
-      Eta.Effect.pure (sort_stat_items filter.limit (List.filter_map Fun.id [ok; error]))
+      Ok (sort_stat_items filter.limit (List.filter_map Fun.id [ok; error]))
   | group_by -> (match attr_group_key group_by with
-      | None -> Eta.Effect.pure []
+      | None -> Ok []
       | Some key ->
           let filtered_trace_ids = Q.Select.(
             from Trace_summaries.table Q.Projection.(one Trace_summaries.trace_id)
@@ -2616,7 +2614,7 @@ let trace_stats ?(attr_contains = []) ?min_duration_ms (filter : trace_stats_fil
              |> with_cte ~name:"trace_stat_rows" rows
              |> group_by Trace_stat_rows.value) in
            let rec collect = function
-             | [] -> Eta.Effect.pure []
+             | [] -> Ok []
              | (value, count, avg, error_count) :: rest ->
                   let group_pred () =
                     let matching_trace_ids = Q.Select.(
@@ -2629,15 +2627,15 @@ let trace_stats ?(attr_contains = []) ?min_duration_ms (filter : trace_stats_fil
                  let* item = stat_for_group value count avg
                    (Option.value error_count ~default:0) group_pred in
                  let* tail = collect rest in
-                 Eta.Effect.pure (item :: tail) in
+                 Ok (item :: tail) in
            let* items = collect groups in
-           Eta.Effect.pure (sort_stat_items filter.limit items))
+           Ok (sort_stat_items filter.limit items))
 
 (* Every group and aggregate runs in SQL over the complete window; no group
    samples a page (aic-qpv6). *)
 let ai_stats ?(attr_contains = []) ?min_duration_ms
     ~group_by ~agg (filter : ai_call_filter) t =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let predicate = ai_call_predicate ~attr_contains ?min_duration_ms filter in
   let p95 count group_pred =
     let ranked =
@@ -2658,7 +2656,7 @@ let ai_stats ?(attr_contains = []) ?min_duration_ms
           |> with_cte ~name:"ranked_trace_duration" ranked
           |> where Q.Expr.(eq Ranked_trace_duration.rank rank))
     in
-    Eta.Effect.pure (match durations with duration :: _ -> duration | [] -> 0.)
+    Ok (match durations with duration :: _ -> duration | [] -> 0.)
   in
   let by_column label col =
     let* groups =
@@ -2680,42 +2678,42 @@ let ai_stats ?(attr_contains = []) ?min_duration_ms
             from Ai_calls.table Q.Projection.(t2 (one col) (count ()))
             |> where Q.Expr.(and_ predicate (eq Ai_calls.status "error"))
             |> group_by col)
-      else Eta.Effect.pure []
+      else Ok []
     in
     let error_counts = Hashtbl.create (List.length error_groups) in
     List.iter
       (fun (key, count) -> Hashtbl.replace error_counts (label key) count)
       error_groups;
     let rec collect = function
-      | [] -> Eta.Effect.pure []
+      | [] -> Ok []
       | (key, count, avg, input_tokens, output_tokens, total_tokens) :: rest ->
           let group = label key in
           let* value =
             match agg with
-            | "avg_duration" -> Eta.Effect.pure (Option.value avg ~default:0.)
+            | "avg_duration" -> Ok (Option.value avg ~default:0.)
             | "p95_duration" -> p95 count (fun () -> Q.Expr.eq col key)
             | "total_input_tokens" ->
-                Eta.Effect.pure
+                Ok
                   (float_of_int (Option.value input_tokens ~default:0))
             | "total_output_tokens" ->
-                Eta.Effect.pure
+                Ok
                   (float_of_int (Option.value output_tokens ~default:0))
             | "total_tokens" ->
-                Eta.Effect.pure
+                Ok
                   (float_of_int (Option.value total_tokens ~default:0))
             | "error_rate" ->
                 let errors =
                   Option.value (Hashtbl.find_opt error_counts group) ~default:0
                 in
-                Eta.Effect.pure
+                Ok
                   (float_of_int errors /. float_of_int (max 1 count))
-            | _ -> Eta.Effect.pure (float_of_int count)
+            | _ -> Ok (float_of_int count)
           in
           let* tail = collect rest in
-          Eta.Effect.pure ({ Model.group; value; count } :: tail)
+          Ok ({ Model.group; value; count } :: tail)
     in
     let* items = collect groups in
-    Eta.Effect.pure (sort_stat_items filter.limit items)
+    Ok (sort_stat_items filter.limit items)
   in
   let label = function Some "" | None -> "unknown" | Some value -> value in
   let report_label value = if String.equal value "" then "unknown" else value in
@@ -2727,11 +2725,11 @@ let ai_stats ?(attr_contains = []) ?min_duration_ms
   | "finishReason" -> by_column report_label Ai_calls.finish_reason
   | "operation" -> by_column Fun.id Ai_calls.operation
   | "status" -> by_column Fun.id Ai_calls.status
-  | _ -> Eta.Effect.pure []
+  | _ -> Ok []
 
 let log_stats ?(attr_contains = []) ?min_severity
     (filter : log_stats_filter) t =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let search_filter : log_search_filter = {
     service = filter.service; trace_id = filter.trace_id;
     span_id = filter.span_id; severity = filter.severity;
@@ -2747,7 +2745,7 @@ let log_stats ?(attr_contains = []) ?min_severity
     let* groups = q_select t.pool Q.Select.(
       from Logs.table Q.Projection.(t2 (one col) (count ()))
       |> where predicate |> group_by col) in
-    Eta.Effect.pure (as_items groups) in
+    Ok (as_items groups) in
   match filter.group_by with
   | "service" -> by_column Logs.service_name
   | "severity" -> by_column Logs.severity_text
@@ -2755,14 +2753,14 @@ let log_stats ?(attr_contains = []) ?min_severity
       let* groups = q_select t.pool Q.Select.(
         from Logs.table Q.Projection.(t2 (one Logs.scope_name) (count ()))
         |> where predicate |> group_by Logs.scope_name) in
-      Eta.Effect.pure (as_items (List.map (fun (name,count) ->
+      Ok (as_items (List.map (fun (name,count) ->
         (Option.value name ~default:"unknown", count)) groups))
   | group_by ->
       (match attr_group_key group_by with
       | None ->
           let* count = q_select t.pool Q.Select.(
             from Logs.table Q.Projection.(count ()) |> where predicate) in
-          Eta.Effect.pure (as_items ["unknown", List.hd count])
+          Ok (as_items ["unknown", List.hd count])
       | Some key ->
           let filtered_ids = Q.Select.(
             from Logs.table Q.Projection.(one Logs.id)
@@ -2778,7 +2776,7 @@ let log_stats ?(attr_contains = []) ?min_severity
             |> where Q.Expr.(and_ (eq (left Log_attributes.key) key)
               (in_select (right Logs.id) filtered_ids))
             |> group_by (left Log_attributes.value)) in
-          Eta.Effect.pure (as_items groups))
+          Ok (as_items groups))
 
 module Facet_pairs = struct
   module T = Q.Table.Make (struct let name = "facet_pairs" end)
@@ -2788,7 +2786,7 @@ module Facet_pairs = struct
 end
 
 let facets (filter : facet_filter) t =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let to_items ?(short_values = false) rows =
     rows
     |> List.filter (fun (value, _) ->
@@ -2861,32 +2859,32 @@ let facets (filter : facet_filter) t =
   match filter.kind, filter.field with
   | "traces", "service" ->
       let* rows = trace_col Trace_summaries.service_name in
-      Eta.Effect.pure (to_items rows)
+      Ok (to_items rows)
   | "traces", "operation" ->
       let* rows = trace_col Trace_summaries.root_operation_name in
-      Eta.Effect.pure (to_items rows)
+      Ok (to_items rows)
   | "traces", "status" ->
       let count pred = q_select t.pool Q.Select.(
         from Trace_summaries.table Q.Projection.(count ())
         |> where Q.Expr.(and_ trace_predicate pred)) in
       let* ok = count Q.Expr.(eq Trace_summaries.error_count 0) in
       let* error = count Q.Expr.(gt Trace_summaries.error_count 0) in
-      Eta.Effect.pure (to_items ["ok", List.hd ok; "error", List.hd error]
+      Ok (to_items ["ok", List.hd ok; "error", List.hd error]
         |> List.filter (fun item -> item.Model.count > 0))
   | "logs", "service" ->
-      let* rows = log_col Logs.service_name in Eta.Effect.pure (to_items rows)
+      let* rows = log_col Logs.service_name in Ok (to_items rows)
   | "logs", "severity" ->
-      let* rows = log_col Logs.severity_text in Eta.Effect.pure (to_items rows)
+      let* rows = log_col Logs.severity_text in Ok (to_items rows)
   | "logs", "scope" ->
       let* rows = log_col Logs.scope_name in
-      Eta.Effect.pure (to_items (List.map (fun (v,n) ->
+      Ok (to_items (List.map (fun (v,n) ->
         Option.value v ~default:"unknown", n) rows))
   | ("traces" | "logs"), ("attribute_keys" | "attribute_values")
       when filter.field <> "attribute_values" || Option.is_some filter.key ->
       let* rows = if filter.kind = "traces" then trace_attributes ()
         else log_attributes () in
-      Eta.Effect.pure (to_items ~short_values:(filter.field = "attribute_values") rows)
-  | _ -> Eta.Effect.pure []
+      Ok (to_items ~short_values:(filter.field = "attribute_values") rows)
+  | _ -> Ok []
 
 let metric_predicate (filter : metric_filter) =
   let predicate = Q.Expr.true_ in
@@ -2918,7 +2916,7 @@ let list_metric_points (filter : metric_filter) t =
       |> order_by ~desc:true Metric_points.timestamp_ns
       |> order_by ~desc:true Metric_points.id
       |> limit (filter.limit + 1))
-  |> Eta.Effect.map (fun rows ->
+  |> Result.map (fun rows ->
          let page =
            page_of_rows ~limit:filter.limit
              ~position:(fun (id, (point : Model.metric_point)) ->
@@ -2931,12 +2929,12 @@ let list_metric_points (filter : metric_filter) t =
          { items = List.map snd page.items; next = page.next })
 
 let count_rows runner table =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* rows = q_select runner Q.Select.(from table Q.Projection.(count ())) in
   scalar "count" rows
 
 let count_windowed_rows runner table sort_key window =
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* rows =
     q_select runner
       Q.Select.(
@@ -2947,7 +2945,7 @@ let count_windowed_rows runner table sort_key window =
 
 let stats ?window t =
   let window = Option.value window ~default:Model.window_all in
-  let open Eta.Syntax in
+  let open Result.Syntax in
   let* spans = count_windowed_rows t.pool Spans.table Spans.start_time_ns window in
   let* logs = count_windowed_rows t.pool Logs.table Logs.timestamp_ns window in
   let* metric_points =
@@ -2959,7 +2957,7 @@ let stats ?window t =
   in
   let* services = list_services_runner ~window t.pool in
   let* live_bytes = live_bytes t.pool in
-  Eta.Effect.pure
+  Ok
     {
       Model.spans;
       logs;

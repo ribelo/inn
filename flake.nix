@@ -3,7 +3,7 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   inputs.eta = {
-    url = "git+file:///home/ribelo/projects/ribelo/ocaml/Eta";
+    url = "git+file:///home/ribelo/projects/ribelo/ocaml/Eta?ref=eta-next";
     inputs.nixpkgs.follows = "nixpkgs";
     inputs.opam-nix.follows = "opam-nix";
     inputs.opam-repository.follows = "opam-repository";

@@ -16,20 +16,12 @@
 
 (rule
  (targets version.ml)
- (action (with-stdout-to %{targets} (echo "let value = \"%{version:inn}\""))))
+ (action
+  (with-stdout-to
+   %{targets}
+   (echo "let value = \"%{version:inn}\""))))
 
 (library
  (name inn)
  (public_name inn)
- (libraries
-  eta
-  eta_eio
-  eta_http
-  eta_http_eio
-  eta_http_service
-  eta_http_service_eio
-  eta_sql
-  eio
-  eio.unix
-  yojson
-  unix))
+ (libraries eta eta_http eta_sql eio eio.unix yojson unix))

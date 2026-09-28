@@ -2,13 +2,17 @@
  (name test_inn)
  (package inn)
  (deps ../README.md ../docs/guides/eta.md eta_guide_snippet.ml)
- (libraries inn alcotest eta eta_eio eta_http eta_http_eio eio_main unix)
+ (libraries inn alcotest eta eta_http eta_sql eio_main unix)
  ; The suite starts many short-lived Eio runtimes. Each io_uring ring locks
  ; memory against a per-user cap that this sandbox sets to 8 MiB, so under
  ; contention with other processes Eio_main.run fails with
  ; "io_uring_queue_init: ENOMEM" and hides real failures. The posix backend
  ; is the same Eio API without io_uring, so the tests stay deterministic.
- (action (setenv EIO_BACKEND posix (run %{test}))))
+ (action
+  (setenv
+   EIO_BACKEND
+   posix
+   (run %{test}))))
 
 (test
  (name test_mcp)
@@ -17,20 +21,23 @@
 
 ; The Eta guide's exporter snippet, compiled against the real Eta API. The
 ; Alcotest suite checks that docs/guides/eta.md carries exactly this source, so
-; the guide cannot drift from an API it does not compile against. The shared
-; switch still has the pre-endpoint eta_otel, so the stanza is enabled on the
-; local-Eta build path only (scripts/test-local-eta.sh sets the variable).
+; the guide cannot drift from an API it does not compile against. Enable
+; the compiled example on the eta-next build path with INN_ETA_GUIDE_SNIPPET=1.
+
 (executable
  (name eta_guide_snippet)
- (enabled_if (= %{env:INN_ETA_GUIDE_SNIPPET=0} 1))
- (flags (:standard -w -32))
- (libraries eta eta_eio eta_observability eta_otel eta_http eta_http_eio
-   eio_main))
+ (enabled_if
+  (= %{env:INN_ETA_GUIDE_SNIPPET=0} 1))
+ (flags
+  (:standard -w -32))
+ (libraries eta eta_observability eta_otel eta_http eio_main))
 
 (rule
  (alias runtest)
- (enabled_if (= %{env:INN_ETA_GUIDE_SNIPPET=0} 1))
- (action (run ./eta_guide_snippet.exe)))
+ (enabled_if
+  (= %{env:INN_ETA_GUIDE_SNIPPET=0} 1))
+ (action
+  (run ./eta_guide_snippet.exe)))
 
 (cram
  (deps
