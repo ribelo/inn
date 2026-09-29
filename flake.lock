@@ -21,16 +21,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1790587711,
-        "narHash": "sha256-YaCzEAQPNI3XartegxlHiS3nW5CxBDHRp6xY0+keeGw=",
-        "ref": "eta-next",
-        "rev": "14f80b766bfb47d4a51c70db86a8e218bc5c4530",
-        "revCount": 3047,
+        "lastModified": 1790668059,
+        "narHash": "sha256-tun7CZosbdXn4OgvCqL6dTIZUqmDVwddMPRNPMO24gs=",
+        "ref": "master",
+        "rev": "64db430efd878202628bde6039f2836c3e67a378",
+        "revCount": 3076,
         "type": "git",
         "url": "file:///home/ribelo/projects/ribelo/ocaml/Eta"
       },
       "original": {
-        "ref": "eta-next",
+        "ref": "master",
         "type": "git",
         "url": "file:///home/ribelo/projects/ribelo/ocaml/Eta"
       }
