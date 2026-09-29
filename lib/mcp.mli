@@ -21,4 +21,8 @@ val handle_line :
   Yojson.Safe.t option
 
 val run :
-  tool_call:(string -> Yojson.Safe.t -> (string, string) result) -> unit -> unit
+  caps:< Ox_caps.Cap.stdin ; Ox_caps.Cap.stdout ; .. > ->
+  tool_call:(string -> Yojson.Safe.t -> (string, string) result) ->
+  unit ->
+  unit
+(** Reads one request per stdin line and writes one flushed stdout line. ^inncap-q8hn *)

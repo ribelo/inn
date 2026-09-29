@@ -1,5 +1,7 @@
 # Repository Guidelines
 
+Dangerous calls go through `Ox_caps.Cap_*` and require a capability in the signature. ^inncap-w5qo
+
 ## Landing: work is done when it is committed
 
 You are the only agent working in this repository. Each session starts with no

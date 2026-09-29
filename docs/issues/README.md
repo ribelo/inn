@@ -18,6 +18,7 @@ Each spec's frontmatter carries its status (completed = implemented and accepted
 | 11 | [self-description](self-description/01-openapi-and-guides.md) | done (c03f279) |
 | 12 | [systemd-service](systemd-service/01-service-runs.md) | done (fb9bd18) |
 | 13 | [eta-next-migration](eta-next-migration/01-eta-next-migration.md) | in progress |
+| 14 | [caps](caps/01-caps.md) | done (uncommitted; ox row 52) |
 
 Specs 3–11 all touch the store and server, so they are implemented one at a
 time, in this order.

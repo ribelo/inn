@@ -18,8 +18,8 @@ let default_metrics_retention_hours = 48
 let default_prune_interval_seconds = 300
 let default_max_db_size_mb = 1024
 
-let getenv key =
-  match Sys.getenv_opt key with
+let getenv ~caps key =
+  match Ox_caps.Cap_sys.getenv_opt ~caps key with
   | Some value when String.trim value <> "" -> Some value
   | _ -> None
 
@@ -37,8 +37,8 @@ let positive_int_env env ~name ~default =
   parse_positive_int ~name
     (Option.value (clean_env env name) ~default:(string_of_int default))
 
-let default_home () =
-  match Sys.getenv_opt "HOME" with
+let default_home ~caps () =
+  match Ox_caps.Cap_sys.getenv_opt ~caps "HOME" with
   | Some value when String.trim value <> "" -> value
   | _ -> "."
 
@@ -51,8 +51,8 @@ let legacy_retention_error =
 
 let ( let* ) = Result.bind
 
-let resolve ?(env = getenv) ?home () =
-  let home = Option.value home ~default:(default_home ()) in
+let resolve ~caps ?(env = getenv ~caps) ?home () =
+  let home = Option.value home ~default:(default_home ~caps ()) in
   let state_home =
     match clean_env env "XDG_STATE_HOME" with
     | Some path -> path
@@ -113,7 +113,7 @@ let resolve ?(env = getenv) ?home () =
           max_db_size_mb;
         }
 
-let resolve_exn () =
-  match resolve () with
+let resolve_exn ~caps () =
+  match resolve ~caps () with
   | Ok config -> config
   | Error message -> invalid_arg message

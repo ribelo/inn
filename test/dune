@@ -2,7 +2,7 @@
  (name test_inn)
  (package inn)
  (deps ../README.md ../docs/guides/ox.md ox_guide_snippet.ml)
- (libraries inn alcotest ox ox_http ox_sql eio_main unix)
+ (libraries inn alcotest ox ox_caps ox_http ox_sql ox_test eio_main unix)
  ; The suite starts many short-lived Eio runtimes. Each io_uring ring locks
  ; memory against a per-user cap that this sandbox sets to 8 MiB, so under
  ; contention with other processes Eio_main.run fails with
@@ -31,7 +31,7 @@
   (= %{env:INN_ETA_GUIDE_SNIPPET=0} 1))
  (flags
   (:standard -w -32))
- (libraries ox ox_observability ox_otel ox_http eio_main))
+ (libraries ox ox_observability ox_otel ox_http ox_test eio_main))
 
 (rule
  (alias runtest)

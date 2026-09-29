@@ -132,6 +132,11 @@ val schema_fingerprint : string
 (** Fingerprint of the compiled schema statements for [schema_version]. *)
 
 val open_ :
+  caps:< Ox_caps.Cap.time
+       ; Ox_caps.Cap.fs_read
+       ; Ox_caps.Cap.fs_write
+       ; Ox_caps.Cap.stderr
+       ; .. > ->
   sw:Eio.Switch.t ->
   ?now_ms:(unit -> int) ->
   ?report:(string -> unit) ->
@@ -148,6 +153,11 @@ val ping : t -> (unit, error) result
     [GET /ready]. *)
 
 val with_db :
+  caps:< Ox_caps.Cap.time
+       ; Ox_caps.Cap.fs_read
+       ; Ox_caps.Cap.fs_write
+       ; Ox_caps.Cap.stderr
+       ; .. > ->
   sw:Eio.Switch.t ->
   ?now_ms:(unit -> int) ->
   ?report:(string -> unit) ->

@@ -11,6 +11,7 @@ type t = {
   config : Config.t;
   pool : Q.Pool.t;
   now_ms : unit -> int;
+  wall_now : unit -> int;
   mutable last_prune : Model.prune_report option;
 }
 
@@ -354,19 +355,20 @@ let pp_error ppf = function
 
 let widen_pool_error (error : Q.Pool.error) : error = (error :> error)
 
-let rec mkdir_p path =
+let rec mkdir_p ~caps path =
   if path = "" || path = "." || Sys.file_exists path then ()
   else (
-    mkdir_p (Filename.dirname path);
-    Unix.mkdir path 0o700)
+    mkdir_p ~caps (Filename.dirname path);
+    Ox_caps.Cap_unix.mkdir ~caps path 0o700)
 
-let wall_now_ms () = int_of_float (Unix.gettimeofday () *. 1000.)
+let wall_now_ms ~caps () =
+  int_of_float (Ox_caps.Cap_unix.gettimeofday ~caps () *. 1000.)
 
 let id_counter = Atomic.make 0
 
-let fresh_id prefix =
+let fresh_id wall_now prefix =
   let seq = Atomic.fetch_and_add id_counter 1 in
-  Printf.sprintf "%s-%d-%d-%d" prefix (Unix.getpid ()) (wall_now_ms ()) seq
+  Printf.sprintf "%s-%d-%d-%d" prefix (Unix.getpid ()) (wall_now ()) seq
 
 let span_row_id (span : Model.span) = span.trace_id ^ ":" ^ span.span_id
 let attr_row_id owner_id index key = owner_id ^ ":" ^ string_of_int index ^ ":" ^ key
@@ -791,11 +793,11 @@ type database_state =
 let local_sqlite_config ?(mode = Sqlite.Read_write) path =
   { (sqlite_config path) with mode; journal_mode = None }
 
-let with_local_pool ?mode path f =
+let with_local_pool ~caps ?mode path f =
   Eio.Switch.run (fun sw ->
       let open Result.Syntax in
       let* pool =
-        Q.Pool.create ~sw ~default_timeout:(Ox.Duration.seconds 5) ~max_size:1
+        Q.Pool.create ~caps ~sw ~default_timeout:(Ox.Duration.seconds 5) ~max_size:1
           (local_sqlite_config ?mode path)
         |> Result.map_error widen_pool_error
       in
@@ -809,8 +811,8 @@ let sqlite_magic = "SQLite format 3\000"
    carry the SQLite header. Refusing a file that is not SQLite before opening a
    connection keeps a misconfigured path from being touched at all
    (schm-xkk2). *)
-let file_is_sqlite path =
-  let channel = open_in_bin path in
+let file_is_sqlite ~caps path =
+  let channel = Ox_caps.Cap_stdlib.open_in_bin ~caps path in
   Fun.protect
     ~finally:(fun () -> close_in channel)
     (fun () ->
@@ -819,16 +821,16 @@ let file_is_sqlite path =
       else if length < String.length sqlite_magic then false
       else String.equal (really_input_string channel 16) sqlite_magic)
 
-let read_database_state path =
+let read_database_state ~caps path =
   if not (Sys.file_exists path) then Ok Database_absent
-  else if not (file_is_sqlite path) then
+  else if not (file_is_sqlite ~caps path) then
     Error
       (`Invalid_store
         (Printf.sprintf "refusing to open %s: it is not an SQLite database" path))
   else
     let open Result.Syntax in
     let result =
-      with_local_pool path (fun pool ->
+      with_local_pool ~caps path (fun pool ->
           let open Result.Syntax in
           let* tables =
             q_select pool
@@ -870,20 +872,22 @@ let read_database_state path =
             (Printf.sprintf "cannot read %s as an SQLite database: %s" path
                (Format.asprintf "%a" pp_error error)))
 
-let remove_if_exists path =
+let remove_if_exists ~caps path =
   if Sys.file_exists path then
-    try Sys.remove path with Sys_error _ -> ()
+    try Ox_caps.Cap_sys.remove ~caps path with Sys_error _ -> ()
 
-let remove_database_files path =
-  List.iter remove_if_exists [ path; path ^ "-wal"; path ^ "-shm" ]
+let remove_database_files ~caps path =
+  List.iter (remove_if_exists ~caps) [ path; path ^ "-wal"; path ^ "-shm" ]
 
-let default_report line = prerr_endline ("inn: " ^ line)
+let default_report ~caps line =
+  Ox_caps.Cap_stdlib.prerr_endline ~caps ("inn: " ^ line)
 
-let open_ ~sw ?(now_ms = wall_now_ms) ?(report = default_report) config =
+let open_ ~caps ~sw ?(now_ms = wall_now_ms ~caps) ?(report = default_report ~caps) config =
+  let wall_now = wall_now_ms ~caps in
   let open Result.Syntax in
   let path = config.Config.db_path in
-  mkdir_p (Filename.dirname path);
-  let* state = read_database_state path in
+  mkdir_p ~caps (Filename.dirname path);
+  let* state = read_database_state ~caps path in
   let* () =
     match state with
     | Database_current -> Ok ()
@@ -898,10 +902,10 @@ let open_ ~sw ?(now_ms = wall_now_ms) ?(report = default_report) config =
           (Printf.sprintf
              "schema version %s at %s does not match version %d; deleting the old database and creating a fresh one"
              stored path schema_version);
-        remove_database_files path;
+        remove_database_files ~caps path;
         Ok ()
     | Database_absent | Database_fresh ->
-        remove_database_files path;
+        remove_database_files ~caps path;
         Ok ()
   in
   let* () =
@@ -910,16 +914,16 @@ let open_ ~sw ?(now_ms = wall_now_ms) ?(report = default_report) config =
     match state with
     | Database_current -> Ok ()
     | _ ->
-        with_local_pool ~mode:Sqlite.Read_write_create path (fun pool ->
+        with_local_pool ~caps ~mode:Sqlite.Read_write_create path (fun pool ->
             sqlite_pragma pool "auto_vacuum = INCREMENTAL")
   in
   let* pool =
-    Q.Pool.create ~sw ~default_timeout:(Ox.Duration.seconds 5) ~max_size:4
+    Q.Pool.create ~caps ~sw ~default_timeout:(Ox.Duration.seconds 5) ~max_size:4
       (sqlite_config path)
     |> Result.map_error widen_pool_error
   in
   let* () = init_schema pool |> Result.map_error widen_pool_error in
-  Ok { config; pool; now_ms; last_prune = None }
+  Ok { config; pool; now_ms; wall_now; last_prune = None }
 
 let close t = Q.Pool.shutdown t.pool |> Result.map_error widen_pool_error
 
@@ -937,9 +941,9 @@ let ping t =
       |> limit 1)
   |> Result.map (fun _ -> ())
 
-let with_db ~sw ?now_ms ?report config f =
+let with_db ~caps ~sw ?now_ms ?report config f =
   let open Result.Syntax in
-  let* store = open_ ~sw ?now_ms ?report config in
+  let* store = open_ ~caps ~sw ?now_ms ?report config in
   let result = f store in
   let closed = close store in
   match result with Error _ -> result | Ok value -> Result.map (fun () -> value) closed
@@ -1876,7 +1880,7 @@ let ingest_logs t logs =
   let open Result.Syntax in
   let now_ms = t.now_ms () in
   let insert_log runner (log : Model.log_record) =
-    let id = fresh_id "log" in
+    let id = fresh_id t.wall_now "log" in
     let timestamp_ns = if log.timestamp_ns = 0 then now_ms * 1_000_000 else log.timestamp_ns in
     let query =
       Q.Insert.(
@@ -1911,7 +1915,7 @@ let ingest_metrics t points =
   let open Result.Syntax in
   let now_ms = t.now_ms () in
   let insert_point runner (point : Model.metric_point) =
-    let id = fresh_id "metric" in
+    let id = fresh_id t.wall_now "metric" in
     let query =
       Q.Insert.(
         into Metric_points.table

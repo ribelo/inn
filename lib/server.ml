@@ -56,13 +56,25 @@ let not_found () = error_response 404 "not_found" "endpoint not found"
    the ISO 8601 start time, and the uptime of the running process
    (desc-8syr, desc-lqpr). *)
 
-let wall_now_ms () = int_of_float (Unix.gettimeofday () *. 1000.)
+let wall_clock = ref (fun () -> 0)
+let wall_now_ms () = !wall_clock ()
 
-let started_at_ms = Atomic.make (wall_now_ms ())
+let install_clock ~caps =
+  wall_clock :=
+    fun () ->
+      int_of_float (Ox_caps.Cap_unix.gettimeofday ~caps () *. 1000.)
+
+let started_at_ms = Atomic.make 0
 let draining = Atomic.make false
-let mark_started () =
+let mark_started ~caps () =
+  install_clock ~caps;
   Atomic.set started_at_ms (wall_now_ms ());
   Atomic.set draining false
+
+let adopt_instance_id ~caps =
+  match Ox_caps.Cap_sys.getenv_opt ~caps "INN_INSTANCE_ID" with
+  | Some value when String.trim value <> "" -> set_instance_id (String.trim value)
+  | _ -> ()
 
 let iso8601_of_ms ms =
   let seconds = ms / 1000 in
@@ -1046,8 +1058,10 @@ let unix_addr host port =
 let socket_domain host =
   if String.contains host ':' then Unix.PF_INET6 else Unix.PF_INET
 
-let check_bind_available config =
-  let fd = Unix.socket (socket_domain config.Config.host) Unix.SOCK_STREAM 0 in
+let check_bind_available ~caps config =
+  let fd =
+    Ox_caps.Cap_unix.socket ~caps (socket_domain config.Config.host) Unix.SOCK_STREAM 0
+  in
   Fun.protect
     ~finally:(fun () -> Unix.close fd)
     (fun () ->
@@ -1060,59 +1074,60 @@ let check_bind_available config =
 let prune_interval config =
   float_of_int config.Config.prune_interval_seconds
 
-let report_prune (report : Model.prune_report) =
+let report_prune ~caps (report : Model.prune_report) =
   let deleted =
     report.traces + report.spans + report.logs + report.metric_points
   in
   if deleted > 0 then
-    prerr_endline
+    Ox_caps.Cap_stdlib.prerr_endline ~caps
       (Printf.sprintf
          "inn pruner: deleted %d traces, %d spans, %d logs, and %d metric points%s"
          report.traces report.spans report.logs report.metric_points
          (if report.size_cap_triggered then " (size cap)" else ""))
 
-let report_prune_failure error =
-  prerr_endline (Format.asprintf "inn pruner: %a" Store.pp_error error)
+let report_prune_failure ~caps error =
+  Ox_caps.Cap_stdlib.prerr_endline ~caps
+    (Format.asprintf "inn pruner: %a" Store.pp_error error)
 
 (* One prune pass at startup, then one pass per interval. The pruner never
    fails the server: a failed pass is reported and retried on the next interval
    (ret-sj15, ret-sbgj). *)
-let pruner_loop ~clock ~config store =
+let pruner_loop ~caps ~clock ~config store =
   let rec loop () =
     (match Store.prune store with
-    | Ok report -> report_prune report
-    | Error error -> report_prune_failure error);
+    | Ok report -> report_prune ~caps report
+    | Error error -> report_prune_failure ~caps error);
     Eio.Time.sleep clock (prune_interval config);
     loop ()
   in
   loop ()
 
-let start_pruner ~sw ~clock ~config store =
+let start_pruner ~caps ~sw ~clock ~config store =
   Eio.Fiber.fork_daemon ~sw (fun () ->
-      (try pruner_loop ~clock ~config store with
+      (try pruner_loop ~caps ~clock ~config store with
       | Eio.Cancel.Cancelled _ as ex -> raise ex
       | ex ->
-          prerr_endline
+          Ox_caps.Cap_stdlib.prerr_endline ~caps
             (Printf.sprintf "inn pruner stopped: %s" (Printexc.to_string ex)));
       `Stop_daemon)
 
 (* The serving switch has cancelled and awaited the pruner before the store
    closes on this still-live outer switch. *)
-let close_store store =
+let close_store ~caps store =
   match Store.close store with
   | Ok () -> ()
   | Error error ->
-      prerr_endline (Format.asprintf "inn: closing the store failed: %a"
-                      Store.pp_error error)
+      Ox_caps.Cap_stdlib.prerr_endline ~caps
+        (Format.asprintf "inn: closing the store failed: %a" Store.pp_error error)
 
 (* Startup lines record the effective configuration, so
    [journalctl --user -u inn] shows the listen address, the database path, and
    the retention settings the running process actually uses (svc-dh98). *)
-let log_startup config =
-  prerr_endline
+let log_startup ~caps config =
+  Ox_caps.Cap_stdlib.prerr_endline ~caps
     (Printf.sprintf "inn server listening on http://%s:%d" config.Config.host
        config.port);
-  prerr_endline
+  Ox_caps.Cap_stdlib.prerr_endline ~caps
     (Printf.sprintf
        "inn server configuration: database=%s traces_retention=%dh \
         logs_retention=%dh metrics_retention=%dh prune_interval=%ds \
@@ -1125,7 +1140,7 @@ let log_startup config =
    in-flight requests for five seconds. The serving switch awaits the pruner
    before the outer finaliser closes the store, so systemd sees a clean exit.
    Keep Inn's /ready JSON contract instead of introducing Door-owned CLI/config. *)
-let with_shutdown_signals ~sw f =
+let with_shutdown_signals ~caps ~sw f =
   let stop, resolver = Eio.Promise.create () in
   let signal = Atomic.make 0 in
   let changed = Eio.Condition.create () in
@@ -1136,7 +1151,10 @@ let with_shutdown_signals ~sw f =
   in
   (* Eio conditions are domain-local; like Ox_app, this must use Sys.signal,
      whose callback may close over the condition, rather than Sys.Safe.signal. *)
-  let set_signal = (Sys.signal [@alert "-unsafe_multidomain"]) in
+  let set_signal behavior_signal behavior =
+    (Ox_caps.Cap_sys.signal [@alert "-unsafe_multidomain"]) ~caps
+      behavior_signal behavior
+  in
   let previous_term = set_signal Sys.sigterm (Sys.Signal_handle on_signal) in
   Fun.protect
     ~finally:(fun () -> ignore (set_signal Sys.sigterm previous_term))
@@ -1157,24 +1175,25 @@ let with_shutdown_signals ~sw f =
               `Stop_daemon);
           f stop))
 
-let run ~sw ~env config =
-  check_bind_available config;
-  mark_started ();
+let run ~caps ~sw ~env config =
+  adopt_instance_id ~caps;
+  check_bind_available ~caps config;
+  mark_started ~caps ();
   let net = Eio.Stdenv.net env in
   let clock = Eio.Stdenv.clock env in
-  let store = run_store_result (Store.open_ ~sw config) in
+  let store = run_store_result (Store.open_ ~caps ~sw config) in
   Fun.protect
-    ~finally:(fun () -> close_store store)
+    ~finally:(fun () -> close_store ~caps store)
     (fun () ->
       (* Serve.h1 returns after draining. Leaving this switch cancels and
          awaits the pruner before the store closes on the outer switch. *)
       Eio.Switch.run (fun serve_sw ->
-          start_pruner ~sw:serve_sw ~clock ~config store;
-          log_startup config;
+          start_pruner ~caps ~sw:serve_sw ~clock ~config store;
+          log_startup ~caps config;
           let addr =
             Serve.tcp_addr ~host:config.Config.host ~port:config.port
           in
-          with_shutdown_signals ~sw:serve_sw (fun stop ->
+          with_shutdown_signals ~caps ~sw:serve_sw (fun stop ->
               Serve.h1 ~sw:serve_sw ~net ~clock ~addr ~stop
                 ~drain_timeout:(Ox.Duration.seconds 5)
                 (handler config store))))

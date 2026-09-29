@@ -25,7 +25,7 @@ let contains haystack needle =
 (* Config ---------------------------------------------------------------- *)
 
 let test_config_defaults_are_user_level () =
-  match Config.resolve ~env:(env []) ~home:"/home/alice" () with
+  match Config.resolve ~caps:(Ox_test.powerbox ()) ~env:(env []) ~home:"/home/alice" () with
   | Error message -> Alcotest.fail message
   | Ok config ->
       Alcotest.(check string)
@@ -62,7 +62,7 @@ let test_config_env_overrides () =
         ("INN_MAX_DB_SIZE_MB", "2048");
       ]
   in
-  match Config.resolve ~env ~home:"/home/alice" () with
+  match Config.resolve ~caps:(Ox_test.powerbox ()) ~env ~home:"/home/alice" () with
   | Error message -> Alcotest.fail message
   | Ok config ->
       Alcotest.(check string) "state dir" "/custom/state" config.state_dir;
@@ -83,7 +83,7 @@ let test_config_env_overrides () =
 
 let test_config_rejects_legacy_retention () =
   let env = env [ ("INN_RETENTION_HOURS", "72") ] in
-  match Config.resolve ~env ~home:"/home/alice" () with
+  match Config.resolve ~caps:(Ox_test.powerbox ()) ~env ~home:"/home/alice" () with
   | Ok _ -> Alcotest.fail "INN_RETENTION_HOURS must be rejected"
   | Error message ->
       Alcotest.(check bool)
@@ -99,7 +99,7 @@ let test_config_rejects_legacy_retention () =
 let test_config_rejects_invalid_values () =
   let check_invalid name value =
     let env = env [ (name, value) ] in
-    match Config.resolve ~env ~home:"/home/alice" () with
+    match Config.resolve ~caps:(Ox_test.powerbox ()) ~env ~home:"/home/alice" () with
     | Ok _ -> Alcotest.failf "%s = %S must be rejected" name value
     | Error message ->
         Alcotest.(check bool)
@@ -280,7 +280,7 @@ let run_store_in ~sw ~clock:_ program =
   | Error error -> Alcotest.failf "%a" Store.pp_error error
 
 let with_store ?now_ms ?report config f =
-  run_store (fun sw -> Store.with_db ~sw ?now_ms ?report config f)
+  run_store (fun sw -> Store.with_db ~caps:(Ox_test.powerbox ()) ~sw ?now_ms ?report config f)
 
 (* Test-only database probes. The store's public interface cannot produce a
    stale schema version or a foreign database, and it cannot prove that no
@@ -379,7 +379,7 @@ let run_test_db path program =
   let ( let* ) = Result.bind in
   let program =
     let* pool =
-      Ox_sql.Pool.create
+      Ox_sql.Pool.create ~caps:(Ox_test.powerbox ())
         ~sw ~default_timeout:(Ox.Duration.seconds 5)
         (Ox_sql.Sqlite.default_config path)
     in
@@ -626,7 +626,7 @@ let test_schema_refuses_foreign_database () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   create_foreign_database config.Config.db_path;
-  (match run_store_error (fun sw -> Store.open_ ~sw config) with
+  (match run_store_error (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) with
   | Some message ->
       Alcotest.(check bool)
         "error names the missing metadata table (schm-xkk2)" true
@@ -647,7 +647,7 @@ let test_schema_refuses_foreign_database () =
       let channel = open_out_bin other.Config.db_path in
       output_string channel contents;
       close_out channel;
-      (match run_store_error (fun sw -> Store.open_ ~sw other) with
+      (match run_store_error (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw other) with
       | Some message ->
           Alcotest.(check bool)
             "error says the file is not a database (schm-xkk2)" true
@@ -702,7 +702,7 @@ let test_store_ingests_and_queries_all_signals () =
       stats )
     =
     let ( let* ) = Result.bind in
-    (fun sw -> Store.with_db ~sw config (fun store ->
+    (fun sw -> Store.with_db ~caps:(Ox_test.powerbox ()) ~sw config (fun store ->
         let* inserted_spans = Store.ingest_traces store spans in
         let* inserted_logs = Store.ingest_logs store logs in
         let* inserted_metrics = Store.ingest_metrics store metrics in
@@ -1259,7 +1259,7 @@ let test_server_handler_ingests_and_queries_services () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
   Fun.protect
     ~finally:(fun () -> run_store (fun _sw -> Store.close store))
     (fun () ->
@@ -1507,7 +1507,7 @@ let test_server_pruner_prunes_without_ingest () =
   let net = Eio.Stdenv.net env in
   let clock = Eio.Stdenv.clock env in
   Eio.Fiber.first
-    (fun () -> Inn.Server.run ~sw ~env config)
+    (fun () -> Inn.Server.run ~caps:(Ox_test.powerbox ()) ~sw ~env config)
     (fun () ->
       let client = Ox_http.Client.create ~sw ~net ~clock () in
       let base_url = Printf.sprintf "http://127.0.0.1:%d" port in
@@ -1540,7 +1540,7 @@ let test_server_pruner_prunes_without_ingest () =
       (* A later interval pass prunes data that arrives while the server keeps
          running without any ingest request (ret-sj15). *)
       run_store_in ~sw ~clock
-        (fun sw -> Store.with_db ~sw
+        (fun sw -> Store.with_db ~caps:(Ox_test.powerbox ()) ~sw
            ~now_ms:(fun () -> wall_now_ms () - (2 * hour_ms))
            config
            (fun store ->
@@ -1598,7 +1598,7 @@ let test_otlp_conformance_handler () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
   let post ?(headers = Ox_http.Header.empty) path body =
     run_server_effect (Inn.Server.handler config store
       (request ~method_:"POST" ~target:path ~body ~headers ())) in
@@ -1680,7 +1680,7 @@ let test_otlp_store_retry () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
   run_store (fun _sw -> Store.close store);
   let response = run_server_effect
     (Inn.Server.handler config store
@@ -1877,7 +1877,7 @@ let test_query_windows () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw ~now_ms:(fun () -> base_time) config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw ~now_ms:(fun () -> base_time) config) in
   Fun.protect
     ~finally:(fun () -> run_store (fun _sw -> Store.close store))
     (fun () ->
@@ -2058,7 +2058,7 @@ let test_pagination_walk_logs () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw ~now_ms:(fun () -> base_time) config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw ~now_ms:(fun () -> base_time) config) in
   Fun.protect
     ~finally:(fun () -> run_store (fun _sw -> Store.close store))
     (fun () ->
@@ -2155,7 +2155,7 @@ let test_pagination_endpoints () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw ~now_ms:(fun () -> base_time) config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw ~now_ms:(fun () -> base_time) config) in
   Fun.protect
     ~finally:(fun () -> run_store (fun _sw -> Store.close store))
     (fun () ->
@@ -2244,7 +2244,7 @@ let test_exact_queries_above_old_caps () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw ~now_ms:(fun () -> base_time) config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw ~now_ms:(fun () -> base_time) config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let span_count = 12_050 and log_count = 188_025 in
   let spans = List.init span_count (fun i ->
@@ -2330,7 +2330,7 @@ let test_search_filters_and_exact_stats () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw ~now_ms:(fun () -> base_time) config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw ~now_ms:(fun () -> base_time) config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let trace_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in
   let trace_b = "cccccccccccccccccccccccccccccccc" in
@@ -2715,7 +2715,7 @@ let test_trace_tree_handlers () =
     ~finally:(fun () -> cleanup_config config)
     (fun () ->
       run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw ~now_ms:(fun () -> base_time) config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw ~now_ms:(fun () -> base_time) config) in
       Fun.protect
         ~finally:(fun () -> run_store (fun _sw -> Store.close store))
         (fun () ->
@@ -3170,7 +3170,7 @@ let test_ai_call_store_and_handlers () =
     ~finally:(fun () -> cleanup_config config)
     (fun () ->
       run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw ~now_ms:(fun () -> base_time) config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw ~now_ms:(fun () -> base_time) config) in
       Fun.protect
         ~finally:(fun () -> run_store (fun _sw -> Store.close store))
         (fun () ->
@@ -3612,7 +3612,7 @@ let test_declarations_drive_the_router () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let inventory =
     json_list "endpoints" (server_json config store "/endpoints")
@@ -3789,7 +3789,7 @@ let test_declared_responses_match_handlers () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   List.iter
     (fun (endpoint : Inn.Endpoint.t) ->
@@ -3851,7 +3851,7 @@ let test_hidden_routes_are_documented () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let inventory =
     json_list "endpoints" (server_json config store "/endpoints")
@@ -3896,7 +3896,7 @@ let test_docs_endpoints () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let guides = json_list "guides" (server_json config store "/docs") in
   Alcotest.(check int)
@@ -4042,7 +4042,7 @@ let test_health_identity () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let health = server_json config store "/health" in
   let healthz = server_json config store "/healthz" in
@@ -4107,7 +4107,7 @@ let test_instructions_point_at_the_docs () =
   let config = temp_config () in
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let body = response_body_string (server_get config store "/instructions") in
   List.iter

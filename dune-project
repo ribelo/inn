@@ -15,9 +15,12 @@
   (dune (>= 3.0))
   cmdliner
   ox
+  ox_app
+  ox_caps
   ox_http
   ox_sql
   eio
   eio_main
   yojson
+  (ox_test :with-test)
   (alcotest :with-test)))

@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Inn capability gate (^inncap-m2pd): the installed Ox gate beside ox_caps.
+# Nix findlib is deeper than an opam switch, so walk up from ocamlfind's
+# directory until share/ox_caps/caps-gate appears.
+set -euo pipefail
+cd "$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
+
+if ! lib_dir="$(ocamlfind query ox_caps 2>/dev/null)"; then
+  echo "caps-gate: ox_caps is not installed (ocamlfind query ox_caps failed)" >&2
+  exit 2
+fi
+dir="$lib_dir"
+gate=""
+while [ "$dir" != "/" ]; do
+  if [ -f "$dir/share/ox_caps/caps-gate" ]; then
+    gate="$dir/share/ox_caps/caps-gate"
+    break
+  fi
+  dir="$(dirname "$dir")"
+done
+if [ -z "$gate" ]; then
+  echo "caps-gate: no gate script beside $lib_dir" >&2
+  exit 2
+fi
+
+exec bash "$gate" "$@" lib bin

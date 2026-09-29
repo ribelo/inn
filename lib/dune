@@ -24,4 +24,4 @@
 (library
  (name inn)
  (public_name inn)
- (libraries ox ox_http ox_sql eio eio.unix yojson unix))
+ (libraries ox ox_caps ox_http ox_sql eio eio.unix yojson unix))

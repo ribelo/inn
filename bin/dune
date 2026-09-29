@@ -2,4 +2,4 @@
  (name main)
  (public_name inn)
  (package inn)
- (libraries inn cmdliner ox ox_http eio_main yojson unix))
+ (libraries inn cmdliner ox ox_app ox_caps ox_http eio_main yojson unix))

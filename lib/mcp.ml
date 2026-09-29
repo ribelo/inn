@@ -681,17 +681,20 @@ let handle_line ~tool_call line =
   | exception Yojson.Json_error _ -> Some (error `Null (-32700) "parse error")
 
 (* mcp-dgq3, mcp-seqk, mcp-jovg: each response is exactly one flushed line. *)
-let run ~tool_call () =
+let run ~caps ~tool_call () =
+  let input = Ox_caps.Cap_stdlib.stdin ~caps in
+  let output = Ox_caps.Cap_stdlib.stdout ~caps in
   let rec loop () =
-    match input_line stdin with
+    match input_line input with
     | exception End_of_file -> ()
     | line ->
         (if String.trim line <> "" then
            match handle_line ~tool_call line with
            | None -> ()
            | Some response ->
-               print_endline (Yojson.Safe.to_string response);
-               flush stdout);
+               Ox_caps.Cap_stdlib.print_endline ~caps
+                 (Yojson.Safe.to_string response);
+               flush output);
         loop ()
   in
   loop ()

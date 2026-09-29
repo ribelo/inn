@@ -12,5 +12,12 @@ type t = {
 }
 
 val default_port : int
-val resolve : ?env:(string -> string option) -> ?home:string -> unit -> (t, string) result
-val resolve_exn : unit -> t
+val resolve :
+  caps:< Ox_caps.Cap.env ; .. > ->
+  ?env:(string -> string option) ->
+  ?home:string ->
+  unit ->
+  (t, string) result
+(** [caps] reads the environment when [env] or [home] is omitted. ^inncap-q8hn *)
+
+val resolve_exn : caps:< Ox_caps.Cap.env ; .. > -> unit -> t

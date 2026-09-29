@@ -99,7 +99,9 @@ let run () =
   let http_client = Ox_http.Client.create ~sw ~net ~clock () in
   let exporter =
     match
-      Ox_otel.create ~sw ~clock ~http_client ~endpoint ~service_name:"my-app"
+      let caps = Ox_test.powerbox () in
+      Ox_otel.create ~caps ~sw ~clock ~http_client ~endpoint
+        ~service_name:"my-app"
         ~resource:[ ("service.version", "0.1.0") ] ()
     with
     | Ok exporter -> exporter
