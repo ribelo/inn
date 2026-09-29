@@ -284,93 +284,93 @@ let with_store ?now_ms ?report config f =
 
 (* Test-only database probes. The store's public interface cannot produce a
    stale schema version or a foreign database, and it cannot prove that no
-   orphaned attribute row is left behind, so these helpers use Eta SQL typed
+   orphaned attribute row is left behind, so these helpers use Ox SQL typed
    builders directly. *)
 
 let pp_pool_error ppf = function
-  | `Eta_sql error -> Eta_sql.pp_error ppf error
+  | `Ox_sql error -> Ox_sql.pp_error ppf error
   | `Pool_shutdown -> Format.pp_print_string ppf "pool shutdown"
   | `Timeout -> Format.pp_print_string ppf "timeout"
 
 module Test_meta = struct
-  module T = Eta_sql.Table.Make (struct
+  module T = Ox_sql.Table.Make (struct
     let name = "inn_meta"
   end)
 
   include T
 
-  let key = column "key" Eta_sql.text
-  let value = column "value" Eta_sql.text
+  let key = column "key" Ox_sql.text
+  let value = column "value" Ox_sql.text
 end
 
 module Test_foreign = struct
-  module T = Eta_sql.Table.Make (struct
+  module T = Ox_sql.Table.Make (struct
     let name = "other_app"
   end)
 
   include T
 
-  let id = column "id" Eta_sql.text
+  let id = column "id" Ox_sql.text
 end
 
 module Test_spans = struct
-  module T = Eta_sql.Table.Make (struct
+  module T = Ox_sql.Table.Make (struct
     let name = "spans"
   end)
 
   include T
 
-  let id = column "id" Eta_sql.text
+  let id = column "id" Ox_sql.text
 end
 
 module Test_span_attributes = struct
-  module T = Eta_sql.Table.Make (struct
+  module T = Ox_sql.Table.Make (struct
     let name = "span_attributes"
   end)
 
   include T
 
-  let owner_id = column "owner_id" Eta_sql.text
+  let owner_id = column "owner_id" Ox_sql.text
 end
 
 module Test_logs = struct
-  module T = Eta_sql.Table.Make (struct
+  module T = Ox_sql.Table.Make (struct
     let name = "logs"
   end)
 
   include T
 
-  let id = column "id" Eta_sql.text
+  let id = column "id" Ox_sql.text
 end
 
 module Test_log_attributes = struct
-  module T = Eta_sql.Table.Make (struct
+  module T = Ox_sql.Table.Make (struct
     let name = "log_attributes"
   end)
 
   include T
 
-  let owner_id = column "owner_id" Eta_sql.text
+  let owner_id = column "owner_id" Ox_sql.text
 end
 
 module Test_metric_points = struct
-  module T = Eta_sql.Table.Make (struct
+  module T = Ox_sql.Table.Make (struct
     let name = "metric_points"
   end)
 
   include T
 
-  let id = column "id" Eta_sql.text
+  let id = column "id" Ox_sql.text
 end
 
 module Test_metric_attributes = struct
-  module T = Eta_sql.Table.Make (struct
+  module T = Ox_sql.Table.Make (struct
     let name = "metric_attributes"
   end)
 
   include T
 
-  let owner_id = column "owner_id" Eta_sql.text
+  let owner_id = column "owner_id" Ox_sql.text
 end
 
 let run_test_db path program =
@@ -379,12 +379,12 @@ let run_test_db path program =
   let ( let* ) = Result.bind in
   let program =
     let* pool =
-      Eta_sql.Pool.create
+      Ox_sql.Pool.create
         ~sw ~default_timeout:5.
-        (Eta_sql.Sqlite.default_config path)
+        (Ox_sql.Sqlite.default_config path)
     in
     let* value = program pool in
-    let* () = Eta_sql.Pool.shutdown pool in
+    let* () = Ox_sql.Pool.shutdown pool in
     Result.ok value
   in
   match program with
@@ -395,54 +395,54 @@ let write_schema_version path version =
   run_test_db path (fun pool ->
       let ( let* ) = Result.bind in
       let update =
-        Eta_sql.Update.(
+        Ox_sql.Update.(
           table Test_meta.table
           |> set Test_meta.value version
-          |> where Eta_sql.Expr.(eq Test_meta.key "schema_version")
+          |> where Ox_sql.Expr.(eq Test_meta.key "schema_version")
           |> compile)
       in
-      let* _ = Eta_sql.Pool.Typed.execute_compiled pool update in
+      let* _ = Ox_sql.Pool.Typed.execute_compiled pool update in
       Result.ok ())
 
 let create_foreign_database path =
   run_test_db path (fun pool ->
       let ( let* ) = Result.bind in
       let schema =
-        Eta_sql.Eta_schema.(
+        Ox_sql.Ox_schema.(
           compile
             (create_table Test_foreign.table
                [ column ~primary_key:true Test_foreign.id ]))
       in
-      let* () = Eta_sql.Pool.Typed.run_schema pool schema in
+      let* () = Ox_sql.Pool.Typed.run_schema pool schema in
       let insert =
-        Eta_sql.Insert.(
+        Ox_sql.Insert.(
           into Test_foreign.table
           |> value Test_foreign.id "row-1"
           |> compile)
       in
-      let* _ = Eta_sql.Pool.Typed.execute_compiled pool insert in
+      let* _ = Ox_sql.Pool.Typed.execute_compiled pool insert in
       Result.ok ())
 
 let foreign_rows path =
   run_test_db path (fun pool ->
-      Eta_sql.Pool.Typed.select pool
-        (Eta_sql.Select.compile
-           Eta_sql.Select.(
-             from Test_foreign.table (Eta_sql.Projection.one Test_foreign.id))))
+      Ox_sql.Pool.Typed.select pool
+        (Ox_sql.Select.compile
+           Ox_sql.Select.(
+             from Test_foreign.table (Ox_sql.Projection.one Test_foreign.id))))
 
 (* Attribute rows whose owner row is gone (ret-hy7e). *)
 let orphan_attribute_rows path =
   run_test_db path (fun pool ->
       let ( let* ) = Result.bind in
       let owners table owner_id =
-        Eta_sql.Pool.Typed.select pool
-          (Eta_sql.Select.compile
-             Eta_sql.Select.(from table (Eta_sql.Projection.one owner_id)))
+        Ox_sql.Pool.Typed.select pool
+          (Ox_sql.Select.compile
+             Ox_sql.Select.(from table (Ox_sql.Projection.one owner_id)))
       in
       let ids table id =
-        Eta_sql.Pool.Typed.select pool
-          (Eta_sql.Select.compile
-             Eta_sql.Select.(from table (Eta_sql.Projection.one id)))
+        Ox_sql.Pool.Typed.select pool
+          (Ox_sql.Select.compile
+             Ox_sql.Select.(from table (Ox_sql.Projection.one id)))
       in
       let count_orphans owners ids =
         let ids = List.sort_uniq String.compare ids in
@@ -467,16 +467,16 @@ let orphan_attribute_rows path =
 let run_server_effect program =
   match program with
   | Ok value -> value
-  | Error error -> Alcotest.failf "%a" Eta_http.Server.Error.pp error
+  | Error error -> Alcotest.failf "%a" Ox_http.Server.Error.pp error
 
 let request ?(method_ = "GET") ?(target = "/health") ?(body = "")
-    ?(headers = Eta_http.Header.empty) () =
-  let path, query = Eta_http.Server.Request.split_target target in
+    ?(headers = Ox_http.Header.empty) () =
+  let path, query = Ox_http.Server.Request.split_target target in
   let body =
-    if String.equal body "" then Eta_http.Server.Body.empty ()
+    if String.equal body "" then Ox_http.Server.Body.empty ()
     else
       let chunks = ref [ Bytes.of_string body ] in
-      Eta_http.Server.Body.of_reader (fun () ->
+      Ox_http.Server.Body.of_reader (fun () ->
           match !chunks with
           | [] -> Result.ok None
           | chunk :: rest ->
@@ -484,8 +484,8 @@ let request ?(method_ = "GET") ?(target = "/health") ?(body = "")
               Result.ok (Some chunk))
   in
   {
-    Eta_http.Server.Request.id = lazy "req-test";
-    version = Eta_http.Version.H1_1;
+    Ox_http.Server.Request.id = lazy "req-test";
+    version = Ox_http.Version.H1_1;
     scheme = "http";
     authority = Some "127.0.0.1";
     method_;
@@ -494,7 +494,7 @@ let request ?(method_ = "GET") ?(target = "/health") ?(body = "")
     query;
     headers;
     body;
-    trailers = (fun () -> Result.ok Eta_http.Header.empty);
+    trailers = (fun () -> Result.ok Ox_http.Header.empty);
     peer = { address = Some "127.0.0.1"; port = Some 43123 };
     tls = false;
     alpn_protocol = Some "http/1.1";
@@ -503,7 +503,7 @@ let request ?(method_ = "GET") ?(target = "/health") ?(body = "")
   }
 
 let response_body_string response =
-  match Eta_http.Server.Response.body response with
+  match Ox_http.Server.Response.body response with
   | Empty -> ""
   | Fixed chunks -> Bytes.to_string (Bytes.concat Bytes.empty chunks)
   | Stream _ -> Alcotest.fail "expected fixed response body"
@@ -536,7 +536,7 @@ let free_port () =
       | Unix.ADDR_UNIX _ -> Alcotest.fail "expected an inet socket")
 
 let http_get_opt ~sw:_ ~net:_ ~clock:_ client url =
-  match Eta_http.Client.request client ~method_:"GET" ~url () with
+  match Ox_http.Client.request client ~method_:"GET" ~url () with
   | Ok response -> Some (response.status, Bytes.to_string response.body)
   | Error _ -> None
 
@@ -1269,7 +1269,7 @@ let test_server_handler_ingests_and_queries_services () =
              (request ~method_:"POST" ~target:"/v1/traces" ~body:trace_fixture ()))
       in
       Alcotest.(check int)
-        "ingest status" 200 (Eta_http.Server.Response.status ingest);
+        "ingest status" 200 (Ox_http.Server.Response.status ingest);
       Alcotest.(check string)
         "ingest body" "{}\n" (response_body_string ingest);
       let ingest_ai =
@@ -1278,20 +1278,20 @@ let test_server_handler_ingests_and_queries_services () =
              (request ~method_:"POST" ~target:"/v1/traces" ~body:ai_trace_fixture ()))
       in
       Alcotest.(check int)
-        "ingest ai status" 200 (Eta_http.Server.Response.status ingest_ai);
+        "ingest ai status" 200 (Ox_http.Server.Response.status ingest_ai);
       let ingest_logs =
         run_server_effect
           (Inn.Server.handler config store
              (request ~method_:"POST" ~target:"/v1/logs" ~body:log_fixture ()))
       in
       Alcotest.(check int)
-        "ingest logs status" 200 (Eta_http.Server.Response.status ingest_logs);
+        "ingest logs status" 200 (Ox_http.Server.Response.status ingest_logs);
       let services =
         run_server_effect
           (Inn.Server.handler config store (request ~target:"/services" ()))
       in
       Alcotest.(check int)
-        "services status" 200 (Eta_http.Server.Response.status services);
+        "services status" 200 (Ox_http.Server.Response.status services);
       Alcotest.(check int)
         "services length" 1 (services |> response_json |> json_list_length "services");
       Alcotest.(check string)
@@ -1304,7 +1304,7 @@ let test_server_handler_ingests_and_queries_services () =
              (request ~target:"/spans/bbbbbbbbbbbbbbbb" ()))
       in
       Alcotest.(check int)
-        "span status" 200 (Eta_http.Server.Response.status span);
+        "span status" 200 (Ox_http.Server.Response.status span);
       Alcotest.(check string)
         "span id" "bbbbbbbbbbbbbbbb"
         (span |> response_json |> json_string_field "spanId");
@@ -1316,7 +1316,7 @@ let test_server_handler_ingests_and_queries_services () =
                   "/traces/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/spans?lookback=all" ()))
       in
       Alcotest.(check int)
-        "trace spans status" 200 (Eta_http.Server.Response.status trace_spans);
+        "trace spans status" 200 (Ox_http.Server.Response.status trace_spans);
       Alcotest.(check int)
         "trace spans length" 1
         (trace_spans |> response_json |> json_list_length "spans");
@@ -1328,7 +1328,7 @@ let test_server_handler_ingests_and_queries_services () =
                   "/api/traces/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/logs?lookback=all" ()))
       in
       Alcotest.(check int)
-        "trace logs status" 200 (Eta_http.Server.Response.status trace_logs);
+        "trace logs status" 200 (Ox_http.Server.Response.status trace_logs);
       Alcotest.(check int)
         "trace logs length" 1
         (trace_logs |> response_json |> json_list_length "logs");
@@ -1338,7 +1338,7 @@ let test_server_handler_ingests_and_queries_services () =
              (request ~target:"/spans/bbbbbbbbbbbbbbbb/logs?lookback=all" ()))
       in
       Alcotest.(check int)
-        "span logs status" 200 (Eta_http.Server.Response.status span_logs);
+        "span logs status" 200 (Ox_http.Server.Response.status span_logs);
       Alcotest.(check int)
         "span logs length" 1
         (span_logs |> response_json |> json_list_length "logs");
@@ -1352,7 +1352,7 @@ let test_server_handler_ingests_and_queries_services () =
       in
       Alcotest.(check int)
         "search spans status" 200
-        (Eta_http.Server.Response.status searched_spans);
+        (Ox_http.Server.Response.status searched_spans);
       Alcotest.(check int)
         "search spans length" 1
         (searched_spans |> response_json |> json_list_length "spans");
@@ -1366,7 +1366,7 @@ let test_server_handler_ingests_and_queries_services () =
       in
       Alcotest.(check int)
         "search traces status" 200
-        (Eta_http.Server.Response.status searched_traces);
+        (Ox_http.Server.Response.status searched_traces);
       Alcotest.(check int)
         "search traces length" 1
         (searched_traces |> response_json |> json_list_length "traces");
@@ -1380,7 +1380,7 @@ let test_server_handler_ingests_and_queries_services () =
       in
       Alcotest.(check int)
         "search logs status" 200
-        (Eta_http.Server.Response.status searched_logs);
+        (Ox_http.Server.Response.status searched_logs);
       Alcotest.(check int)
         "search logs length" 1
         (searched_logs |> response_json |> json_list_length "logs");
@@ -1391,7 +1391,7 @@ let test_server_handler_ingests_and_queries_services () =
                 ~target:"/ai/calls?model=gpt-test&provider=openai&lookback=all" ()))
       in
       Alcotest.(check int)
-        "ai calls status" 200 (Eta_http.Server.Response.status ai_calls);
+        "ai calls status" 200 (Ox_http.Server.Response.status ai_calls);
       Alcotest.(check int)
         "ai calls length" 1
         (ai_calls |> response_json |> json_list_length "calls");
@@ -1401,14 +1401,14 @@ let test_server_handler_ingests_and_queries_services () =
              (request ~target:"/ai/calls/dddddddddddddddd" ()))
       in
       Alcotest.(check int)
-        "ai call status" 200 (Eta_http.Server.Response.status ai_call);
+        "ai call status" 200 (Ox_http.Server.Response.status ai_call);
       let ai_stats =
         run_server_effect
           (Inn.Server.handler config store
              (request ~target:"/ai/stats?groupBy=model&agg=count&lookback=all" ()))
       in
       Alcotest.(check int)
-        "ai stats status" 200 (Eta_http.Server.Response.status ai_stats);
+        "ai stats status" 200 (Ox_http.Server.Response.status ai_stats);
       Alcotest.(check int)
         "ai stats length" 1
         (ai_stats |> response_json |> json_list_length "stats");
@@ -1421,7 +1421,7 @@ let test_server_handler_ingests_and_queries_services () =
                 ()))
       in
       Alcotest.(check int)
-        "trace stats status" 200 (Eta_http.Server.Response.status trace_stats);
+        "trace stats status" 200 (Ox_http.Server.Response.status trace_stats);
       Alcotest.(check int)
         "trace stats length" 1
         (trace_stats |> response_json |> json_list_length "stats");
@@ -1431,7 +1431,7 @@ let test_server_handler_ingests_and_queries_services () =
              (request ~target:"/logs/stats?groupBy=severity&service=svc&lookback=all" ()))
       in
       Alcotest.(check int)
-        "log stats status" 200 (Eta_http.Server.Response.status log_stats);
+        "log stats status" 200 (Ox_http.Server.Response.status log_stats);
       Alcotest.(check int)
         "log stats length" 1
         (log_stats |> response_json |> json_list_length "stats");
@@ -1443,7 +1443,7 @@ let test_server_handler_ingests_and_queries_services () =
                   "/facets?type=traces&field=attribute_keys&service=svc&lookback=all" ()))
       in
       Alcotest.(check int)
-        "facets status" 200 (Eta_http.Server.Response.status facets);
+        "facets status" 200 (Ox_http.Server.Response.status facets);
       Alcotest.(check int)
         "facets length" 7
         (facets |> response_json |> json_list_length "facets");
@@ -1452,7 +1452,7 @@ let test_server_handler_ingests_and_queries_services () =
           (Inn.Server.handler config store (request ~target:"/api/endpoints" ()))
       in
       Alcotest.(check int)
-        "endpoints status" 200 (Eta_http.Server.Response.status endpoints);
+        "endpoints status" 200 (Ox_http.Server.Response.status endpoints);
       Alcotest.(check int)
         "endpoint inventory is present" (List.length Inn.Endpoint.all)
         (endpoints |> response_json |> json_list_length "endpoints");
@@ -1461,7 +1461,7 @@ let test_server_handler_ingests_and_queries_services () =
           (Inn.Server.handler config store (request ~target:"/stats" ()))
       in
       Alcotest.(check int)
-        "stats status" 200 (Eta_http.Server.Response.status stats);
+        "stats status" 200 (Ox_http.Server.Response.status stats);
       Alcotest.(check bool)
         "stats body carries the retention section (ret-eeb1)" true
         (Yojson.Safe.Util.member "retention" (response_json stats) <> `Null);
@@ -1471,7 +1471,7 @@ let test_server_handler_ingests_and_queries_services () =
       in
       Alcotest.(check int)
         "instructions status" 200
-        (Eta_http.Server.Response.status instructions);
+        (Ox_http.Server.Response.status instructions);
       Alcotest.(check bool)
         "instructions body" true
         (String.length (response_body_string instructions) > 0);
@@ -1480,7 +1480,7 @@ let test_server_handler_ingests_and_queries_services () =
           (Inn.Server.handler config store (request ~target:"/openapi.json" ()))
       in
       Alcotest.(check int)
-        "openapi status" 200 (Eta_http.Server.Response.status openapi);
+        "openapi status" 200 (Ox_http.Server.Response.status openapi);
       Alcotest.(check string)
         "openapi version" "3.1.0"
         (openapi |> response_json |> json_string_field "openapi"))
@@ -1509,7 +1509,7 @@ let test_server_pruner_prunes_without_ingest () =
   Eio.Fiber.first
     (fun () -> Inn.Server.run ~sw ~env config)
     (fun () ->
-      let client = Eta_http.Client.create ~sw ~net ~clock () in
+      let client = Ox_http.Client.create ~sw ~net ~clock () in
       let base_url = Printf.sprintf "http://127.0.0.1:%d" port in
       let stats_json () =
         let status, body = http_get ~sw ~net ~clock client (base_url ^ "/stats") in
@@ -1599,7 +1599,7 @@ let test_otlp_conformance_handler () =
   Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
   run_store_scope @@ fun () ->
   let store = run_store (fun sw -> Store.open_ ~sw config) in
-  let post ?(headers = Eta_http.Header.empty) path body =
+  let post ?(headers = Ox_http.Header.empty) path body =
     run_server_effect (Inn.Server.handler config store
       (request ~method_:"POST" ~target:path ~body ~headers ())) in
   let get path = run_server_effect
@@ -1607,20 +1607,20 @@ let test_otlp_conformance_handler () =
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   List.iter (fun path ->
     let response = post path "" in
-    Alcotest.(check int) "empty status (otlp-dtfh)" 200 (Eta_http.Server.Response.status response);
+    Alcotest.(check int) "empty status (otlp-dtfh)" 200 (Ox_http.Server.Response.status response);
     Alcotest.(check bool) "OTLP empty response (otlp-2k5g)" true
       (response_json response = `Assoc [])) ["/v1/traces"; "/v1/logs"; "/v1/metrics"];
   let invalid = post "/v1/traces" "{" in
-  Alcotest.(check int) "bad JSON (otlp-qso2)" 400 (Eta_http.Server.Response.status invalid);
+  Alcotest.(check int) "bad JSON (otlp-qso2)" 400 (Ox_http.Server.Response.status invalid);
   Alcotest.(check bool) "INVALID_ARGUMENT body" true (member "code" (response_json invalid) = `Int 3);
-  let headers = Eta_http.Header.unsafe_of_list ["content-type", "application/x-protobuf"] in
+  let headers = Ox_http.Header.unsafe_of_list ["content-type", "application/x-protobuf"] in
   let unsupported = post ~headers "/v1/traces" "{}" in
-  Alcotest.(check int) "protobuf rejected (otlp-ohmj)" 415 (Eta_http.Server.Response.status unsupported);
+  Alcotest.(check int) "protobuf rejected (otlp-ohmj)" 415 (Ox_http.Server.Response.status unsupported);
   let oversized = post "/v1/traces" (String.make (32 * 1024 * 1024 + 1) ' ') in
-  Alcotest.(check int) "body cap (otlp-ohmj)" 413 (Eta_http.Server.Response.status oversized);
+  Alcotest.(check int) "body cap (otlp-ohmj)" 413 (Ox_http.Server.Response.status oversized);
   let payload = {|{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","spanId":"BBBBBBBBBBBBBBBB","name":"short","kind":2,"startTimeUnixNano":"1000000001","endTimeUnixNano":"1000000501","attributes":[{"key":"count","value":{"intValue":"7"}},{"key":"ai.model.id","value":{"stringValue":"example"}}],"events":[{"name":"instant","timeUnixNano":"1000000002"}],"links":[{"traceId":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC","spanId":"DDDDDDDDDDDDDDDD","attributes":[{"key":"weight","value":{"intValue":"3"}}]}]},{"traceId":"oops","spanId":"bbbbbbbbbbbbbbbb"}]}]}]}|} in
   let ingested = post "/v1/traces" payload in
-  Alcotest.(check int) "partial status (otlp-2k5g)" 200 (Eta_http.Server.Response.status ingested);
+  Alcotest.(check int) "partial status (otlp-2k5g)" 200 (Ox_http.Server.Response.status ingested);
   Alcotest.(check bool) "rejectedSpans (otlp-r73z)" true
     (member "rejectedSpans" (member "partialSuccess" (response_json ingested)) = `Int 1);
   let span = get "/api/spans/bbbbbbbbbbbbbbbb" in
@@ -1647,7 +1647,7 @@ let test_otlp_conformance_handler () =
       (get "/api/traces/stats?groupBy=operation&agg=count&status=ok&lookback=all"));
   let logs = post "/v1/logs"
     {|{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"0","observedTimeUnixNano":"1000000501","body":{"stringValue":"hello"}}]}]}]}|} in
-  Alcotest.(check int) "log ingested" 200 (Eta_http.Server.Response.status logs);
+  Alcotest.(check int) "log ingested" 200 (Ox_http.Server.Response.status logs);
   let logs_json = get "/api/logs?limit=10&lookback=all" in
   let rows = member "logs" logs_json in
   let log = match rows with `List (head :: _) -> head | _ -> Alcotest.fail "missing log" in
@@ -1686,12 +1686,12 @@ let test_otlp_store_retry () =
     (Inn.Server.handler config store
       (request ~method_:"POST" ~target:"/v1/traces" ~body:trace_fixture ())) in
   Alcotest.(check int) "closed store returns retryable (otlp-2wg5)" 503
-    (Eta_http.Server.Response.status response);
+    (Ox_http.Server.Response.status response);
   Alcotest.(check bool) "OTLP UNAVAILABLE" true
     (member "code" (response_json response) = `Int 14);
   Alcotest.(check (option string)) "Retry-After" (Some "1")
-    (Eta_http.Header.get "retry-after"
-      (Eta_http.Server.Response.headers response))
+    (Ox_http.Header.get "retry-after"
+      (Ox_http.Server.Response.headers response))
 
 (* Query windows and cursors --------------------------------------------- *)
 
@@ -1709,7 +1709,7 @@ let server_json config store path = server_get config store path |> response_jso
 let check_invalid_query label response fragment =
   Alcotest.(check int)
     (label ^ " status") 400
-    (Eta_http.Server.Response.status response);
+    (Ox_http.Server.Response.status response);
   let json = response_json response in
   Alcotest.(check string)
     (label ^ " code") "invalid_query" (json_string_field "error" json);
@@ -2687,25 +2687,25 @@ let test_trace_tree_warnings () =
 (* Test-only probe: the store never leaves a trace without its summary row, so
    the 404 rule needs one deleted by hand (tree-ddll). *)
 module Test_trace_summaries = struct
-  module T = Eta_sql.Table.Make (struct
+  module T = Ox_sql.Table.Make (struct
     let name = "trace_summaries"
   end)
 
   include T
 
-  let trace_id = column "trace_id" Eta_sql.text
+  let trace_id = column "trace_id" Ox_sql.text
 end
 
 let delete_trace_summary path trace_id =
   run_test_db path (fun pool ->
       let ( let* ) = Result.bind in
       let delete =
-        Eta_sql.Delete.(
+        Ox_sql.Delete.(
           from Test_trace_summaries.table
-          |> where Eta_sql.Expr.(eq Test_trace_summaries.trace_id trace_id)
+          |> where Ox_sql.Expr.(eq Test_trace_summaries.trace_id trace_id)
           |> compile)
       in
-      let* _ = Eta_sql.Pool.Typed.execute_compiled pool delete in
+      let* _ = Ox_sql.Pool.Typed.execute_compiled pool delete in
       Result.ok ())
 
 let test_trace_tree_handlers () =
@@ -2817,7 +2817,7 @@ let test_trace_tree_handlers () =
           let still = server_get config store ("/traces/" ^ trace_id) in
           Alcotest.(check int)
             "tree-ddll a trace without its summary row still answers" 200
-            (Eta_http.Server.Response.status still);
+            (Ox_http.Server.Response.status still);
           Alcotest.(check int) "tree-ddll and still has all its spans" 3
             (List.length (json_list "spans" (response_json still)));
           let missing =
@@ -2826,7 +2826,7 @@ let test_trace_tree_handlers () =
           in
           Alcotest.(check int)
             "tree-ddll a trace with no span at all is a 404" 404
-            (Eta_http.Server.Response.status missing)))
+            (Ox_http.Server.Response.status missing)))
 
 (* AI calls -------------------------------------------------------------- *)
 
@@ -2851,10 +2851,10 @@ let ai_span ?(trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     attributes;
   }
 
-(* An Eta gen_ai chat span: what eta_ai emits through provider_telemetry.ml. *)
-let eta_chat_span ?(trace_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+(* An Ox gen_ai chat span: what ox_ai emits through provider_telemetry.ml. *)
+let ox_chat_span ?(trace_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
     ?(span_id = "e000000000000001") ?(parent_span_id = None) () =
-  ai_span ~trace_id ~span_id ~parent_span_id ~service_name:"eta-app"
+  ai_span ~trace_id ~span_id ~parent_span_id ~service_name:"ox-app"
     ~operation_name:"chat gpt-4o" ~duration_ms:5_000.
     ~attributes:
       (ai_attrs
@@ -2878,10 +2878,10 @@ let eta_chat_span ?(trace_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
          ])
     ()
 
-let eta_tool_span ?(trace_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+let ox_tool_span ?(trace_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
     ?(span_id = "e000000000000002") ?(parent_span_id = Some "e000000000000001")
     () =
-  ai_span ~trace_id ~span_id ~parent_span_id ~service_name:"eta-app"
+  ai_span ~trace_id ~span_id ~parent_span_id ~service_name:"ox-app"
     ~operation_name:"execute_tool get_weather" ~duration_ms:5.
     ~attributes:
       (ai_attrs
@@ -2902,10 +2902,10 @@ let kind_of spans span =
 
 let test_ai_classification () =
   (* aic-cw6h, aic-jupv, aic-qs41 *)
-  let eta = eta_chat_span () in
+  let ox = ox_chat_span () in
   Alcotest.(check string)
     "aic-cw6h a GenAI chat span is an AI call" "call"
-    (kind_of [ eta ] eta);
+    (kind_of [ ox ] ox);
   let effect_chat =
     ai_span ~trace_id:"ffffffffffffffffffffffffffffffff"
       ~span_id:"f000000000000001" ~service_name:"effect-app"
@@ -2993,13 +2993,13 @@ let test_ai_classification () =
 
 let test_ai_extraction () =
   (* aic-q5qt, aic-kqhv, aic-fy0u, aic-gywl, aic-cw6h *)
-  let eta = eta_chat_span () in
-  let tool = eta_tool_span () in
+  let ox = ox_chat_span () in
+  let tool = ox_tool_span () in
   let children = [ tool ] in
-  let call = Ai.call_of_span ~children eta in
+  let call = Ai.call_of_span ~children ox in
   Alcotest.(check string) "aic-q5qt operation comes from the GenAI convention"
     "chat" call.operation;
-  Alcotest.(check string) "aic-q5qt service" "eta-app" call.service_name;
+  Alcotest.(check string) "aic-q5qt service" "ox-app" call.service_name;
   Alcotest.(check (option string)) "aic-q5qt provider" (Some "openai")
     call.provider;
   Alcotest.(check (option string)) "aic-q5qt model" (Some "gpt-4o") call.model;
@@ -3044,7 +3044,7 @@ let test_ai_extraction () =
   Alcotest.(check (option int)) "aic-kqhv response previews stop at 200 too"
     (Some 200)
     (Option.map String.length long_call.response_preview);
-  let detail = Ai.detail_of_span ~children eta in
+  let detail = Ai.detail_of_span ~children ox in
   Alcotest.(check int) "aic-fy0u the parsed prompt messages" 1
     (List.length detail.prompt.messages);
   Alcotest.(check (option string)) "aic-fy0u the raw prompt is kept"
@@ -3130,7 +3130,7 @@ let test_ai_extraction () =
   let evented =
     {
       (ai_span ~trace_id:"ffffffffffffffffffffffffffffffff"
-         ~span_id:"f00000000000000b" ~service_name:"eta-app"
+         ~span_id:"f00000000000000b" ~service_name:"ox-app"
          ~operation_name:"chat evented"
          ~attributes:(ai_attrs [ ("gen_ai.operation.name", "chat") ])
          ())
@@ -3152,7 +3152,7 @@ let test_ai_extraction () =
     (Some "evented") (Ai.call_of_span ~children:[] evented).prompt_preview;
   Alcotest.(check int) "aic-fy0u a GenAI prompt event parses into messages" 1
     (List.length evented_detail.prompt.messages);
-  let search = Ai.search_text ~children eta in
+  let search = Ai.search_text ~children ox in
   Alcotest.(check bool) "aic-gywl text covers the prompt" true
     (contains search "book a flight");
   Alcotest.(check bool) "aic-gywl text covers the response" true
@@ -3178,12 +3178,12 @@ let test_ai_call_store_and_handlers () =
           let call_id = "e000000000000001"
           and tool_id = "e000000000000002"
           and nested_id = "e000000000000003" in
-          let eta = eta_chat_span ~trace_id ~span_id:call_id () in
-          let tool = eta_tool_span ~trace_id ~span_id:tool_id
+          let ox = ox_chat_span ~trace_id ~span_id:call_id () in
+          let tool = ox_tool_span ~trace_id ~span_id:tool_id
               ~parent_span_id:(Some call_id) () in
           let nested =
             ai_span ~trace_id ~span_id:nested_id
-              ~parent_span_id:(Some call_id) ~service_name:"eta-app"
+              ~parent_span_id:(Some call_id) ~service_name:"ox-app"
               ~operation_name:"ai.generateText.doGenerate" ~duration_ms:30.
               ~attributes:
                 (ai_attrs
@@ -3225,7 +3225,7 @@ let test_ai_call_store_and_handlers () =
           ignore
             (run_store
                (fun _sw -> let ( let* ) = Result.bind in
-                let* _ = Store.ingest_traces store [ eta; tool; nested; failing ] in
+                let* _ = Store.ingest_traces store [ ox; tool; nested; failing ] in
                 let* _ = Store.ingest_logs store [ log ] in
                 Result.ok ()));
           let calls path = json_list "calls" (server_json config store path) in
@@ -3251,7 +3251,7 @@ let test_ai_call_store_and_handlers () =
                   all));
           Alcotest.(check string) "aic-q5qt the summary operation" "chat"
             (json_string_field "operation" call);
-          Alcotest.(check string) "aic-q5qt the summary service" "eta-app"
+          Alcotest.(check string) "aic-q5qt the summary service" "ox-app"
             (json_string_field "serviceName" call);
           Alcotest.(check string) "aic-q5qt the summary provider" "openai"
             (json_string_field "provider" call);
@@ -3467,7 +3467,7 @@ let test_ai_call_store_and_handlers () =
                  "total_output_tokens"; "total_tokens"; "error_rate" ]);
           let tool_miss = server_get config store ("/ai/calls/" ^ tool_id) in
           Alcotest.(check int) "aic-t8tl a tool call is a 404" 404
-            (Eta_http.Server.Response.status tool_miss);
+            (Ox_http.Server.Response.status tool_miss);
           let tool_body = response_json tool_miss in
           Alcotest.(check string) "aic-t8tl the hint names the kind" "tool"
             (json_string_field "kind" tool_body);
@@ -3478,7 +3478,7 @@ let test_ai_call_store_and_handlers () =
           let nested_miss = server_get config store ("/ai/calls/" ^ nested_id) in
           Alcotest.(check int)
             "aic-t8tl a nested provider span is a 404" 404
-            (Eta_http.Server.Response.status nested_miss);
+            (Ox_http.Server.Response.status nested_miss);
           Alcotest.(check string)
             "aic-t8tl the nested hint names the kind" "nested"
             (json_string_field "kind" (response_json nested_miss));
@@ -3489,7 +3489,7 @@ let test_ai_call_store_and_handlers () =
             server_get config store "/ai/calls/00000000000000ff"
           in
           Alcotest.(check int) "aic-t8tl an unknown span is a plain 404" 404
-            (Eta_http.Server.Response.status unknown);
+            (Ox_http.Server.Response.status unknown);
           Alcotest.(check bool)
             "aic-t8tl an unknown span has no parent hint" true
             (List.mem_assoc "kind" (match response_json unknown with
@@ -3770,10 +3770,10 @@ let test_declarations_drive_the_router () =
       Alcotest.(check bool)
         (method_ ^ " " ^ target ^ " is registered")
         true
-        (Eta_http.Server.Response.status response <> 405);
+        (Ox_http.Server.Response.status response <> 405);
       (match
-         Eta_http.Header.get "content-type"
-           (Eta_http.Server.Response.headers response)
+         Ox_http.Header.get "content-type"
+           (Ox_http.Server.Response.headers response)
        with
       | Some content_type when contains content_type "application/json" ->
           Alcotest.(check bool)
@@ -3804,7 +3804,7 @@ let test_declared_responses_match_handlers () =
         ^ (if required = [] then "" else "?" ^ String.concat "&" required)
       in
       let response = declared_request config store endpoint target in
-      let status = Eta_http.Server.Response.status response in
+      let status = Ox_http.Server.Response.status response in
       match declared_response endpoint status with
       | None ->
           Alcotest.failf "%s %s answered %d, which the declaration does not carry"
@@ -3883,10 +3883,10 @@ let test_hidden_routes_are_documented () =
   List.iter
     (fun path ->
       Alcotest.(check int) ("the " ^ path ^ " alias answers") 200
-        (Eta_http.Server.Response.status (server_get config store path)))
+        (Ox_http.Server.Response.status (server_get config store path)))
     [ "/api/healthz"; "/api/ready"; "/api/docs" ];
   Alcotest.(check int) "the /api ingest alias answers" 200
-    (Eta_http.Server.Response.status
+    (Ox_http.Server.Response.status
        (run_server_effect
           (Inn.Server.handler config store
              (request ~method_:"POST" ~target:"/api/v1/metrics" ()))))
@@ -3922,13 +3922,13 @@ let test_docs_endpoints () =
       let response = server_get config store ("/docs/" ^ guide.name) in
       Alcotest.(check int)
         (guide.name ^ " status") 200
-        (Eta_http.Server.Response.status response);
+        (Ox_http.Server.Response.status response);
       Alcotest.(check bool)
         (guide.name ^ " is served as Markdown")
         true
         (match
-           Eta_http.Header.get "content-type"
-             (Eta_http.Server.Response.headers response)
+           Ox_http.Header.get "content-type"
+             (Ox_http.Server.Response.headers response)
          with
         | Some value -> contains value "text/markdown"
         | None -> false);
@@ -3939,7 +3939,7 @@ let test_docs_endpoints () =
   let unknown = server_get config store "/docs/nope" in
   Alcotest.(check int)
     "an unknown guide is a 404" 404
-    (Eta_http.Server.Response.status unknown);
+    (Ox_http.Server.Response.status unknown);
   let body = response_json unknown in
   Alcotest.(check string)
     "the unknown guide code" "doc_not_found" (json_string_field "error" body);
@@ -3951,7 +3951,7 @@ let test_docs_endpoints () =
     (fun path ->
       Alcotest.(check int)
         (path ^ " alias") 200
-        (Eta_http.Server.Response.status (server_get config store path)))
+        (Ox_http.Server.Response.status (server_get config store path)))
     [ "/api/docs"; "/api/docs/debug" ]
 
 let test_guide_content () =
@@ -3992,11 +3992,11 @@ let test_guide_content () =
       "serviceName"; "/v1/traces"; "/v1/logs"; "/v1/metrics";
       "application/json";
     ];
-  check (guide "eta")
+  check (guide "ox")
     [
-      "Eta_otel.create"; "Eta_http.Client.create";
-      "Eta_observability.Logger.span"; "Eta_otel.reporter";
-      "Eta_otel.span_ids"; "Eta_otel.shutdown"; "~endpoint"; "eta_otel";
+      "Ox_otel.create"; "Ox_http.Client.create";
+      "Ox_observability.Logger.span"; "Ox_otel.reporter";
+      "Ox_otel.span_ids"; "Ox_otel.shutdown"; "~endpoint"; "ox_otel";
       "/v1/traces"; "/v1/logs"; "/v1/metrics";
     ]
 
@@ -4016,24 +4016,24 @@ let fenced_block language text =
   in
   find (String.split_on_char '\n' text)
 
-(* docs/guides/eta.md documents the exporter with one OCaml snippet, and
-   test/eta_guide_snippet.ml is that same snippet compiled against the real Eta
-   API (the stanza is enabled on the local-Eta build path). Keeping the two
+(* docs/guides/ox.md documents the exporter with one OCaml snippet, and
+   test/ox_guide_snippet.ml is that same snippet compiled against the real Ox
+   API (the stanza is enabled on the local-Ox build path). Keeping the two
    texts identical is what stops the guide from drifting away from an API it
    does not compile against. *)
 let test_eta_guide_snippet_is_compiled () =
   let guide =
-    read_repository_file [ "../docs/guides/eta.md"; "docs/guides/eta.md" ]
+    read_repository_file [ "../docs/guides/ox.md"; "docs/guides/ox.md" ]
   in
   let source =
     read_repository_file
-      [ "eta_guide_snippet.ml"; "../test/eta_guide_snippet.ml" ]
+      [ "ox_guide_snippet.ml"; "../test/ox_guide_snippet.ml" ]
   in
   match fenced_block "ocaml" guide with
-  | None -> Alcotest.fail "docs/guides/eta.md has no ocaml snippet"
+  | None -> Alcotest.fail "docs/guides/ox.md has no ocaml snippet"
   | Some block ->
       Alcotest.(check string)
-        "the guide's Eta snippet is test/eta_guide_snippet.ml verbatim" source
+        "the guide's Ox snippet is test/ox_guide_snippet.ml verbatim" source
         block
 
 let test_health_identity () =
@@ -4116,7 +4116,7 @@ let test_instructions_point_at_the_docs () =
         ("instructions link " ^ fragment) true
         (contains body fragment))
     [
-      "/docs"; "/docs/debug"; "/docs/effect"; "/docs/eta"; "/openapi.json";
+      "/docs"; "/docs/debug"; "/docs/effect"; "/docs/ox"; "/openapi.json";
       "/endpoints"; "/v1/traces"; "/v1/logs"; "/v1/metrics";
     ]
 let () =
@@ -4246,7 +4246,7 @@ let () =
           Alcotest.test_case "guide instructions (desc-wy48, desc-od3y, desc-62du)"
             `Quick test_guide_content;
           Alcotest.test_case
-            "the Eta guide snippet is the compiled source (guide-eta-snippet)"
+            "the Ox guide snippet is the compiled source (guide-ox-snippet)"
             `Quick test_eta_guide_snippet_is_compiled;
           Alcotest.test_case "health identity (desc-8syr, desc-lqpr)" `Quick
             test_health_identity;

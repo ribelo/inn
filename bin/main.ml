@@ -1,6 +1,6 @@
 open Cmdliner
 
-module H = Eta_http
+module H = Ox_http
 
 let version = Inn.Version.value
 
@@ -1080,7 +1080,7 @@ let docs_name_t =
   Arg.(
     value
     & pos 0 (some string) None
-    & info [] ~docv:"NAME" ~doc:"Guide name: debug, effect, or eta.")
+    & info [] ~docv:"NAME" ~doc:"Guide name: debug, effect, or ox.")
 
 let docs_cmd =
   cmd "docs" "List the Inn guides, or print one guide as Markdown."

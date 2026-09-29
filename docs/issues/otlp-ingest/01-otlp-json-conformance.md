@@ -32,7 +32,7 @@ exporters:
 
 `POST /v1/traces`, `/v1/logs`, and `/v1/metrics` follow the OTLP/HTTP
 specification for the JSON encoding. The only clients are Effect (TypeScript)
-with JSON serialization and Eta's `eta_otel`, which also sends JSON, so
+with JSON serialization and Ox's `ox_otel`, which also sends JSON, so
 protobuf and gzip are out of scope. Inn keeps nanosecond time precision. It
 normalizes kind and status to names, and keeps attribute value types and span
 links. It reports rejected items through `partialSuccess` and uses the
@@ -91,7 +91,7 @@ status codes OTLP defines for retryable and non-retryable failures.
 - Attribute-based log correlation fallback, with a valid hex id taken from the attributes (otlp-beaj).
 
 - Decoder unit tests use fixture payloads shaped like those from Effect's
-  `OtlpSerialization.layerJson` and from `eta_otel`. Capture one real payload
+  `OtlpSerialization.layerJson` and from `ox_otel`. Capture one real payload
   from each if practical. Cover empty requests, invalid ids, zero timestamps,
   kinds, statuses, typed attributes, links, and sub-millisecond spans
   (otlp-dtfh, otlp-r73z, otlp-6ul3, otlp-e9t0, otlp-5oj4, otlp-a16d,
@@ -111,6 +111,6 @@ status codes OTLP defines for retryable and non-retryable failures.
 
 ## Further Notes
 
-- Depends on the Eta migration spec and the schema versioning spec. It touches
+- Depends on the Ox migration spec and the schema versioning spec. It touches
   the same store code as the retention spec, so implement the two one after
   the other, not in parallel.

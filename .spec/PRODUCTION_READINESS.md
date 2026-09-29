@@ -11,9 +11,9 @@ verified. TUI and web UI parity with Motel are intentionally out of scope.
 - CLI read commands query the configured Inn server by default.
 - Direct database access is reserved for explicit offline/admin/debug flows.
 - OTLP traces, logs, and metrics are accepted as first-class signals.
-- Eta SQL typed APIs are used for application database access. Raw SQL is not
+- Ox SQL typed APIs are used for application database access. Raw SQL is not
   used in Inn application or test code.
-- Eta HTTP is used for the local API server and CLI HTTP client.
+- Ox HTTP is used for the local API server and CLI HTTP client.
 
 ## Required Non-TUI Motel Parity
 
@@ -46,7 +46,7 @@ verified. TUI and web UI parity with Motel are intentionally out of scope.
 - Errors are JSON, stable, and script-friendly.
 - CLI exits non-zero for failed HTTP/store operations.
 - Documentation covers build, run, configuration, API, CLI, and agent usage.
-- `flake.nix` provides the OxCaml/Eta development environment.
+- `flake.nix` provides the OxCaml/Ox development environment.
 
 ## Verification Gates
 

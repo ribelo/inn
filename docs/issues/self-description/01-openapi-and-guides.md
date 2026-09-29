@@ -25,7 +25,7 @@ Inn generates its OpenAPI document and endpoint inventory from the same
 per-endpoint declarations that drive request parsing. That includes the
 parameters, with types, defaults, and descriptions, and the response schemas.
 It serves a small set of Markdown guides: a debugging workflow for agents, an
-Effect OTLP setup guide, and an Eta `eta_otel` setup guide. The guides are
+Effect OTLP setup guide, and an Ox `ox_otel` setup guide. The guides are
 available over HTTP, the CLI, and MCP. Health reports version, start time, and
 uptime.
 
@@ -37,7 +37,7 @@ uptime.
 4. As an agent, I want `GET /docs` to list the available guides (name, title, path) and `GET /docs/{name}` to return one guide as Markdown, so that I can learn the debugging workflow from the server itself ^desc-bqwh
 5. As an agent, I want a "debug" guide describing how to investigate with Inn (find the service, narrow the window, search traces and logs, open the tree, check AI calls, use stats and facets), with example queries, so that I follow an effective workflow ^desc-wy48
 6. As an app developer, I want an "effect" guide showing how to point an Effect app's OtlpTracer, OtlpLogger, and metrics at Inn with JSON serialization, so that new apps are instrumented correctly ^desc-od3y
-7. As an app developer, I want an "eta" guide showing how to point an Eta app's `eta_otel` exporter at Inn, so that OCaml apps are instrumented correctly ^desc-62du
+7. As an app developer, I want an "ox" guide showing how to point an Ox app's `ox_otel` exporter at Inn, so that OCaml apps are instrumented correctly ^desc-62du
 8. As an agent using MCP, I want `inn_docs_index` and `inn_get_doc` tools, so that I can read the guides through MCP ^desc-s5j5
 9. As a CLI user, I want `inn docs` and `inn docs NAME`, so that I can read the guides in the terminal ^desc-85u9
 10. As an agent, I want `/health` to report `version`, `startedAt` (ISO 8601), and `uptimeSeconds`, so that I can tell which build is running and whether it restarted ^desc-8syr
@@ -70,8 +70,8 @@ uptime.
   instructions links (desc-bqwh, desc-7wwz, desc-8syr, desc-qv27).
 - A guide content smoke test: each guide is non-empty and mentions the
   endpoints it describes (desc-wy48, desc-od3y, desc-62du). Check the guide
-  instructions against real Effect and Eta exporter configuration in
-  /home/ribelo/projects/ribelo/effect-pie/src/otl.ts and Eta's lib/otel.
+  instructions against real Effect and Ox exporter configuration in
+  /home/ribelo/projects/ribelo/effect-pie/src/otl.ts and Ox's lib/otel.
 - MCP and CLI coverage (desc-s5j5, desc-85u9, desc-lqpr).
 
 ## Out of Scope

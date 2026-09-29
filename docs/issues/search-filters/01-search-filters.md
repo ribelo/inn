@@ -52,9 +52,9 @@ same filters.
 
 - **Substring matching** uses `LIKE` with an escape character. The user's
   `%`, `_`, and escape characters are escaped. Matching is case-insensitive
-  for ASCII, which is SQLite's default `LIKE` behavior. If Eta SQL's
+  for ASCII, which is SQLite's default `LIKE` behavior. If Ox SQL's
   expression builder cannot express `LIKE ... ESCAPE`, stop and report it as
-  an Eta gap. Do not paper over it.
+  an Ox gap. Do not paper over it.
 - No full-text index in this spec. Substring matching over the retained
   24-48 hours is expected to be fast enough, and it is more predictable than
   motel's token-prefix FTS. Revisit only if measurements show otherwise.

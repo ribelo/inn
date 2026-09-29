@@ -26,8 +26,8 @@ output tokens. Inn also has problems finding AI calls:
 - Detection runs after fetching 10,000 arbitrary spans, and has no
   minimum-duration or time-window filter.
 
-The apps that send to Inn are Effect (`effect/unstable/ai`) and Eta
-(`eta_ai`). Both follow the OpenTelemetry GenAI semantic conventions
+The apps that send to Inn are Effect (`effect/unstable/ai`) and Ox
+(`ox_ai`). Both follow the OpenTelemetry GenAI semantic conventions
 (`gen_ai.*`). Motel only understands the Vercel AI SDK `ai.*` keys.
 
 ## Solution
@@ -41,7 +41,7 @@ whichever convention the span uses.
 
 ## User Stories
 
-1. As an agent, I want AI calls detected from GenAI semantic-convention spans (such as `gen_ai.operation.name` chat or text_completion, or `gen_ai.request.model`) and from Vercel AI SDK top-level `ai.*` spans, so that calls from Effect, Eta, and Vercel apps all show up ^aic-cw6h
+1. As an agent, I want AI calls detected from GenAI semantic-convention spans (such as `gen_ai.operation.name` chat or text_completion, or `gen_ai.request.model`) and from Vercel AI SDK top-level `ai.*` spans, so that calls from Effect, Ox, and Vercel apps all show up ^aic-cw6h
 2. As an agent, I want nested provider spans (Vercel `ai.*.do*` under a top-level `ai.*` span) excluded when their parent is an AI call, so that one logical call is not listed twice ^aic-jupv
 3. As an agent, I want tool-execution spans (`gen_ai.operation.name=execute_tool`, Vercel `ai.toolCall`) classified as tool calls and not as AI calls, so that the call list shows model invocations ^aic-qs41
 4. As an agent, I want each AI call summary to include operation, service, provider, model, status, start time, duration, finish reason, session id, function id, user id, tool-call count, and usage (input, output, total, cached-input, and reasoning tokens, each nullable), so that I can scan calls quickly ^aic-q5qt
@@ -81,15 +81,15 @@ whichever convention the span uses.
   SQL. This bumps the schema version.
 - **Text search** is a case-insensitive literal substring match over the
   stored prompt, response, and tool content, as in the search filter spec.
-- Inspect Eta's `eta_ai` and Effect's `effect/unstable/ai` telemetry code
-  to confirm the exact keys they emit. Eta is at
-  /home/ribelo/projects/ribelo/ocaml/Eta/lib/ai. An Effect checkout is in the
+- Inspect Ox's `ox_ai` and Effect's `effect/unstable/ai` telemetry code
+  to confirm the exact keys they emit. Ox is at
+  /home/ribelo/projects/ribelo/ocaml/ox/lib/ai. An Effect checkout is in the
   node_modules of /home/ribelo/projects/ribelo/effect-pie. Build fixtures from
   what they actually emit.
 
 ## Testing Decisions
 
-- Unit tests for classification and extraction with fixtures for an Eta
+- Unit tests for classification and extraction with fixtures for an Ox
   gen_ai chat span, an Effect gen_ai span with a tool execution child, and a
   Vercel `ai.generateText` span with a `doGenerate` child and `ai.toolCall`
   children (aic-cw6h … aic-fy0u).

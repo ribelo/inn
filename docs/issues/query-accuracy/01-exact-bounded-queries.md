@@ -61,10 +61,10 @@ be exact, the response says so instead of silently truncating.
   (key, value) and owner. No owner-id lists are materialized in OCaml.
 - **Aggregates.** Count, avg, error-rate, and token sums use SQL
   `GROUP BY`. p95 uses a window function or an ordered fetch of just the
-  duration column per group; either way it is exact. If Eta SQL's typed
+  duration column per group; either way it is exact. If Ox SQL's typed
   builders cannot express `GROUP BY`, aggregate functions, window functions,
   or `EXISTS` subqueries, stop and report exactly which construct is
-  missing, so that an Eta ticket can be opened. Do not work around it with
+  missing, so that an Ox ticket can be opened. Do not work around it with
   in-memory scans.
 - **Trace participation.** Maintain a trace-to-service participation table
   at ingest, keyed by (trace id, service name) and maintained with the trace
@@ -76,7 +76,7 @@ be exact, the response says so instead of silently truncating.
   summaries (root service, root operation). The status facet comes from the
   trace summary's error count. Attribute facets count
   `DISTINCT trace_id` through the span-to-trace mapping.
-- **Indexes and upserts.** Eta now supports mixed-type column lists
+- **Indexes and upserts.** Ox now supports mixed-type column lists
   (`Q.Column.any`). Add the composite indexes the new queries need, such as
   (service_name, start time) and (trace_id, parent_span_id). Replace the span
   and trace-summary insert-then-update pairs with single

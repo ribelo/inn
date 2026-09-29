@@ -117,7 +117,7 @@ type metric_filter = {
 }
 
 type error =
-  [ Eta_sql.Pool.error
+  [ Ox_sql.Pool.error
   | `Invalid_store of string
   ]
 

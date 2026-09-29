@@ -1,7 +1,7 @@
-module H = Eta_http
-module S = Eta_http.Server
-module Service = Eta_http.Service
-module Serve = Eta_http.Service.Serve
+module H = Ox_http
+module S = Ox_http.Server
+module Service = Ox_http.Service
+module Serve = Ox_http.Service.Serve
 
 let max_body_bytes = 32 * 1024 * 1024
 
@@ -101,7 +101,7 @@ let health_fields config =
 let health config = json_response (`Assoc (health_fields config))
 
 (* Inn owns /ready (and /api/ready): retain the JSON identity and store check,
-   and report draining before Eta closes the listener (desc-dmuw, svc-pehm). *)
+   and report draining before Ox closes the listener (desc-dmuw, svc-pehm). *)
 let draining_response () =
   error_response_with_details 503 "not_ready" "server is draining"
     [ ("ready", `Bool false); ("store", `String "draining") ]
@@ -198,7 +198,7 @@ Documentation:
   %s/docs            guide index (name, title, path)
   %s/docs/debug      debugging workflow for agents
   %s/docs/effect     Effect app setup (OtlpTracer, OtlpLogger, OtlpMetrics)
-  %s/docs/eta        Eta app setup (eta_otel)
+  %s/docs/ox        Ox app setup (ox_otel)
   %s/openapi.json    OpenAPI 3.1: every parameter and response schema
   %s/endpoints       endpoint inventory
 |}
@@ -1134,7 +1134,7 @@ let with_shutdown_signals ~sw f =
     Atomic.set signal signo;
     Eio.Condition.broadcast changed
   in
-  (* Eio conditions are domain-local; like Eta_app, this must use Sys.signal,
+  (* Eio conditions are domain-local; like Ox_app, this must use Sys.signal,
      whose callback may close over the condition, rather than Sys.Safe.signal. *)
   let set_signal = (Sys.signal [@alert "-unsafe_multidomain"]) in
   let previous_term = set_signal Sys.sigterm (Sys.Signal_handle on_signal) in
@@ -1176,5 +1176,5 @@ let run ~sw ~env config =
           in
           with_shutdown_signals ~sw:serve_sw (fun stop ->
               Serve.h1 ~sw:serve_sw ~net ~clock ~addr ~stop
-                ~drain_timeout:(Eta.Duration.seconds 5)
+                ~drain_timeout:(Ox.Duration.seconds 5)
                 (handler config store))))

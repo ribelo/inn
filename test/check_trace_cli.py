@@ -138,7 +138,7 @@ try:
     assert docs.returncode == 0, (docs.returncode, docs.stderr)
     index = json.loads(docs.stdout)
     names = [guide["name"] for guide in index["guides"]]
-    assert names == ["debug", "effect", "eta"], index
+    assert names == ["debug", "effect", "ox"], index
     assert all(
         guide["path"] == "/docs/%s" % guide["name"]
         and guide["title"]

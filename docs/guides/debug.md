@@ -16,7 +16,7 @@ Default local server:
 
 If the app is already instrumented for another collector, point its OTLP
 endpoint at Inn. Otherwise see `GET /docs/effect` for an Effect app and
-`GET /docs/eta` for an Eta (OCaml) app.
+`GET /docs/ox` for an Ox (OCaml) app.
 
 ## Workflow
 
@@ -264,7 +264,7 @@ sends. Read this guide over MCP with `inn_get_doc {\"name\": \"debug\"}`.
 ## Discover the API
 
 - `GET /docs` lists the guides (name, title, path); `GET /docs/debug`,
-  `GET /docs/effect`, and `GET /docs/eta` return them as Markdown. An unknown
+  `GET /docs/effect`, and `GET /docs/ox` return them as Markdown. An unknown
   name is a 404 that lists the available names.
 - `GET /endpoints` is the machine-readable inventory: every route with its
   parameters, responses, and `/api` alias policy.

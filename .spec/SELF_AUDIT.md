@@ -40,14 +40,14 @@ Implemented non-TUI surfaces:
 - `instructions`, `endpoints`, `openapi`.
 - `mcp`.
 
-## Eta SQL Dogfooding
+## Ox SQL Dogfooding
 
-- Pass: application storage uses Eta SQL typed schema/query builders.
+- Pass: application storage uses Ox SQL typed schema/query builders.
 - Pass: raw SQL is not used for application/test storage access.
-- Pass: Eta SQL API gaps discovered during implementation are recorded in
-  `.spec/ETA_SQL_DOGFOODING.md`.
+- Pass: Ox SQL API gaps discovered during implementation are recorded in
+  `.spec/OX_SQL_DOGFOODING.md`.
 
-Known Eta SQL gaps are not release blockers because Inn uses typed
+Known Ox SQL gaps are not release blockers because Inn uses typed
 workarounds:
 
 - heterogeneous composite indexes;

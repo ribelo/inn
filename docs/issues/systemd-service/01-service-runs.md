@@ -17,9 +17,9 @@ the service that actually runs it.
 
 ## Solution
 
-After Inn builds on the latest Eta, install it into the shared OxCaml switch
-together with the latest Eta. Before that, confirm that the other installed
-Eta dependents in that switch (pie and grip) still build on that Eta. Restart
+After Inn builds on the latest Ox, install it into the shared OxCaml switch
+together with the latest Ox. Before that, confirm that the other installed
+Ox dependents in that switch (pie and grip) still build on that Ox. Restart
 the user service and check that it is healthy. Inn behaves well under systemd:
 it logs to stderr (journald), shuts down cleanly on SIGTERM, and its CLI hints
 mention the systemd service.
@@ -28,7 +28,7 @@ mention the systemd service.
 
 1. As a developer, I want `systemctl --user status inn` to show the service active after login, so that my apps' telemetry is collected ^svc-1qs5
 2. As a developer, I want `inn health` and `curl 127.0.0.1:27687/health` to succeed against the service, so that I can confirm it is up ^svc-v677
-3. As a developer, I want the shared switch's Eta upgraded only after pie and grip are shown to build on it, so that upgrading Inn does not break my other tools ^svc-is5q
+3. As a developer, I want the shared switch's Ox upgraded only after pie and grip are shown to build on it, so that upgrading Inn does not break my other tools ^svc-is5q
 4. As a developer, I want Inn to finish in-flight requests, stop the pruner, and close the store cleanly on SIGTERM, so that `systemctl --user restart inn` never leaves a damaged WAL or a hung process ^svc-pehm
 5. As a developer, I want the "cannot connect" hint in the CLI and MCP to mention `systemctl --user start inn` as well as `inn server`, so that the hint matches how Inn actually runs ^svc-xd4x
 6. As a developer, I want the server to log its listen address, database path, and retention settings to stderr at startup, so that `journalctl --user -u inn` shows its effective configuration ^svc-dh98
@@ -37,12 +37,12 @@ mention the systemd service.
 ## Implementation Decisions
 
 - **Install path (decided after the compatibility check).** pie and grip do
-  NOT build on current Eta master. They break on Eta_http.Client.t, the
-  Eta.Queue kinds, Eta_linux_input.Device.fd, and the Eta_otel.create and
-  shutdown signatures, all from Eta commit 992ed936. Upgrading Eta in the
+  NOT build on current Ox master. They break on Ox_http.Client.t, the
+  Ox.Queue kinds, Ox_linux_input.Device.fd, and the Ox_otel.create and
+  shutdown signatures, all from Ox commit 992ed936. Upgrading Ox in the
   shared switch would therefore break them, so this spec must not upgrade
-  Eta there. Instead, add a script that builds Inn against the local Eta (as
-  the existing local-Eta test script does). The script then installs only the
+  Ox there. Instead, add a script that builds Inn against the local Ox (as
+  the existing local-Ox test script does). The script then installs only the
   `inn` executable at the path the unit runs
   (`$OPAMROOT/5.4.0+ox/bin/inn`, with OPAMROOT defaulting to
   `~/.cache/opam`). It copies the binary to a temporary file in the same
@@ -50,7 +50,7 @@ mention the systemd service.
   `inn.service` if the unit exists, then checks health. Document this in the
   README as the service update command. Once pie and grip are ported, the
   opam-managed `inn-opam-install` path can replace it.
-- svc-is5q is satisfied by the decision not to touch Eta in the switch.
+- svc-is5q is satisfied by the decision not to touch Ox in the switch.
 - Do not restart pie or other services. The rebuilt pie binary takes effect
   at the next restart the user chooses.
 - SIGTERM: install a handler that cancels the server switch, so that the store
@@ -81,6 +81,6 @@ mention the systemd service.
 
 ## Further Notes
 
-- Depends on the Eta migration spec. It should run last, after the retention
+- Depends on the Ox migration spec. It should run last, after the retention
   and ingest specs land, so the service runs the fixed code. It can also run
   earlier and simply be repeated.

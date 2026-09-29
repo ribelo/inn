@@ -4,24 +4,24 @@
    set OTEL_EXPORTER_OTLP_ENDPOINT to export to a real collector instead. *)
 let start_collector ~sw ~net ~clock =
   let received = ref [] in
-  let router = Eta_http.Service.Router.create () in
+  let router = Ox_http.Service.Router.create () in
   let record req =
     let body =
-      match Eta_http.Service.Extractors.body_text req with
+      match Ox_http.Service.Extractors.body_text req with
       | Ok body -> body
       | Error _ -> ""
     in
-    received := (Eta_http.Service.Req.path req, body) :: !received;
+    received := (Ox_http.Service.Req.path req, body) :: !received;
     Ok
-      (Eta_http.Server.Response.text
+      (Ox_http.Server.Response.text
          ~headers:
-           (Eta_http.Header.unsafe_of_list
+           (Ox_http.Header.unsafe_of_list
               [ ("content-type", "application/json") ])
          "{}")
   in
   List.iter
     (fun path ->
-      Eta_http.Service.Router.add_exn router ~methods:[ "POST" ] path record)
+      Ox_http.Service.Router.add_exn router ~methods:[ "POST" ] path record)
     [ "/v1/traces"; "/v1/logs"; "/v1/metrics" ];
   let listener =
     Eio.Net.listen ~sw ~backlog:8 net (`Tcp (Eio.Net.Ipaddr.V4.loopback, 0))
@@ -32,8 +32,8 @@ let start_collector ~sw ~net ~clock =
     | _ -> assert false
   in
   Eio.Fiber.fork_daemon ~sw (fun () ->
-      Eta_http.Server.run_h1_on_socket ~sw ~clock ~socket:listener
-        (Eta_http.Service.Router.compile router);
+      Ox_http.Server.run_h1_on_socket ~sw ~clock ~socket:listener
+        (Ox_http.Service.Router.compile router);
       `Stop_daemon);
   (Printf.sprintf "http://127.0.0.1:%d" port, received)
 
@@ -73,37 +73,37 @@ let run () =
         let endpoint, received = start_collector ~sw ~net ~clock in
         (endpoint, Some received)
   in
-  let http_client = Eta_http.Client.create ~sw ~net ~clock () in
+  let http_client = Ox_http.Client.create ~sw ~net ~clock () in
   let exporter =
     match
-      Eta_otel.create ~sw ~clock ~http_client ~endpoint ~service_name:"my-app"
+      Ox_otel.create ~sw ~clock ~http_client ~endpoint ~service_name:"my-app"
         ~resource:[ ("service.version", "0.1.0") ] ()
     with
     | Ok exporter -> exporter
-    | Error error -> failwith (Format.asprintf "%a" Eta_otel.pp_error error)
+    | Error error -> failwith (Format.asprintf "%a" Ox_otel.pp_error error)
   in
   let logger =
-    Eta_observability.Logger.create ~service:"my-app" ~clock
-      ~mono_clock:stdenv#mono_clock ~reporter:(Eta_otel.reporter exporter)
-      ~span_ids:(Eta_otel.span_ids exporter) ()
+    Ox_observability.Logger.create ~service:"my-app" ~clock
+      ~mono_clock:stdenv#mono_clock ~reporter:(Ox_otel.reporter exporter)
+      ~span_ids:(Ox_otel.span_ids exporter) ()
   in
-  let meter = Eta_otel.meter exporter in
+  let meter = Ox_otel.meter exporter in
   let requests =
-    Eta_otel.Meter.counter meter ~name:"http.requests" ~unit_:"{request}"
+    Ox_otel.Meter.counter meter ~name:"http.requests" ~unit_:"{request}"
       ~description:"requests served" ()
   in
   let durations =
-    Eta_otel.Meter.histogram meter ~name:"http.request.duration" ~unit_:"ms"
+    Ox_otel.Meter.histogram meter ~name:"http.request.duration" ~unit_:"ms"
       ~boundaries:[ 10.0; 50.0; 200.0 ] ()
   in
   let result =
-    Eta_observability.Logger.span logger "http.request" (fun () ->
-        Eta_otel.Meter.add requests 1.0;
-        Eta_otel.Meter.record durations 42.0;
-        Eta_observability.Logger.info logger "work completed";
+    Ox_observability.Logger.span logger "http.request" (fun () ->
+        Ox_otel.Meter.add requests 1.0;
+        Ox_otel.Meter.record durations 42.0;
+        Ox_observability.Logger.info logger "work completed";
         Ok "ok")
   in
-  let settlement = Eta_otel.shutdown exporter in
+  let settlement = Ox_otel.shutdown exporter in
   (* shutdown settles the meter's window before returning, so the collector has
      already answered POST /v1/metrics when the example checks what it holds. *)
   (match received with Some received -> check_metrics received | None -> ());
@@ -114,4 +114,4 @@ let () =
   match settlement with
   | Ok () ->
       print_endline "spans, logs, the counter and the histogram reached the collector"
-  | Error error -> failwith (Format.asprintf "%a" Eta_otel.pp_error error)
+  | Error error -> failwith (Format.asprintf "%a" Ox_otel.pp_error error)

@@ -1,37 +1,37 @@
-# Eta SQL Dogfooding Notes
+# Ox SQL Dogfooding Notes
 
-Inn uses Eta SQL's typed builders for application storage:
+Inn uses Ox SQL's typed builders for application storage:
 
 - `Table.Make` for table and column declarations.
-- `Eta_schema.create_table` and `Eta_schema.create_index` for schema creation.
+- `Ox_schema.create_table` and `Ox_schema.create_index` for schema creation.
 - `Insert`, `Update`, `Delete`, and `Select` builders for writes and reads.
 - `Pool.Typed` and `Pool.with_transaction` for execution.
 
 Raw SQL is not part of the application store path, with one exception: SQLite
-pragmas. `Eta_sql.mli` documents `Pool.Raw` as the escape hatch for
+pragmas. `Ox_sql.mli` documents `Pool.Raw` as the escape hatch for
 "migrations, pragmas, diagnostics, and backend-specific SQL", and every pragma
 Inn runs goes through one helper in `lib/store.ml` built on it. Pragmas that
-`Eta_sql.Sqlite.config` covers (`journal_mode`, `synchronous`,
+`Ox_sql.Sqlite.config` covers (`journal_mode`, `synchronous`,
 `foreign_keys`, `cache_size`) are still supplied through the config.
 
 ## Resolved Gaps
 
-Eta commit `5a24b687` adds `Eta_sql.Column.any`. `create_index`,
+Ox commit `5a24b687` adds `Ox_sql.Column.any`. `create_index`,
 `on_conflict_do_nothing`, and `on_conflict_update ~set` now accept mixed-type
 column lists, which resolves the two heterogeneous-list gaps below. Inn wraps its
 columns with `Q.Column.any`. The query accuracy spec adopts composite indexes and
 single-statement upserts.
 
-Eta commit `d64f1e88` adds `Eta_sql_dsl.Expr.sum_int_nullable`,
+Ox commit `d64f1e88` adds `Ox_sql_dsl.Expr.sum_int_nullable`,
 `sum_float_nullable`, `avg_nullable`, `min_nullable`, `max_nullable`, and
-`coalesce`, also exposed as `Eta_sql.Expr.*` and `Eta_sql.Projection.*`. The
+`coalesce`, also exposed as `Ox_sql.Expr.*` and `Ox_sql.Projection.*`. The
 nullable aggregates accept a column whose declared type is already nullable,
 ignore NULL inputs, and decode an all-NULL group as `None`. Inn's AI call stats
 now use `Q.Projection.sum_int_nullable Ai_calls.input_tokens` (and the output and
 total token columns), so the non-nullable `Q.Table.alias` view described below is
 gone and the columns keep their real `Q.nullable` declaration end to end.
 
-None of the remaining gaps below is resolved by local Eta master at `d64f1e88`
+None of the remaining gaps below is resolved by local Ox master at `d64f1e88`
 (checked against its SQL public interfaces). Inn therefore keeps its typed
 builders and the workarounds described here.
 
@@ -44,20 +44,20 @@ SQLite database spins at 100% CPU inside `Pool.Typed.select` instead of
 returning an error when the pool's `Sqlite.config.synchronous` is `None`:
 
 {[
-(* Eta master, with the text "not a database" written to /tmp/bad.sqlite. *)
+(* Ox master, with the text "not a database" written to /tmp/bad.sqlite. *)
 let config =
-  { (Eta_sql.Sqlite.default_config "/tmp/bad.sqlite") with
+  { (Ox_sql.Sqlite.default_config "/tmp/bad.sqlite") with
     synchronous = None;
-    mode = Eta_sql.Sqlite.Read_write }
+    mode = Ox_sql.Sqlite.Read_write }
 in
 let query =
-  Eta_sql.Select.compile
-    Eta_sql.Select.(from Meta.table (Eta_sql.Projection.one Meta.key))
+  Ox_sql.Select.compile
+    Ox_sql.Select.(from Meta.table (Ox_sql.Projection.one Meta.key))
 in
-let* pool = Eta_sql.Pool.create ~default_timeout:(Eta.Duration.ms 5000) config in
-let* _rows = Eta_sql.Pool.Typed.select pool query in
-let* () = Eta_sql.Pool.shutdown pool in
-Eta.Effect.unit
+let* pool = Ox_sql.Pool.create ~default_timeout:(Ox.Duration.ms 5000) config in
+let* _rows = Ox_sql.Pool.Typed.select pool query in
+let* () = Ox_sql.Pool.shutdown pool in
+Ox.Effect.unit
 ]}
 
 The program never returns; the 5 s default operation timeout does not fire. With
@@ -71,7 +71,7 @@ the store's `synchronous` setting. Reported here so it is not lost.
 
 Retention needs `page_count`, `freelist_count`, and `page_size` to size live
 data, `auto_vacuum` to create new databases in incremental mode, and
-`incremental_vacuum` to return freed pages to the filesystem. `Eta_sql.Sqlite.config`
+`incremental_vacuum` to return freed pages to the filesystem. `Ox_sql.Sqlite.config`
 exposes no `auto_vacuum` field, and the DSL has no typed pragma builder, so Inn
 routes all five through one `Pool.Raw` helper. Two details make the raw route
 awkward: `auto_vacuum` only takes effect on an empty database and before any
@@ -83,12 +83,12 @@ escape hatch from the store.
 
 ### Heterogeneous Composite Indexes
 
-`Eta_schema.create_index` accepts a regular OCaml list of columns. That makes
+`Ox_schema.create_index` accepts a regular OCaml list of columns. That makes
 the list homogeneous at the column value type level, so mixed-type indexes such
 as `(service_name TEXT, timestamp_ms INTEGER)` cannot be expressed.
 
 Inn currently uses typed single-column indexes instead. For production query
-planning, Eta SQL should support heterogeneous column lists for schema indexes.
+planning, Ox SQL should support heterogeneous column lists for schema indexes.
 
 ### Heterogeneous Conflict Update Sets
 
@@ -97,7 +97,7 @@ requires all updated columns to have the same value type. Mixed-field upserts
 such as span or trace summary updates cannot be expressed directly.
 
 Inn currently emits a typed `INSERT ... ON CONFLICT DO NOTHING` followed by a
-typed `UPDATE ... SET ... WHERE ...` in the same transaction. Eta SQL should
+typed `UPDATE ... SET ... WHERE ...` in the same transaction. Ox SQL should
 support heterogeneous update-set lists for conflict updates.
 
 ### Transaction Body Error Type
@@ -107,5 +107,5 @@ That works for Inn's ingest/retention path, but it means application-level
 typed errors cannot be raised directly inside a transaction body.
 
 Inn keeps transaction internals pool-error-only and widens errors at the public
-store boundary. Eta SQL could consider a transaction helper whose body error can
+store boundary. Ox SQL could consider a transaction helper whose body error can
 be a supertype of pool errors.

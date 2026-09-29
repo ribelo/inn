@@ -1,6 +1,6 @@
 """innnext-8nuj: the guide's compiled example exports to a real, isolated Inn.
 
-The Eta guide's compiled snippet (test/eta_guide_snippet.ml) runs with
+The Ox guide's compiled snippet (test/ox_guide_snippet.ml) runs with
 OTEL_EXPORTER_OTLP_ENDPOINT pointing at an Inn server started on a free port
 and a temporary state directory, and the check then requires GET /metrics to
 return the counter and the histogram the example recorded. The running user
@@ -47,7 +47,7 @@ def wait_for_health(base_url, proc, deadline):
     raise AssertionError("inn did not answer /health")
 
 
-root = tempfile.mkdtemp(prefix="inn-eta-guide-")
+root = tempfile.mkdtemp(prefix="inn-ox-guide-")
 state_dir = os.path.join(root, "state")
 os.makedirs(state_dir)
 port = free_port()
@@ -111,7 +111,7 @@ try:
             "the histogram arrived as %r, not a histogram" % kinds.get(HISTOGRAM)
         )
     print(
-        "eta guide: %s and %s reached an isolated inn's POST /v1/metrics"
+        "ox guide: %s and %s reached an isolated inn's POST /v1/metrics"
         % (COUNTER, HISTOGRAM)
     )
 finally:

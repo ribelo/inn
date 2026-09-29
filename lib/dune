@@ -4,7 +4,7 @@
   ../tools/gen_docs/gen_docs.exe
   ../docs/guides/debug.md
   ../docs/guides/effect.md
-  ../docs/guides/eta.md)
+  ../docs/guides/ox.md)
  (action
   (with-stdout-to
    docs_data.ml
@@ -12,7 +12,7 @@
     %{dep:../tools/gen_docs/gen_docs.exe}
     debug:../docs/guides/debug.md
     effect:../docs/guides/effect.md
-    eta:../docs/guides/eta.md))))
+    ox:../docs/guides/ox.md))))
 
 (rule
  (targets version.ml)
@@ -24,4 +24,4 @@
 (library
  (name inn)
  (public_name inn)
- (libraries eta eta_http eta_sql eio eio.unix yojson unix))
+ (libraries ox ox_http ox_sql eio eio.unix yojson unix))

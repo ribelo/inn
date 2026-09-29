@@ -113,7 +113,7 @@ the enforced one. `/health` and `/healthz` report the build version, the ISO
 answers a metadata read and `503` otherwise.
 
 The guides are Markdown files under `docs/guides` compiled into the binary at
-build time (`debug`, `effect`, `eta`); `/docs` indexes them and
+build time (`debug`, `effect`, `ox`); `/docs` indexes them and
 `/docs/<name>` serves one, with a `404` that lists the available names.
 `/instructions` points at them and at the OpenAPI document.
 
@@ -204,10 +204,10 @@ position, and return one page: the rows plus the position of the last row when
 more exist. They fetch one row past the limit, so truncation is exact. The
 store never parses a query parameter.
 
-The store is implemented through Eta SQL's typed schema/query builders. The one
+The store is implemented through Ox SQL's typed schema/query builders. The one
 documented exception is SQLite pragmas, which have no typed API: `page_count`,
 `freelist_count`, `page_size`, `auto_vacuum`, and `incremental_vacuum` run
-through one store helper built on `Eta_sql.Pool.Raw`. No other raw SQL is used.
+through one store helper built on `Ox_sql.Pool.Raw`. No other raw SQL is used.
 
 The store owns one integer schema version, stored in `inn_meta`. Opening the
 store reads the file before any schema statement runs: a missing or empty

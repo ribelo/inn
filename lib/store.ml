@@ -1,5 +1,5 @@
-module Q = Eta_sql
-module Sqlite = Eta_sql.Sqlite
+module Q = Ox_sql
+module Sqlite = Ox_sql.Sqlite
 module String_set = Set.Make (String)
 
 type error =
@@ -347,7 +347,7 @@ module Sqlite_master = struct
 end
 
 let pp_error ppf = function
-  | `Eta_sql error -> Q.pp_error ppf error
+  | `Ox_sql error -> Q.pp_error ppf error
   | `Pool_shutdown -> Format.pp_print_string ppf "pool shutdown"
   | `Timeout -> Format.pp_print_string ppf "timeout"
   | `Invalid_store message -> Format.fprintf ppf "invalid store: %s" message
@@ -436,7 +436,7 @@ let events_of_json text =
   | exception _ -> []
 
 let q_schema_pool runner schema =
-  Q.Pool.Typed.run_schema runner (Q.Eta_schema.compile schema)
+  Q.Pool.Typed.run_schema runner (Q.Ox_schema.compile schema)
 
 let q_exec_pool runner query = Q.Pool.Typed.execute_compiled runner query
 
@@ -444,7 +444,7 @@ let q_select_pool runner query =
   Q.Pool.Typed.select runner (Q.Select.compile query)
 
 let q_schema runner schema =
-  Q.Pool.Typed.run_schema runner (Q.Eta_schema.compile schema)
+  Q.Pool.Typed.run_schema runner (Q.Ox_schema.compile schema)
   |> Result.map_error widen_pool_error
 
 let q_exec runner query =
@@ -483,7 +483,7 @@ let scalar operation rows =
   | _ -> Error (`Invalid_store (operation ^ " returned more than one row"))
 
 let schemas =
-  let open Q.Eta_schema in
+  let open Q.Ox_schema in
   [
     create_table ~if_not_exists:true Meta.table
       [ column ~primary_key:true Meta.key; column ~not_null:true Meta.value ];
@@ -700,7 +700,7 @@ let schemas =
    (schm-hnis). *)
 let schema_statements =
   List.map
-    (fun schema -> Q.Compiled.schema_sql (Q.Eta_schema.compile schema))
+    (fun schema -> Q.Compiled.schema_sql (Q.Ox_schema.compile schema))
     schemas
 
 let schema_fingerprint =
@@ -731,7 +731,7 @@ let sqlite_config path =
     cache_size = Some (-20_000);
   }
 
-(* Eta SQL has no typed pragma API. Eta_sql.mli documents [Pool.Raw] as the
+(* Ox SQL has no typed pragma API. Ox_sql.mli documents [Pool.Raw] as the
    escape hatch for "migrations, pragmas, diagnostics, and backend-specific
    SQL", so every pragma Inn runs goes through these two helpers, and no other
    raw SQL exists in the store. *)
@@ -1260,7 +1260,7 @@ let sort_stat_items limit (items : Model.stat_item list) =
   |> take limit
 
 (* LIKE's pattern is built from literal user text; '%' and '_' have no wildcard
-   meaning in filters (srch-zjff). Eta renders ESCAPE through its typed API. *)
+   meaning in filters (srch-zjff). Ox renders ESCAPE through its typed API. *)
 let literal_like_pattern text =
   let b = Buffer.create (String.length text + 2) in
   Buffer.add_char b '%';
@@ -2181,7 +2181,7 @@ let span_search_predicate ?(attr_contains = []) ?min_duration_ms
    aggregate never scans non-AI spans (acc-gkoz, aic-yfcd). Token totals are
    summed over the nullable token columns themselves: [sum_int_nullable]
    ignores NULL and decodes an all-NULL group as [None], so no alias is needed
-   (Eta d64f1e88; see .spec/ETA_SQL_DOGFOODING.md). *)
+   (Ox d64f1e88; see .spec/OX_SQL_DOGFOODING.md). *)
 
 let none_if_empty value = if String.equal value "" then None else Some value
 

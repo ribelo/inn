@@ -70,7 +70,7 @@ active retention settings and the last prune result.
   traces, never partial traces.
 - **Pruner placement.** The pruner is a server-lifetime fiber started by the
   server run function. It runs immediately, then sleeps for the interval
-  between runs, using the Eta and Eio clock so tests can drive it. Remove
+  between runs, using the Ox and Eio clock so tests can drive it. Remove
   retention from the three ingest transactions entirely. The pruner is
   cancelled with the server switch. A failed prune pass is logged and retried
   on the next interval; it must not crash the server.
@@ -82,9 +82,9 @@ active retention settings and the last prune result.
   order of 1,000) together with their attribute rows, inside one short
   transaction. Batches repeat until nothing expired remains. Id lists sent as
   bound parameters are capped at the batch size. A subquery-based delete is
-  preferred where Eta SQL can express it.
+  preferred where Ox SQL can express it.
 - **Size cap.** Live bytes are computed as (page count minus freelist count)
-  times page size. Eta SQL has no typed pragma API. Its sanctioned escape hatch
+  times page size. Ox SQL has no typed pragma API. Its sanctioned escape hatch
   for pragmas is Pool.Raw. Read and run pragmas (page_count, freelist_count,
   page_size, auto_vacuum, incremental_vacuum) through one small, clearly named
   store helper that uses it. Use no raw SQL anywhere else. Under size pressure,
@@ -135,6 +135,6 @@ active retention settings and the last prune result.
 
 ## Further Notes
 
-- Depends on the Eta migration spec and on the schema versioning spec.
+- Depends on the Ox migration spec and on the schema versioning spec.
 - Because the TTL uses ingestion time, the stored client timestamps stay
   purely descriptive.

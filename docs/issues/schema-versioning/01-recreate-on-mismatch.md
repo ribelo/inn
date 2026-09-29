@@ -61,4 +61,4 @@ schema-changing spec bumps the version.
 
 ## Further Notes
 
-- Depends on the Eta migration spec. The retention and query specs build on it.
+- Depends on the Ox migration spec. The retention and query specs build on it.

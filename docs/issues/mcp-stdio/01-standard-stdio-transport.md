@@ -69,4 +69,4 @@ at end of input. Logs go to stderr, never stdout.
 
 ## Further Notes
 
-- Depends on the Eta migration spec.
+- Depends on the Ox migration spec.

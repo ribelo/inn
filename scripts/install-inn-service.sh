@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# svc-k4u6, svc-is5q: build Inn against the local Eta checkout and install only
+# svc-k4u6, svc-is5q: build Inn against the local Ox checkout and install only
 # the inn executable into the shared OxCaml switch, then restart the systemd
 # user service that runs it.
 #
 #   ./scripts/install-inn-service.sh
 #
-# The script never runs `opam install`, `opam upgrade`, or `opam pin`: the Eta
+# The script never runs `opam install`, `opam upgrade`, or `opam pin`: the Ox
 # installed in the shared switch is left exactly as it is, because pie and grip
 # still build against it. Only $OPAMROOT/<switch>/bin/inn is replaced, by
 # staging a copy in the same directory and renaming it into place, so the
@@ -14,7 +14,7 @@
 # Options:
 #   --no-restart   install the binary, do not touch inn.service
 # Environment:
-#   ETA_PATH           Eta checkout (default: <inn>/../ocaml/Eta)
+#   OX_PATH           Ox checkout (default: <inn>/../ocaml/ox)
 #   OPAMROOT           opam root (default: ~/.cache/opam)
 #   INN_OPAM_SWITCH    switch name (default: 5.4.0+ox)
 #   INN_SYSTEMD_UNIT   user unit to restart (default: inn)
@@ -22,7 +22,7 @@
 set -euo pipefail
 
 inn_root="$(cd "$(dirname "$0")/.." && pwd -P)"
-eta_root="$(cd "${ETA_PATH:-$inn_root/../ocaml/Eta}" && pwd -P)"
+ox_root="$(cd "${OX_PATH:-$inn_root/../ocaml/ox}" && pwd -P)"
 opamroot="${OPAMROOT:-$HOME/.cache/opam}"
 switch="${INN_OPAM_SWITCH:-5.4.0+ox}"
 bin_dir="$opamroot/$switch/bin"
@@ -42,35 +42,35 @@ for arg in "$@"; do
 done
 
 if [[ "${1:-}" != --in-shell ]]; then
-  # The Eta Nix shell supplies the native SQLite/OpenSSL headers and pkg-config;
+  # The Ox Nix shell supplies the native SQLite/OpenSSL headers and pkg-config;
   # every OCaml dependency comes from the existing shared OxCaml switch.
-  exec nix develop "$eta_root" -c bash "$0" --in-shell "$@"
+  exec nix develop "$ox_root" -c bash "$0" --in-shell "$@"
 fi
 
 export OPAMROOT="$opamroot"
 eval "$(opam env --switch "$switch" --set-switch)"
 pkg-config --exists sqlite3 openssl || {
-  echo 'install-inn-service.sh: Eta needs SQLite and OpenSSL native libraries in the Nix shell.' >&2
+  echo 'install-inn-service.sh: Ox needs SQLite and OpenSSL native libraries in the Nix shell.' >&2
   exit 1
 }
 
-mirror="$inn_root/_dev/eta-source"
-prefix="$inn_root/_dev/eta-install"
+mirror="$inn_root/_dev/ox-source"
+prefix="$inn_root/_dev/ox-install"
 mkdir -p "$inn_root/_dev"
 rm -rf "$mirror" "$prefix"
 mkdir -p "$mirror"
 # Dune does not traverse directory symlinks. Mirror real directories and symlink
-# each source file, so edits in Eta are picked up without writing into Eta.
-cp -rs "$eta_root/lib" "$mirror/lib"
-ln -s "$eta_root/dune-project" "$mirror/dune-project"
+# each source file, so edits in Ox are picked up without writing into Ox.
+cp -rs "$ox_root/lib" "$mirror/lib"
+ln -s "$ox_root/dune-project" "$mirror/dune-project"
 
-packages=eta,eta_blocking,eta_sql_driver,eta_sql_dsl,eta_sql,eta_eio,eta_observability,eta_otel,eta_http,eta_http_h1,eta_http_h2,eta_http_tls_openssl,eta_http_ws,eta_stream,eta_http_eio,eta_router,eta_http_service,eta_http_service_eio
+packages=ox,ox_blocking,ox_sql_driver,ox_sql_dsl,ox_sql,ox_eio,ox_observability,ox_otel,ox_http,ox_http_h1,ox_http_h2,ox_http_tls_openssl,ox_http_ws,ox_stream,ox_http_eio,ox_router,ox_http_service,ox_http_service_eio
 dune build --root "$mirror" --only-packages "$packages" @install
 dune install --root "$mirror" --only-packages "$packages" --prefix "$prefix"
 
 export OCAMLPATH="$prefix/lib${OCAMLPATH:+:$OCAMLPATH}"
-if [[ "$(ocamlfind query eta_sql)" != "$prefix/lib/eta_sql" ]]; then
-  echo 'install-inn-service.sh: local Eta did not take precedence over the shared switch.' >&2
+if [[ "$(ocamlfind query ox_sql)" != "$prefix/lib/ox_sql" ]]; then
+  echo 'install-inn-service.sh: local Ox did not take precedence over the shared switch.' >&2
   exit 1
 fi
 

@@ -1,7 +1,7 @@
 # inn
 
 `inn` is a local OpenTelemetry collector and query service written in OxCaml
-on Eta. It stores traces, logs, and metrics in one user-level SQLite database
+on Ox. It stores traces, logs, and metrics in one user-level SQLite database
 and exposes cwd-independent HTTP and CLI query surfaces.
 
 ## State
@@ -51,25 +51,25 @@ a short-lived debugging cache.
 ## Build
 
 With the existing shared OxCaml opam switch (`~/.cache/opam/5.4.0+ox`) and a
-local Eta checkout next to Inn, run the local-source build and full test suite:
+local Ox checkout next to Inn, run the local-source build and full test suite:
 
 ```sh
-./scripts/test-local-eta.sh
+./scripts/test-local-ox.sh
 ```
 
-Set `ETA_PATH=/path/to/Eta` before the command if the checkout is elsewhere.
-The script enters Eta's Nix shell for native SQLite/OpenSSL dependencies, uses
+Set `OX_PATH=/path/to/Ox` before the command if the checkout is elsewhere.
+The script enters Ox's Nix shell for native SQLite/OpenSSL dependencies, uses
 only the OCaml packages already installed in the shared switch, and builds a
-source-file-symlink mirror of Eta under ignored `_dev/`. It installs the
-needed Eta libraries under `_dev/eta-install`, then builds and tests Inn
+source-file-symlink mirror of Ox under ignored `_dev/`. It installs the
+needed Ox libraries under `_dev/ox-install`, then builds and tests Inn
 with that local installation first in `OCAMLPATH`. It neither pins nor
-installs packages into the shared switch and does not edit Eta. Missing OCaml
+installs packages into the shared switch and does not edit Ox. Missing OCaml
 dependencies must be addressed outside this workflow, not installed into the
 shared switch.
 
-The same run compiles the Eta guide's exporter snippet
-(`test/eta_guide_snippet.ml`) against that local Eta and fails when
-`docs/guides/eta.md` no longer carries it verbatim, so the guide cannot drift
+The same run compiles the Ox guide's exporter snippet
+(`test/ox_guide_snippet.ml`) against that local Ox and fails when
+`docs/guides/ox.md` no longer carries it verbatim, so the guide cannot drift
 from the API it documents.
 
 The Alcotest suite runs with `EIO_BACKEND=posix` (set by `test/dune`). Each
@@ -78,7 +78,7 @@ fails with `ENOMEM` under a small per-user locked-memory cap, which hides real
 failures. The posix backend is the same Eio API without io_uring; the server
 itself keeps the default backend.
 
-To check Inn against the previously installed Eta in the shared switch instead:
+To check Inn against the previously installed Ox in the shared switch instead:
 
 ```sh
 export OPAMROOT="$HOME/.cache/opam"
@@ -108,7 +108,7 @@ it stops accepting connections, closes idle keep-alives, and gives in-flight
 requests up to five seconds to finish before cancelling any that remain. It
 then cancels and awaits the pruner, closes the store, and exits 0, so a restart
 never leaves a hung process or an unclean WAL behind. Inn owns `/ready` (and
-`/api/ready`) rather than Eta’s plain-text readiness wrapper: it retains the
+`/api/ready`) rather than Ox’s plain-text readiness wrapper: it retains the
 JSON identity and store check, and returns `503` when draining.
 
 Default server address:
@@ -128,15 +128,15 @@ service in one step after any Inn change:
 ./scripts/install-inn-service.sh
 ```
 
-The script builds Inn against the local Eta checkout, exactly as
-`./scripts/test-local-eta.sh` does (set `ETA_PATH=/path/to/Eta` when the
+The script builds Inn against the local Ox checkout, exactly as
+`./scripts/test-local-ox.sh` does (set `OX_PATH=/path/to/Ox` when the
 checkout is elsewhere), and installs only the `inn` executable into the shared
 OxCaml switch at `$OPAMROOT/5.4.0+ox/bin/inn` (`OPAMROOT` defaults to
 `~/.cache/opam`). It copies the binary to a temporary file in that same
 directory and renames it into place, so the service never observes a half
 written executable. It then restarts `inn.service` when the unit exists and
 waits for `$INN_BASE_URL/health` (default `http://127.0.0.1:27687`) to answer.
-It never runs `opam install`, `opam upgrade`, or `opam pin`, so the Eta
+It never runs `opam install`, `opam upgrade`, or `opam pin`, so the Ox
 installed in the shared switch is left exactly as it is and pie and grip keep
 building against it.
 
@@ -218,7 +218,7 @@ depend on a checkout path at run time:
   facets.
 - `effect` — point an Effect app's `OtlpTracer`, `OtlpLogger`, and
   `OtlpMetrics` layers at Inn with JSON serialization.
-- `eta` — point an Eta app's `eta_otel` exporter at Inn.
+- `ox` — point an Ox app's `ox_otel` exporter at Inn.
 
 An unknown name is a `404` whose body lists the available names.
 
@@ -473,16 +473,16 @@ List and search tools take `lookback` and `cursor`. `inn_stats`,
 does, and `inn_ai_stats` groups by every field the API accepts. The tool
 arguments become the same HTTP query parameters the CLI sends.
 
-## Eta SQL
+## Ox SQL
 
-The store uses Eta SQL typed builders for schema, writes, reads, and
+The store uses Ox SQL typed builders for schema, writes, reads, and
 transactions. Raw SQL is not used in the application storage path. The one
 exception is SQLite pragmas, which have no typed API: `page_count`,
 `freelist_count`, `page_size`, `auto_vacuum`, and `incremental_vacuum` all run
-through one store helper that uses `Eta_sql.Pool.Raw`, the escape hatch
-`Eta_sql.mli` documents for pragmas. AI token totals are summed over the
+through one store helper that uses `Ox_sql.Pool.Raw`, the escape hatch
+`Ox_sql.mli` documents for pragmas. AI token totals are summed over the
 nullable token columns with `Q.Projection.sum_int_nullable`: NULL inputs are
 ignored and a group with no reported tokens decodes as `None`, so the columns
-keep their `Q.nullable` declaration and no alias is needed (Eta `d64f1e88`).
-Known Eta SQL API gaps found while building Inn are recorded in
-[.spec/ETA_SQL_DOGFOODING.md](.spec/ETA_SQL_DOGFOODING.md).
+keep their `Q.nullable` declaration and no alias is needed (Ox `d64f1e88`).
+Known Ox SQL API gaps found while building Inn are recorded in
+[.spec/OX_SQL_DOGFOODING.md](.spec/OX_SQL_DOGFOODING.md).

@@ -1,8 +1,8 @@
 """svc-k4u6: one documented, repeatable command reinstalls Inn into the shared
 switch: scripts/install-inn-service.sh, as documented in the README.
-svc-is5q: that command never upgrades the Eta installed in the shared switch --
-it builds against the local Eta checkout and installs only the inn executable,
-so pie and grip keep building against the Eta they were built with.
+svc-is5q: that command never upgrades the Ox installed in the shared switch --
+it builds against the local Ox checkout and installs only the inn executable,
+so pie and grip keep building against the Ox they were built with.
 
 The first half checks the README and the script text. The second half runs the
 real script with stubbed nix/opam/pkg-config/dune/ocamlfind/systemctl/curl on
@@ -51,11 +51,11 @@ try:
     os.makedirs(os.path.join(root, "scripts"))
     shutil.copy2(script, os.path.join(root, "scripts", "install-inn-service.sh"))
 
-    eta = os.path.join(root, "eta")
-    os.makedirs(os.path.join(eta, "lib", "eta"))
-    with open(os.path.join(eta, "lib", "eta", "eta.ml"), "w") as handle:
+    ox = os.path.join(root, "ox")
+    os.makedirs(os.path.join(ox, "lib", "ox"))
+    with open(os.path.join(ox, "lib", "ox", "ox.ml"), "w") as handle:
         handle.write("(* stub *)\n")
-    with open(os.path.join(eta, "dune-project"), "w") as handle:
+    with open(os.path.join(ox, "dune-project"), "w") as handle:
         handle.write("(lang dune 3.21)\n")
 
     opamroot = os.path.join(root, "opam")
@@ -112,8 +112,8 @@ try:
         "ocamlfind",
         "#!/usr/bin/env bash\n"
         'echo "ocamlfind $*" >> "$FAKE_LOG"\n'
-        'if [ "$1" = query ] && [ "$2" = eta_sql ]; then\n'
-        '  echo "$FAKE_INN_ROOT/_dev/eta-install/lib/eta_sql"\n'
+        'if [ "$1" = query ] && [ "$2" = ox_sql ]; then\n'
+        '  echo "$FAKE_INN_ROOT/_dev/ox-install/lib/ox_sql"\n'
         "  exit 0\n"
         "fi\n"
         "exit 1\n",
@@ -131,7 +131,7 @@ try:
 
     env = dict(os.environ)
     env["PATH"] = fakebin + os.pathsep + env["PATH"]
-    env["ETA_PATH"] = eta
+    env["OX_PATH"] = ox
     env["OPAMROOT"] = opamroot
     env["FAKE_LOG"] = calls_path
     env["FAKE_INN_ROOT"] = root

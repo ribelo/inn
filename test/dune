@@ -1,8 +1,8 @@
 (test
  (name test_inn)
  (package inn)
- (deps ../README.md ../docs/guides/eta.md eta_guide_snippet.ml)
- (libraries inn alcotest eta eta_http eta_sql eio_main unix)
+ (deps ../README.md ../docs/guides/ox.md ox_guide_snippet.ml)
+ (libraries inn alcotest ox ox_http ox_sql eio_main unix)
  ; The suite starts many short-lived Eio runtimes. Each io_uring ring locks
  ; memory against a per-user cap that this sandbox sets to 8 MiB, so under
  ; contention with other processes Eio_main.run fails with
@@ -19,26 +19,26 @@
  (package inn)
  (libraries inn alcotest yojson))
 
-; The Eta guide's exporter snippet, compiled against the real Eta API. The
-; Alcotest suite checks that docs/guides/eta.md carries exactly this source, so
+; The Ox guide's exporter snippet, compiled against the real Ox API. The
+; Alcotest suite checks that docs/guides/ox.md carries exactly this source, so
 ; the guide cannot drift from an API it does not compile against. Enable
 ; the compiled example, and the check that runs it against a real isolated Inn,
 ; with INN_ETA_GUIDE_SNIPPET=1.
 
 (executable
- (name eta_guide_snippet)
+ (name ox_guide_snippet)
  (enabled_if
   (= %{env:INN_ETA_GUIDE_SNIPPET=0} 1))
  (flags
   (:standard -w -32))
- (libraries eta eta_observability eta_otel eta_http eio_main))
+ (libraries ox ox_observability ox_otel ox_http eio_main))
 
 (rule
  (alias runtest)
  (enabled_if
   (= %{env:INN_ETA_GUIDE_SNIPPET=0} 1))
  (action
-  (run ./eta_guide_snippet.exe)))
+  (run ./ox_guide_snippet.exe)))
 
 (cram
  (deps
@@ -61,6 +61,6 @@
  (alias runtest)
  (enabled_if
   (= %{env:INN_ETA_GUIDE_SNIPPET=0} 1))
- (deps ../bin/main.exe eta_guide_snippet.exe check_eta_guide.py)
+ (deps ../bin/main.exe ox_guide_snippet.exe check_eta_guide.py)
  (action
-  (run python3 check_eta_guide.py ../bin/main.exe eta_guide_snippet.exe)))
+  (run python3 check_eta_guide.py ../bin/main.exe ox_guide_snippet.exe)))

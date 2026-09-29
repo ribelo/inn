@@ -276,7 +276,7 @@ let mcp_tools =
     mcp_tool "inn_openapi" "Fetch Inn OpenAPI JSON." [];
     mcp_tool "inn_docs_index" "List the available Inn guides." [];
     mcp_tool ~required:[ "name" ] "inn_get_doc"
-      "Read one Inn guide as Markdown by name (debug, effect, or eta)."
+      "Read one Inn guide as Markdown by name (debug, effect, or ox)."
       [ ("name", mcp_string_property "Guide name from inn_docs_index") ];
   ]
 

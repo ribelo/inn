@@ -2,7 +2,7 @@
 
 ## Goal
 
-Build `inn`, an OxCaml/Eta local telemetry collector and query tool that
+Build `inn`, an OxCaml/Ox local telemetry collector and query tool that
 replaces the useful parts of `motel` without current-working-directory-coupled
 behavior.
 
@@ -82,18 +82,18 @@ Observed behavior:
 `inn` should preserve the good property, cwd-independent server queries, and
 discard the broken property, cwd-derived daemon/database selection.
 
-## Eta Direction
+## Ox Direction
 
-Use Eta as the implementation substrate.
+Use Ox as the implementation substrate.
 
-Relevant local Eta surfaces:
+Relevant local Ox surfaces:
 
-- `eta_http_eio` for the local HTTP server.
-- `eta_sql.Table`, `Eta_schema`, `Insert`, `Select`, `Update`, `Delete`, and
+- `ox_http_eio` for the local HTTP server.
+- `ox_sql.Table`, `Ox_schema`, `Insert`, `Select`, `Update`, `Delete`, and
   `Pool.Typed` for SQLite access.
-- `eta_sql.Sqlite` only for connection configuration and backend-specific
+- `ox_sql.Sqlite` only for connection configuration and backend-specific
   settings exposed through typed/configured APIs.
-- `eta_otel` as the existing OTLP/HTTP JSON emitter surface that `inn` should
+- `ox_otel` as the existing OTLP/HTTP JSON emitter surface that `inn` should
   ingest from.
 
 SQLite is the natural durable store for spans and logs. LadybugDB is not the
@@ -101,9 +101,9 @@ default storage choice for OTLP telemetry because its graph/Cypher model does
 not match the primary ingest/query workload as directly as SQLite tables and
 indexes.
 
-Application storage code should not use raw SQL strings when Eta SQL can express
-the operation. If Eta SQL cannot express a production-relevant operation, record
-the gap so Eta can be improved.
+Application storage code should not use raw SQL strings when Ox SQL can express
+the operation. If Ox SQL cannot express a production-relevant operation, record
+the gap so Ox can be improved.
 
 Metrics are stored and queried as a first-class signal alongside traces and
 logs.
