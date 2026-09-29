@@ -380,7 +380,7 @@ let run_test_db path program =
   let program =
     let* pool =
       Ox_sql.Pool.create
-        ~sw ~default_timeout:5.
+        ~sw ~default_timeout:(Ox.Duration.seconds 5)
         (Ox_sql.Sqlite.default_config path)
     in
     let* value = program pool in

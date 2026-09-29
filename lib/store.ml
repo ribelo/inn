@@ -795,7 +795,7 @@ let with_local_pool ?mode path f =
   Eio.Switch.run (fun sw ->
       let open Result.Syntax in
       let* pool =
-        Q.Pool.create ~sw ~default_timeout:5.0 ~max_size:1
+        Q.Pool.create ~sw ~default_timeout:(Ox.Duration.seconds 5) ~max_size:1
           (local_sqlite_config ?mode path)
         |> Result.map_error widen_pool_error
       in
@@ -914,7 +914,7 @@ let open_ ~sw ?(now_ms = wall_now_ms) ?(report = default_report) config =
             sqlite_pragma pool "auto_vacuum = INCREMENTAL")
   in
   let* pool =
-    Q.Pool.create ~sw ~default_timeout:5.0 ~max_size:4
+    Q.Pool.create ~sw ~default_timeout:(Ox.Duration.seconds 5) ~max_size:4
       (sqlite_config path)
     |> Result.map_error widen_pool_error
   in
