@@ -1,30 +1,23 @@
 open Cmdliner
 
 module H = Ox_http
+module Cap = Ox_caps.Cap
 
 let version = Inn.Version.value
 
-type door = {
-  caps : Ox_caps.Cap.all_caps;
+(* ^inndoor-k4px: runtime ownership is explicit; capabilities travel separately. *)
+type runtime = {
   base : Eio_unix.Stdenv.base;
   owned : (Eio.Switch.t -> int) -> int;
 }
 
-let door_slot = ref None
-
-let door () =
-  match !door_slot with
-  | Some door -> door
-  | None -> invalid_arg "Inn capabilities come from the Door"
-
 let exn_hook = ref (fun _exn -> ("internal error", 125))
 
-let delay body =
+let delay ~caps:(caps : < Cap.stderr; .. >) body =
   fun () ->
     try body ()
     with exn ->
       let message, code = !exn_hook exn in
-      let caps = (door ()).caps in
       Ox_caps.Cap_stdlib.prerr_endline ~caps message;
       code
 
@@ -38,7 +31,7 @@ let env_with_overrides ~caps overrides key =
   | Some (Some value) -> Some value
   | _ -> getenv ~caps key
 
-let config state_dir db_path host port base_url retention_hours
+let config ~caps:(caps : < Cap.env; .. >) state_dir db_path host port base_url retention_hours
     traces_retention_hours logs_retention_hours metrics_retention_hours
     prune_interval_seconds max_db_size_mb =
   let int_override = Option.map string_of_int in
@@ -57,7 +50,6 @@ let config state_dir db_path host port base_url retention_hours
       ("INN_MAX_DB_SIZE_MB", int_override max_db_size_mb);
     ]
   in
-  let caps = (door ()).caps in
   match Inn.Config.resolve ~caps ~env:(env_with_overrides ~caps overrides) () with
   | Ok config -> config
   | Error message -> failwith message
@@ -135,9 +127,9 @@ let max_db_size_mb_t =
     & info [ "max-db-size-mb" ] ~docv:"MB"
         ~doc:"Target maximum live database size.")
 
-let config_t =
+let config_t ~caps =
   Term.(
-    const config $ state_dir_t $ db_path_t $ host_t $ port_t $ base_url_t
+    const (config ~caps) $ state_dir_t $ db_path_t $ host_t $ port_t $ base_url_t
     $ retention_hours_t $ traces_retention_hours_t $ logs_retention_hours_t
     $ metrics_retention_hours_t $ prune_interval_seconds_t $ max_db_size_mb_t)
 
@@ -198,14 +190,13 @@ let describe_http_error = function
   | `Body_too_large -> "HTTP response exceeds body limit"
   | `Closed -> "HTTP connection closed"
 
-let http_request config method_ path =
+let http_request ~runtime config method_ path =
   let url = trim_trailing_slash config.Inn.Config.base_url ^ path in
-  let door = door () in
   let outcome = ref None in
   ignore
-    (door.owned (fun sw ->
-         let net = Eio.Stdenv.net door.base in
-         let clock = Eio.Stdenv.clock door.base in
+    (runtime.owned (fun sw ->
+         let net = Eio.Stdenv.net runtime.base in
+         let clock = Eio.Stdenv.clock runtime.base in
          (try
             let client = H.Client.create ~sw ~net ~clock () in
             outcome :=
@@ -230,9 +221,8 @@ let friendly_http_error config message =
       config.Inn.Config.base_url
   else message
 
-let run_http config method_ path =
-  let caps = (door ()).caps in
-  match http_request config method_ path with
+let run_http ~caps:(caps : < Cap.stdout; Cap.stderr; .. >) ~runtime config method_ path =
+  match http_request ~runtime config method_ path with
   | Ok (status, body) when status >= 200 && status < 300 ->
       Ox_caps.Cap_stdlib.print_string ~caps body;
       0
@@ -243,10 +233,9 @@ let run_http config method_ path =
       Ox_caps.Cap_stdlib.prerr_endline ~caps (friendly_http_error config message);
       1
 
-let server config =
-  let door = door () in
-  door.owned (fun sw ->
-      Inn.Server.run ~caps:door.caps ~sw ~env:door.base config;
+let server ~caps ~runtime config =
+  runtime.owned (fun sw ->
+      Inn.Server.run ~caps ~sw ~env:runtime.base config;
       0)
 
 let rec mkdir_p ~caps path =
@@ -336,8 +325,8 @@ let json_string name value = (name, `String value)
 let json_int_opt name = function None -> [] | Some value -> [ (name, `Int value) ]
 let json_string_opt name = function None -> [] | Some value -> [ (name, `String value) ]
 
-let health_identity config =
-  match http_request config "GET" "/health" with
+let health_identity ~runtime config =
+  match http_request ~runtime config "GET" "/health" with
   | Error message -> Error (friendly_http_error config message)
   | Ok (status, body) when status >= 200 && status < 300 -> (
       match Yojson.Safe.from_string body with
@@ -358,18 +347,18 @@ let health_identity config =
   | Ok (status, body) ->
       Error (Printf.sprintf "health returned HTTP %d: %s" status body)
 
-let daemon_identity_matches config pid instance_id =
-  match health_identity config with
+let daemon_identity_matches ~runtime config pid instance_id =
+  match health_identity ~runtime config with
   | Ok (Some health_pid, Some health_instance_id) ->
       health_pid = pid && String.equal health_instance_id instance_id
   | _ -> false
 
-let daemon_status_json ~caps config =
+let daemon_status_json ~caps ~runtime config =
   let pid = read_pid ~caps config in
   let instance_id = registry_instance_id ~caps config in
   let alive = Option.value (Option.map (process_alive ~caps) pid) ~default:false in
   let health =
-    match health_identity config with
+    match health_identity ~runtime config with
     | Ok (health_pid, health_instance_id) -> (true, None, health_pid, health_instance_id)
     | Error message -> (false, Some message, None, None)
   in
@@ -377,7 +366,7 @@ let daemon_status_json ~caps config =
   let managed =
     match (pid, instance_id) with
     | Some pid, Some instance_id when alive ->
-        daemon_identity_matches config pid instance_id
+        daemon_identity_matches ~runtime config pid instance_id
     | _ -> false
   in
   `Assoc
@@ -401,9 +390,8 @@ let daemon_status_json ~caps config =
 let print_json ~caps json =
   Ox_caps.Cap_stdlib.print_endline ~caps (Yojson.Safe.pretty_to_string json)
 
-let status config =
-  let caps = (door ()).caps in
-  let json = daemon_status_json ~caps config in
+let status ~caps ~runtime config =
+  let json = daemon_status_json ~caps ~runtime config in
   print_json ~caps json;
   match json with
   | `Assoc fields -> (
@@ -412,10 +400,10 @@ let status config =
       | _ -> 1)
   | _ -> 1
 
-let wait_for_health ~caps config pid instance_id =
+let wait_for_health ~caps ~runtime config pid instance_id =
   let deadline = Ox_caps.Cap_unix.gettimeofday ~caps () +. 10.0 in
   let rec loop last_error =
-    match health_identity config with
+    match health_identity ~runtime config with
     | Ok (Some health_pid, Some health_instance_id)
       when health_pid = pid && String.equal health_instance_id instance_id ->
         Ok ()
@@ -454,13 +442,15 @@ let exec_server ~caps instance_id =
   try Ox_caps.Cap_unix.execve ~caps argv.(0) argv env
   with _ -> Ox_caps.Cap_unix._exit ~caps 127
 
-let daemon config =
-  let caps = (door ()).caps in
+let daemon
+    ~caps:(caps : < Cap.fork; Cap.exec; Cap.exit; Cap.env; Cap.signal; Cap.time;
+                    Cap.random; Cap.stdout; Cap.stderr; Cap.fs_read; Cap.fs_write; .. >)
+    ~runtime config =
   mkdir_p ~caps config.Inn.Config.state_dir;
   match (read_pid ~caps config, registry_instance_id ~caps config) with
   | Some pid, Some instance_id
-    when process_alive ~caps pid && daemon_identity_matches config pid instance_id ->
-      print_json ~caps (daemon_status_json ~caps config);
+    when process_alive ~caps pid && daemon_identity_matches ~runtime config pid instance_id ->
+      print_json ~caps (daemon_status_json ~caps ~runtime config);
       0
   | _ ->
       let instance_id = daemon_instance_id ~caps () in
@@ -478,33 +468,35 @@ let daemon config =
           exec_server ~caps instance_id
       | pid -> (
           write_daemon_registry ~caps config pid instance_id;
-          match wait_for_health ~caps config pid instance_id with
+          match wait_for_health ~caps ~runtime config pid instance_id with
           | Ok () ->
-              print_json ~caps (daemon_status_json ~caps config);
+              print_json ~caps (daemon_status_json ~caps ~runtime config);
               0
           | Error message ->
               Ox_caps.Cap_stdlib.prerr_endline ~caps message;
-              print_json ~caps (daemon_status_json ~caps config);
+              print_json ~caps (daemon_status_json ~caps ~runtime config);
               1)
 
-let stop config =
-  let caps = (door ()).caps in
+let stop
+    ~caps:(caps : < Cap.signal; Cap.time; Cap.stdout; Cap.stderr; Cap.fs_read;
+                    Cap.fs_write; .. >)
+    ~runtime config =
   match (read_pid ~caps config, registry_instance_id ~caps config) with
   | None, _ ->
       remove_daemon_registry ~caps config;
-      print_json ~caps (daemon_status_json ~caps config);
+      print_json ~caps (daemon_status_json ~caps ~runtime config);
       0
   | Some pid, Some instance_id ->
       if not (process_alive ~caps pid) then (
         remove_daemon_registry ~caps config;
-        print_json ~caps (daemon_status_json ~caps config);
+        print_json ~caps (daemon_status_json ~caps ~runtime config);
         0)
-      else if not (daemon_identity_matches config pid instance_id) then (
+      else if not (daemon_identity_matches ~runtime config pid instance_id) then (
         Ox_caps.Cap_stdlib.prerr_endline ~caps
           (Printf.sprintf
              "refusing to stop pid %d because it is not an identity-verified Inn daemon"
              pid);
-        print_json ~caps (daemon_status_json ~caps config);
+        print_json ~caps (daemon_status_json ~caps ~runtime config);
         1)
       else (
         Ox_caps.Cap_unix.kill ~caps pid Sys.sigterm;
@@ -514,48 +506,48 @@ let stop config =
         done;
         if process_alive ~caps pid then Ox_caps.Cap_unix.kill ~caps pid Sys.sigkill;
         remove_daemon_registry ~caps config;
-        print_json ~caps (daemon_status_json ~caps config);
+        print_json ~caps (daemon_status_json ~caps ~runtime config);
         0)
   | Some pid, None ->
       Ox_caps.Cap_stdlib.prerr_endline ~caps
         (Printf.sprintf
            "refusing to stop pid %d because %s has no instance id" pid
            (registry_path config));
-      print_json ~caps (daemon_status_json ~caps config);
+      print_json ~caps (daemon_status_json ~caps ~runtime config);
       1
 
-let restart config =
-  let stopped = stop config in
-  if stopped <> 0 then stopped else daemon config
+let restart ~caps ~runtime config =
+  let stopped = stop ~caps ~runtime config in
+  if stopped <> 0 then stopped else daemon ~caps ~runtime config
 
-let mcp config =
+let mcp ~caps ~runtime config =
   let tool_call =
     Inn.Mcp.tool_call
-      ~request:(fun path -> http_request config "GET" path)
-      ~status:(fun () -> daemon_status_json ~caps:(door ()).caps config)
+      ~request:(fun path -> http_request ~runtime config "GET" path)
+      ~status:(fun () -> daemon_status_json ~caps ~runtime config)
       ~base_url:config.Inn.Config.base_url
   in
-  Inn.Mcp.run ~caps:(door ()).caps ~tool_call ()
+  Inn.Mcp.run ~caps ~tool_call ()
 
-let get path config = run_http config "GET" path
+let get ~caps ~runtime path config = run_http ~caps ~runtime config "GET" path
 
-let health config = get "/health" config
-let services lookback config =
-  get ("/services" ^ query [ ("lookback", lookback) ]) config
-let stats lookback config =
-  get ("/stats" ^ query [ ("lookback", lookback) ]) config
-let instructions config = get "/instructions" config
-let endpoints config = get "/endpoints" config
-let openapi config = get "/openapi.json" config
+let health ~caps ~runtime config = get ~caps ~runtime "/health" config
+let services ~caps ~runtime lookback config =
+  get ~caps ~runtime ("/services" ^ query [ ("lookback", lookback) ]) config
+let stats ~caps ~runtime lookback config =
+  get ~caps ~runtime ("/stats" ^ query [ ("lookback", lookback) ]) config
+let instructions ~caps ~runtime config = get ~caps ~runtime "/instructions" config
+let endpoints ~caps ~runtime config = get ~caps ~runtime "/endpoints" config
+let openapi ~caps ~runtime config = get ~caps ~runtime "/openapi.json" config
 
 (* inn docs lists the guides; inn docs NAME reads one as Markdown. *)
-let docs name config =
+let docs ~caps ~runtime name config =
   match name with
-  | None -> get "/docs" config
-  | Some name -> get ("/docs/" ^ percent_encode name) config
+  | None -> get ~caps ~runtime "/docs" config
+  | Some name -> get ~caps ~runtime ("/docs/" ^ percent_encode name) config
 
-let traces service lookback cursor limit config =
-  get
+let traces ~caps ~runtime service lookback cursor limit config =
+  get ~caps ~runtime
     ("/traces"
     ^ query
         [
@@ -617,11 +609,10 @@ let render_trace json =
     warnings;
   Buffer.contents buffer
 
-let trace json_flag trace_id config =
+let trace ~caps:(caps : < Cap.stdout; Cap.stderr; .. >) ~runtime json_flag trace_id config =
   let path = "/traces/" ^ percent_encode trace_id in
-  match http_request config "GET" path with
+  match http_request ~runtime config "GET" path with
   | Ok (status, body) when status >= 200 && status < 300 ->
-      let caps = (door ()).caps in
       if json_flag then (
         Ox_caps.Cap_stdlib.print_string ~caps body;
         0)
@@ -634,17 +625,17 @@ let trace json_flag trace_id config =
             Ox_caps.Cap_stdlib.print_string ~caps body;
             0)
   | Ok (_status, body) ->
-      Ox_caps.Cap_stdlib.prerr_string ~caps:(door ()).caps body;
+      Ox_caps.Cap_stdlib.prerr_string ~caps body;
       1
   | Error message ->
-      Ox_caps.Cap_stdlib.prerr_endline ~caps:(door ()).caps
+      Ox_caps.Cap_stdlib.prerr_endline ~caps
         (friendly_http_error config message);
       1
 
-let span span_id config = get ("/spans/" ^ percent_encode span_id) config
+let span ~caps ~runtime span_id config = get ~caps ~runtime ("/spans/" ^ percent_encode span_id) config
 
-let trace_spans trace_id lookback cursor limit config =
-  get
+let trace_spans ~caps ~runtime trace_id lookback cursor limit config =
+  get ~caps ~runtime
     ("/traces/" ^ percent_encode trace_id ^ "/spans"
     ^ query
         [
@@ -654,23 +645,23 @@ let trace_spans trace_id lookback cursor limit config =
         ])
     config
 
-let trace_logs trace_id lookback cursor attrs attr_contains limit config =
-  get ("/traces/" ^ percent_encode trace_id ^ "/logs" ^ query
+let trace_logs ~caps ~runtime trace_id lookback cursor attrs attr_contains limit config =
+  get ~caps ~runtime ("/traces/" ^ percent_encode trace_id ^ "/logs" ^ query
     ([ ("lookback", lookback); ("cursor", cursor);
        ("limit", Some (string_of_int limit)) ]
      @ List.map attr_param attrs
      @ List.map attr_contains_param attr_contains)) config
 
-let span_logs span_id lookback cursor attrs attr_contains limit config =
-  get ("/spans/" ^ percent_encode span_id ^ "/logs" ^ query
+let span_logs ~caps ~runtime span_id lookback cursor attrs attr_contains limit config =
+  get ~caps ~runtime ("/spans/" ^ percent_encode span_id ^ "/logs" ^ query
     ([ ("lookback", lookback); ("cursor", cursor);
        ("limit", Some (string_of_int limit)) ]
      @ List.map attr_param attrs
      @ List.map attr_contains_param attr_contains)) config
 
-let search_spans service trace_id operation parent_operation status lookback
+let search_spans ~caps ~runtime service trace_id operation parent_operation status lookback
     cursor attrs attr_contains min_duration limit config =
-  get ("/spans/search" ^ query
+  get ~caps ~runtime ("/spans/search" ^ query
     ([ ("service", service); ("traceId", trace_id);
        ("operation", operation); ("parentOperation", parent_operation);
        ("status", status); ("lookback", lookback); ("cursor", cursor);
@@ -679,9 +670,9 @@ let search_spans service trace_id operation parent_operation status lookback
      @ List.map attr_param attrs
      @ List.map attr_contains_param attr_contains)) config
 
-let search_traces service operation status lookback cursor attrs attr_contains
+let search_traces ~caps ~runtime service operation status lookback cursor attrs attr_contains
     min_duration text limit config =
-  get ("/traces/search" ^ query
+  get ~caps ~runtime ("/traces/search" ^ query
     ([ ("service", service); ("operation", operation); ("status", status);
        ("lookback", lookback); ("cursor", cursor); ("text", text);
        ("minDurationMs", Option.map string_of_float min_duration);
@@ -689,18 +680,18 @@ let search_traces service operation status lookback cursor attrs attr_contains
      @ List.map attr_param attrs
      @ List.map attr_contains_param attr_contains)) config
 
-let logs service severity contains lookback cursor attrs attr_contains
+let logs ~caps ~runtime service severity contains lookback cursor attrs attr_contains
     min_severity limit config =
-  get ("/logs" ^ query
+  get ~caps ~runtime ("/logs" ^ query
     ([ ("service", service); ("severity", severity);
        ("contains", contains); ("lookback", lookback); ("cursor", cursor);
        ("minSeverity", min_severity); ("limit", Some (string_of_int limit)) ]
      @ List.map attr_param attrs
      @ List.map attr_contains_param attr_contains)) config
 
-let search_logs service trace_id span_id severity body lookback cursor attrs
+let search_logs ~caps ~runtime service trace_id span_id severity body lookback cursor attrs
     attr_contains min_severity limit config =
-  get ("/logs/search" ^ query
+  get ~caps ~runtime ("/logs/search" ^ query
     ([ ("service", service); ("traceId", trace_id); ("spanId", span_id);
        ("severity", severity); ("body", body); ("lookback", lookback);
        ("cursor", cursor); ("minSeverity", min_severity);
@@ -708,9 +699,9 @@ let search_logs service trace_id span_id severity body lookback cursor attrs
      @ List.map attr_param attrs
      @ List.map attr_contains_param attr_contains)) config
 
-let trace_stats_query group_by agg service operation status lookback attrs
+let trace_stats_query ~caps ~runtime group_by agg service operation status lookback attrs
     attr_contains min_duration limit config =
-  get ("/traces/stats" ^ query
+  get ~caps ~runtime ("/traces/stats" ^ query
     ([ ("groupBy", Some group_by); ("agg", Some agg); ("service", service);
        ("operation", operation); ("status", status); ("lookback", lookback);
        ("minDurationMs", Option.map string_of_float min_duration);
@@ -718,9 +709,9 @@ let trace_stats_query group_by agg service operation status lookback attrs
      @ List.map attr_param attrs
      @ List.map attr_contains_param attr_contains)) config
 
-let log_stats_query group_by service trace_id span_id severity body lookback
+let log_stats_query ~caps ~runtime group_by service trace_id span_id severity body lookback
     attrs attr_contains min_severity limit config =
-  get ("/logs/stats" ^ query
+  get ~caps ~runtime ("/logs/stats" ^ query
     ([ ("groupBy", Some group_by); ("agg", Some "count");
        ("service", service); ("traceId", trace_id); ("spanId", span_id);
        ("severity", severity); ("body", body); ("lookback", lookback);
@@ -729,8 +720,8 @@ let log_stats_query group_by service trace_id span_id severity body lookback
      @ List.map attr_param attrs
      @ List.map attr_contains_param attr_contains)) config
 
-let facets kind field key service lookback limit config =
-  get
+let facets ~caps ~runtime kind field key service lookback limit config =
+  get ~caps ~runtime
     ("/facets"
     ^ query
         [
@@ -743,9 +734,9 @@ let facets kind field key service lookback limit config =
         ])
     config
 
-let ai_calls service trace_id session_id function_id provider model operation
+let ai_calls ~caps ~runtime service trace_id session_id function_id provider model operation
     status finish_reason text lookback cursor min_duration limit config =
-  get
+  get ~caps ~runtime
     ("/ai/calls"
     ^ query
         [
@@ -766,12 +757,12 @@ let ai_calls service trace_id session_id function_id provider model operation
         ])
     config
 
-let ai_call span_id config =
-  get ("/ai/calls/" ^ percent_encode span_id) config
+let ai_call ~caps ~runtime span_id config =
+  get ~caps ~runtime ("/ai/calls/" ^ percent_encode span_id) config
 
-let ai_stats group_by agg service trace_id session_id function_id provider model
+let ai_stats ~caps ~runtime group_by agg service trace_id session_id function_id provider model
     operation status finish_reason text lookback min_duration limit config =
-  get
+  get ~caps ~runtime
     ("/ai/stats"
     ^ query
         [
@@ -793,8 +784,8 @@ let ai_stats group_by agg service trace_id session_id function_id provider model
         ])
     config
 
-let metrics service name lookback cursor limit config =
-  get
+let metrics ~caps ~runtime service name lookback cursor limit config =
+  get ~caps ~runtime
     ("/metrics"
     ^ query
         [
@@ -990,229 +981,279 @@ let facet_key_t =
 let cmd name doc term =
   Cmd.v (Cmd.info name ~doc) term
 
-let later1 f t1 = Term.(const (fun a -> delay (fun () -> f a)) $ t1)
+let later1 ~caps f t1 = Term.(const (fun a -> delay ~caps (fun () -> f a)) $ t1)
 
-let later2 f t1 t2 = Term.(const (fun a b -> delay (fun () -> f a b)) $ t1 $ t2)
+let later2 ~caps f t1 t2 = Term.(const (fun a b -> delay ~caps (fun () -> f a b)) $ t1 $ t2)
 
-let later3 f t1 t2 t3 =
-  Term.(const (fun a b c -> delay (fun () -> f a b c)) $ t1 $ t2 $ t3)
+let later3 ~caps f t1 t2 t3 =
+  Term.(const (fun a b c -> delay ~caps (fun () -> f a b c)) $ t1 $ t2 $ t3)
 
-let later5 f t1 t2 t3 t4 t5 =
-  Term.(const (fun a b c d e -> delay (fun () -> f a b c d e)) $ t1 $ t2 $ t3 $ t4 $ t5)
+let later5 ~caps f t1 t2 t3 t4 t5 =
+  Term.(const (fun a b c d e -> delay ~caps (fun () -> f a b c d e)) $ t1 $ t2 $ t3 $ t4 $ t5)
 
-let later6 f t1 t2 t3 t4 t5 t6 =
+let later6 ~caps f t1 t2 t3 t4 t5 t6 =
   Term.(
-    const (fun a b c d e g -> delay (fun () -> f a b c d e g))
+    const (fun a b c d e g -> delay ~caps (fun () -> f a b c d e g))
     $ t1 $ t2 $ t3 $ t4 $ t5 $ t6)
 
-let later7 f t1 t2 t3 t4 t5 t6 t7 =
+let later7 ~caps f t1 t2 t3 t4 t5 t6 t7 =
   Term.(
-    const (fun a b c d e g h -> delay (fun () -> f a b c d e g h))
+    const (fun a b c d e g h -> delay ~caps (fun () -> f a b c d e g h))
     $ t1 $ t2 $ t3 $ t4 $ t5 $ t6 $ t7)
 
-let later10 f t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 =
+let later10 ~caps f t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 =
   Term.(
-    const (fun a b c d e g h i j k -> delay (fun () -> f a b c d e g h i j k))
+    const (fun a b c d e g h i j k -> delay ~caps (fun () -> f a b c d e g h i j k))
     $ t1 $ t2 $ t3 $ t4 $ t5 $ t6 $ t7 $ t8 $ t9 $ t10)
 
-let later11 f t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 =
+let later11 ~caps f t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 =
   Term.(
     const
-      (fun a b c d e g h i j k l -> delay (fun () -> f a b c d e g h i j k l))
+      (fun a b c d e g h i j k l -> delay ~caps (fun () -> f a b c d e g h i j k l))
     $ t1 $ t2 $ t3 $ t4 $ t5 $ t6 $ t7 $ t8 $ t9 $ t10 $ t11)
 
-let later12 f t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 =
+let later12 ~caps f t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 =
   Term.(
     const
       (fun a b c d e g h i j k l m ->
-        delay (fun () -> f a b c d e g h i j k l m))
+        delay ~caps (fun () -> f a b c d e g h i j k l m))
     $ t1 $ t2 $ t3 $ t4 $ t5 $ t6 $ t7 $ t8 $ t9 $ t10 $ t11 $ t12)
 
-let later15 f t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 =
+let later15 ~caps f t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 =
   Term.(
     const
       (fun a b c d e g h i j k l m n o p ->
-        delay (fun () -> f a b c d e g h i j k l m n o p))
+        delay ~caps (fun () -> f a b c d e g h i j k l m n o p))
     $ t1 $ t2 $ t3 $ t4 $ t5 $ t6 $ t7 $ t8 $ t9 $ t10 $ t11 $ t12 $ t13 $ t14
     $ t15)
 
-let later16 f t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 =
+let later16 ~caps f t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 =
   Term.(
     const
       (fun a b c d e g h i j k l m n o p q ->
-        delay (fun () -> f a b c d e g h i j k l m n o p q))
+        delay ~caps (fun () -> f a b c d e g h i j k l m n o p q))
     $ t1 $ t2 $ t3 $ t4 $ t5 $ t6 $ t7 $ t8 $ t9 $ t10 $ t11 $ t12 $ t13 $ t14
     $ t15 $ t16)
 
-let later_unit1 f t1 = Term.(const (fun a -> delay (fun () -> f a; 0)) $ t1)
+let later_unit1 ~caps f t1 = Term.(const (fun a -> delay ~caps (fun () -> f a; 0)) $ t1)
 
-let server_cmd =
-  cmd "server" "Run the Inn local HTTP ingest/query server."
-    (later1 server config_t)
+(* ^inndoor-k4px: callbacks capture authority supplied by the Door argument. *)
+let commands ~caps ~runtime =
+  let config_t = config_t ~caps:(caps :> Cap.env) in
+  let stderr_caps = (caps :> Cap.stderr) in
+  let output_caps = (caps :> < Cap.stdout; Cap.stderr >) in
+  let server_cmd =
+    cmd "server" "Run the Inn local HTTP ingest/query server."
+      (later1 ~caps:stderr_caps (server
+           ~caps:(caps :> < Cap.env; Cap.network; Cap.time; Cap.signal;
+                            Cap.fs_read; Cap.fs_write; Cap.stderr >)
+           ~runtime) config_t)
+  in
 
-let daemon_cmd =
-  cmd "daemon" "Run the Inn server as a managed background daemon."
-    (later1 daemon config_t)
+  let daemon_cmd =
+    cmd "daemon" "Run the Inn server as a managed background daemon."
+      (later1 ~caps:stderr_caps (daemon
+           ~caps:(caps :> < Cap.fork; Cap.exec; Cap.exit; Cap.env; Cap.signal;
+                            Cap.time; Cap.random; Cap.stdout; Cap.stderr;
+                            Cap.fs_read; Cap.fs_write >)
+           ~runtime) config_t)
+  in
 
-let status_cmd =
-  cmd "status" "Show managed daemon status." (later1 status config_t)
+  let status_cmd =
+    cmd "status" "Show managed daemon status." (later1 ~caps:stderr_caps (status ~caps:(caps :> < Cap.fs_read; Cap.signal; Cap.stdout >) ~runtime) config_t)
+  in
 
-let health_cmd =
-  cmd "health" "Check the configured Inn server." (later1 health config_t)
+  let health_cmd =
+    cmd "health" "Check the configured Inn server." (later1 ~caps:stderr_caps (health ~caps:output_caps ~runtime) config_t)
+  in
 
-let stop_cmd =
-  cmd "stop" "Stop the managed Inn daemon." (later1 stop config_t)
+  let stop_cmd =
+    cmd "stop" "Stop the managed Inn daemon." (later1 ~caps:stderr_caps (stop
+           ~caps:(caps :> < Cap.signal; Cap.time; Cap.stdout; Cap.stderr;
+                            Cap.fs_read; Cap.fs_write >)
+           ~runtime) config_t)
+  in
 
-let restart_cmd =
-  cmd "restart" "Restart the managed Inn daemon." (later1 restart config_t)
+  let restart_cmd =
+    cmd "restart" "Restart the managed Inn daemon." (later1 ~caps:stderr_caps (restart
+           ~caps:(caps :> < Cap.fork; Cap.exec; Cap.exit; Cap.env; Cap.signal;
+                            Cap.time; Cap.random; Cap.stdout; Cap.stderr;
+                            Cap.fs_read; Cap.fs_write >)
+           ~runtime) config_t)
+  in
 
-let services_cmd =
-  cmd "services" "List services known to Inn."
-    (later2 services lookback_t config_t)
+  let services_cmd =
+    cmd "services" "List services known to Inn."
+      (later2 ~caps:stderr_caps (services ~caps:output_caps ~runtime) lookback_t config_t)
+  in
 
-let traces_cmd =
-  cmd "traces" "List trace summaries."
-    (later5 traces service_t lookback_t cursor_t limit_t config_t)
+  let traces_cmd =
+    cmd "traces" "List trace summaries."
+      (later5 ~caps:stderr_caps (traces ~caps:output_caps ~runtime) service_t lookback_t cursor_t limit_t config_t)
+  in
 
-let trace_cmd =
-  cmd "trace" "Read one trace by trace id as a tree."
-    (later3 trace json_t trace_id_t config_t)
+  let trace_cmd =
+    cmd "trace" "Read one trace by trace id as a tree."
+      (later3 ~caps:stderr_caps (trace ~caps:output_caps ~runtime) json_t trace_id_t config_t)
+  in
 
-let span_cmd =
-  cmd "span" "Read one span by span id." (later2 span span_id_t config_t)
+  let span_cmd =
+    cmd "span" "Read one span by span id." (later2 ~caps:stderr_caps (span ~caps:output_caps ~runtime) span_id_t config_t)
+  in
 
-let trace_spans_cmd =
-  cmd "trace-spans" "List spans for a trace."
-    (later5 trace_spans trace_id_t lookback_t cursor_t limit_t config_t)
+  let trace_spans_cmd =
+    cmd "trace-spans" "List spans for a trace."
+      (later5 ~caps:stderr_caps (trace_spans ~caps:output_caps ~runtime) trace_id_t lookback_t cursor_t limit_t config_t)
+  in
 
-let trace_logs_cmd =
-  cmd "trace-logs" "List logs correlated with a trace."
-    (later7 trace_logs trace_id_t lookback_t cursor_t attrs_t attr_contains_t
-       limit_t config_t)
+  let trace_logs_cmd =
+    cmd "trace-logs" "List logs correlated with a trace."
+      (later7 ~caps:stderr_caps (trace_logs ~caps:output_caps ~runtime) trace_id_t lookback_t cursor_t attrs_t attr_contains_t
+         limit_t config_t)
+  in
 
-let span_logs_cmd =
-  cmd "span-logs" "List logs correlated with a span."
-    (later7 span_logs span_id_t lookback_t cursor_t attrs_t attr_contains_t
-       limit_t config_t)
+  let span_logs_cmd =
+    cmd "span-logs" "List logs correlated with a span."
+      (later7 ~caps:stderr_caps (span_logs ~caps:output_caps ~runtime) span_id_t lookback_t cursor_t attrs_t attr_contains_t
+         limit_t config_t)
+  in
 
-let search_spans_cmd =
-  cmd "search-spans" "Search spans by service, operation, status, and attributes."
-    (later12 search_spans service_t trace_id_filter_t operation_t
-       parent_operation_t status_t lookback_t cursor_t attrs_t attr_contains_t
-       min_duration_t limit_t config_t)
+  let search_spans_cmd =
+    cmd "search-spans" "Search spans by service, operation, status, and attributes."
+      (later12 ~caps:stderr_caps (search_spans ~caps:output_caps ~runtime) service_t trace_id_filter_t operation_t
+         parent_operation_t status_t lookback_t cursor_t attrs_t attr_contains_t
+         min_duration_t limit_t config_t)
+  in
 
-let search_traces_cmd =
-  cmd "search-traces" "Search trace summaries by span filters."
-    (later11 search_traces service_t operation_t status_t lookback_t cursor_t
-       attrs_t attr_contains_t min_duration_t text_t limit_t config_t)
+  let search_traces_cmd =
+    cmd "search-traces" "Search trace summaries by span filters."
+      (later11 ~caps:stderr_caps (search_traces ~caps:output_caps ~runtime) service_t operation_t status_t lookback_t cursor_t
+         attrs_t attr_contains_t min_duration_t text_t limit_t config_t)
+  in
 
-let logs_cmd =
-  cmd "logs" "List logs."
-    (later10 logs service_t severity_t contains_t lookback_t cursor_t attrs_t
-       attr_contains_t min_severity_t limit_t config_t)
+  let logs_cmd =
+    cmd "logs" "List logs."
+      (later10 ~caps:stderr_caps (logs ~caps:output_caps ~runtime) service_t severity_t contains_t lookback_t cursor_t attrs_t
+         attr_contains_t min_severity_t limit_t config_t)
+  in
 
-let search_logs_cmd =
-  cmd "search-logs" "Search logs by service, correlation ids, body, and attributes."
-    (later12 search_logs service_t trace_id_filter_t span_id_filter_t severity_t
-       body_t lookback_t cursor_t attrs_t attr_contains_t min_severity_t limit_t
-       config_t)
+  let search_logs_cmd =
+    cmd "search-logs" "Search logs by service, correlation ids, body, and attributes."
+      (later12 ~caps:stderr_caps (search_logs ~caps:output_caps ~runtime) service_t trace_id_filter_t span_id_filter_t severity_t
+         body_t lookback_t cursor_t attrs_t attr_contains_t min_severity_t limit_t
+         config_t)
+  in
 
-let trace_stats_cmd =
-  cmd "trace-stats" "Aggregate trace statistics."
-    (later11 trace_stats_query group_by_t agg_t service_t operation_t status_t
-       lookback_t attrs_t attr_contains_t min_duration_t limit_t config_t)
+  let trace_stats_cmd =
+    cmd "trace-stats" "Aggregate trace statistics."
+      (later11 ~caps:stderr_caps (trace_stats_query ~caps:output_caps ~runtime) group_by_t agg_t service_t operation_t status_t
+         lookback_t attrs_t attr_contains_t min_duration_t limit_t config_t)
+  in
 
-let log_stats_cmd =
-  cmd "log-stats" "Aggregate log counts."
-    (later12 log_stats_query group_by_t service_t trace_id_filter_t
-       span_id_filter_t severity_t body_t lookback_t attrs_t attr_contains_t
-       min_severity_t limit_t config_t)
+  let log_stats_cmd =
+    cmd "log-stats" "Aggregate log counts."
+      (later12 ~caps:stderr_caps (log_stats_query ~caps:output_caps ~runtime) group_by_t service_t trace_id_filter_t
+         span_id_filter_t severity_t body_t lookback_t attrs_t attr_contains_t
+         min_severity_t limit_t config_t)
+  in
 
-let facets_cmd =
-  cmd "facets" "List trace or log facet values."
-    (later7 facets facet_type_t facet_field_t facet_key_t service_t lookback_t
-       limit_t config_t)
+  let facets_cmd =
+    cmd "facets" "List trace or log facet values."
+      (later7 ~caps:stderr_caps (facets ~caps:output_caps ~runtime) facet_type_t facet_field_t facet_key_t service_t lookback_t
+         limit_t config_t)
+  in
 
-let ai_calls_cmd =
-  cmd "ai-calls" "Search AI call spans."
-    (later15 ai_calls service_t trace_id_filter_t session_id_t function_id_t
-       provider_t model_t operation_t status_t finish_reason_t text_t lookback_t
-       cursor_t min_duration_t limit_t config_t)
+  let ai_calls_cmd =
+    cmd "ai-calls" "Search AI call spans."
+      (later15 ~caps:stderr_caps (ai_calls ~caps:output_caps ~runtime) service_t trace_id_filter_t session_id_t function_id_t
+         provider_t model_t operation_t status_t finish_reason_t text_t lookback_t
+         cursor_t min_duration_t limit_t config_t)
+  in
 
-let ai_call_cmd =
-  cmd "ai-call" "Read one AI call by span id."
-    (later2 ai_call span_id_t config_t)
+  let ai_call_cmd =
+    cmd "ai-call" "Read one AI call by span id."
+      (later2 ~caps:stderr_caps (ai_call ~caps:output_caps ~runtime) span_id_t config_t)
+  in
 
-let ai_stats_cmd =
-  cmd "ai-stats" "Aggregate AI call statistics."
-    (later16 ai_stats group_by_t agg_t service_t trace_id_filter_t session_id_t
-       function_id_t provider_t model_t operation_t status_t finish_reason_t text_t
-       lookback_t min_duration_t limit_t config_t)
+  let ai_stats_cmd =
+    cmd "ai-stats" "Aggregate AI call statistics."
+      (later16 ~caps:stderr_caps (ai_stats ~caps:output_caps ~runtime) group_by_t agg_t service_t trace_id_filter_t session_id_t
+         function_id_t provider_t model_t operation_t status_t finish_reason_t text_t
+         lookback_t min_duration_t limit_t config_t)
+  in
 
-let metrics_cmd =
-  cmd "metrics" "List metric points."
-    (later6 metrics service_t metric_name_t lookback_t cursor_t limit_t config_t)
+  let metrics_cmd =
+    cmd "metrics" "List metric points."
+      (later6 ~caps:stderr_caps (metrics ~caps:output_caps ~runtime) service_t metric_name_t lookback_t cursor_t limit_t config_t)
+  in
 
-let stats_cmd =
-  cmd "stats" "Show store statistics." (later2 stats lookback_t config_t)
+  let stats_cmd =
+    cmd "stats" "Show store statistics." (later2 ~caps:stderr_caps (stats ~caps:output_caps ~runtime) lookback_t config_t)
+  in
 
-let instructions_cmd =
-  cmd "instructions" "Print OTLP setup instructions."
-    (later1 instructions config_t)
+  let instructions_cmd =
+    cmd "instructions" "Print OTLP setup instructions."
+      (later1 ~caps:stderr_caps (instructions ~caps:output_caps ~runtime) config_t)
+  in
 
-let endpoints_cmd =
-  cmd "endpoints" "Print Inn endpoint and exporter configuration."
-    (later1 endpoints config_t)
+  let endpoints_cmd =
+    cmd "endpoints" "Print Inn endpoint and exporter configuration."
+      (later1 ~caps:stderr_caps (endpoints ~caps:output_caps ~runtime) config_t)
+  in
 
-let openapi_cmd =
-  cmd "openapi" "Print the Inn OpenAPI document."
-    (later1 openapi config_t)
+  let openapi_cmd =
+    cmd "openapi" "Print the Inn OpenAPI document."
+      (later1 ~caps:stderr_caps (openapi ~caps:output_caps ~runtime) config_t)
+  in
 
-let docs_name_t =
-  Arg.(
-    value
-    & pos 0 (some string) None
-    & info [] ~docv:"NAME" ~doc:"Guide name: debug, effect, or ox.")
+  let docs_name_t =
+    Arg.(
+      value
+      & pos 0 (some string) None
+      & info [] ~docv:"NAME" ~doc:"Guide name: debug, effect, or ox.")
+  in
 
-let docs_cmd =
-  cmd "docs" "List the Inn guides, or print one guide as Markdown."
-    (later2 docs docs_name_t config_t)
+  let docs_cmd =
+    cmd "docs" "List the Inn guides, or print one guide as Markdown."
+      (later2 ~caps:stderr_caps (docs ~caps:output_caps ~runtime) docs_name_t config_t)
+  in
 
-let mcp_cmd =
-  cmd "mcp" "Run the Inn MCP stdio server." (later_unit1 mcp config_t)
+  let mcp_cmd =
+    cmd "mcp" "Run the Inn MCP stdio server." (later_unit1 ~caps:stderr_caps (mcp ~caps:(caps :> < Cap.fs_read; Cap.signal; Cap.stdin; Cap.stdout >) ~runtime) config_t)
+  in
 
-let commands = [
-      server_cmd;
-      daemon_cmd;
-      status_cmd;
-      health_cmd;
-      stop_cmd;
-      restart_cmd;
-      services_cmd;
-      traces_cmd;
-      trace_cmd;
-      span_cmd;
-      trace_spans_cmd;
-      trace_logs_cmd;
-      span_logs_cmd;
-      search_spans_cmd;
-      search_traces_cmd;
-      logs_cmd;
-      search_logs_cmd;
-      trace_stats_cmd;
-      log_stats_cmd;
-      facets_cmd;
-      ai_calls_cmd;
-      ai_call_cmd;
-      ai_stats_cmd;
-      metrics_cmd;
-      stats_cmd;
-      instructions_cmd;
-      endpoints_cmd;
-      openapi_cmd;
-      docs_cmd;
-      mcp_cmd;
-    ]
+  [
+        server_cmd;
+        daemon_cmd;
+        status_cmd;
+        health_cmd;
+        stop_cmd;
+        restart_cmd;
+        services_cmd;
+        traces_cmd;
+        trace_cmd;
+        span_cmd;
+        trace_spans_cmd;
+        trace_logs_cmd;
+        span_logs_cmd;
+        search_spans_cmd;
+        search_traces_cmd;
+        logs_cmd;
+        search_logs_cmd;
+        trace_stats_cmd;
+        log_stats_cmd;
+        facets_cmd;
+        ai_calls_cmd;
+        ai_call_cmd;
+        ai_stats_cmd;
+        metrics_cmd;
+        stats_cmd;
+        instructions_cmd;
+        endpoints_cmd;
+        openapi_cmd;
+        docs_cmd;
+        mcp_cmd;
+      ]
 
 let friendly_unix_error error operation arg =
   match (error, operation) with
@@ -1270,12 +1311,6 @@ let () =
        ~config:Ox_app.Config.none
        ~pp_err:(fun ppf () -> Format.pp_print_string ppf "inn")
        ~commands_with_env_code:(fun env _run_owned owned ->
-         door_slot :=
-           Some
-             {
-               caps = env.Ox_app.Env.caps;
-               base = env.Ox_app.Env.base;
-               owned;
-             };
-         commands)
+         commands ~caps:env.Ox_app.Env.caps
+           ~runtime:{ base = env.Ox_app.Env.base; owned })
        (fun _env _source () () _sw -> Ok ()))

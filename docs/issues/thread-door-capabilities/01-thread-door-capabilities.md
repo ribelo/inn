@@ -1,5 +1,5 @@
 ---
-status: ready-for-agent
+status: done
 category: bug
 package: inn CLI entry point
 consumer: Inn capability boundary
@@ -72,3 +72,63 @@ Run all four gates from `AGENTS.md`, including the compiled Ox guide test.
 Changing the lint rule, preserving ambient capabilities as an exception,
 changing the CLI contract, deploying Inn, and modernizing the historical
 local-source mirror script.
+
+## Verification — 2026-10-04
+
+Implemented ^inndoor-k4px and ^inndoor-m8sw (uncommitted for human review).
+
+- `Ox_app.run_with_args` remains the sole powerbox source. Its
+  `commands_with_env_code` callback now calls `commands ~caps ~runtime`; the
+  runtime record holds only the existing Eio base and owned-scope callback.
+  Command closures capture narrowed argument capabilities. `door_slot`,
+  `door ()` and the full-capability record field are gone.
+- `delay` takes stderr; `run_http` and `trace` take stdout/stderr; `daemon`
+  takes fork/exec/exit/env/signal/time/random/stdout/stderr/fs_read/fs_write;
+  `stop` takes signal/time/stdout/stderr/fs_read/fs_write. HTTP and lifecycle
+  helpers receive the runtime argument; configuration receives env.
+- Removed `--allow bin/main.ml` and its reason from `scripts/caps-gate`, and
+  replaced the temporary-allowance notes in `AGENTS.md` and `README.md`. The
+  wrapper builds `@install @check` and requires complete typed evidence.
+- The initial root `@check` failed because test executable stanzas implicitly
+  compiled one another's modules with the wrong dependencies. Explicit
+  `(modules ...)` entries in `test/dune` make the required build pass without
+  changing runtime behavior.
+
+Every command ran from the repository root with `INN_ETA_GUIDE_SNIPPET=1`;
+exit codes were captured directly with `cmd; echo rc=$?`.
+
+| Gate | Before | After |
+| --- | --- | --- |
+| `nix develop -c dune build @install @check` | 1 (test module ownership above) | 0 |
+| `nix develop -c dune test` | 0 | 0 |
+| `nix develop -c dune build @fmt` | 0 | 0 |
+| `nix develop -c scripts/caps-gate` | 0 (CLI excluded) | 0 (no exclusions) |
+| `nix develop -c ox-lint --caps-gate --require-typed lib bin` | 1 | 0 |
+
+Before removing the exemption, the direct strict gate reported exactly five
+`ox-caps-signature` findings at original CLI lines 23, 233, 457, 490 and 620,
+with zero typed-undecided modules. After threading, both direct and repository
+gates report:
+
+```text
+caps-gate: 0 findings; 0 modules with typed rules undecided (typed evidence required)
+```
+
+Behavior verification:
+
+- Compared a saved original executable against the new one: 38 help/default/
+  version/parse/configuration cases have byte-identical stdout and stderr and
+  identical exit codes (comparison exit 0).
+- Added `test/check_door_cli.py` to the existing Cram suite: a pre-fork exception
+  exercises `delay`; isolated daemon start, repeated start, status, HTTP health,
+  identity-mismatch stop refusal, stop, start again and idempotent stop all pass.
+  The same check passes against both executables (exit 0 each).
+- Existing CLI tests retain trace tree/JSON, HTTP error output, MCP, signal
+  shutdown/draining and the compiled Ox guide coverage. All 45 Inn and 7 MCP
+  unit tests pass.
+- The first lifecycle probe expected `restart` to succeed, but both original
+  and new executables returned 1. No production behavior was changed to fix
+  this pre-existing defect; it is recorded in
+  [restart-daemon-exec](../restart-daemon-exec/01-restart-daemon-exec.md).
+- `@fmt` passes; it warns on an uncached run that OCaml formatting is disabled
+  because the repository has no `.ocamlformat`. No formatter policy was changed.

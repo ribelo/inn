@@ -59,7 +59,7 @@ Run all four gates before committing:
 
 ```sh
 export INN_ETA_GUIDE_SNIPPET=1
-nix develop -c dune build @install
+nix develop -c dune build @install @check
 nix develop -c dune test
 nix develop -c dune build @fmt
 nix develop -c scripts/caps-gate
@@ -68,15 +68,13 @@ nix develop -c scripts/caps-gate
 The capability gate runs **after a build** with the same compiler and dependency
 graph. Its mandatory source tier needs no build artefacts; the typed tier needs
 Inn's own fresh `.cmt`/`.cmti` evidence and matching CMI fingerprints. The local
-launcher rebuilds `@install` before invoking the installed Ox gate beside
+launcher rebuilds `@install @check` before invoking the installed Ox gate beside
 `ox_caps`, which resolves executable `bin/ox-lint` in the same prefix. Require
-zero findings and zero modules with typed rules undecided for non-allowed sources;
+zero findings and zero modules with typed rules undecided for every production source;
 an undecided module is not checked typed coverage.
 
-The sole temporary allowance is `bin/main.ml`: its Door slot is a mutable global,
-and five entry points take their authority from it.
-[Issue row 16](docs/issues/thread-door-capabilities/01-thread-door-capabilities.md)
-threads the Door's capabilities through arguments and removes this allowance.
+The CLI receives capabilities through arguments from the Door; every production
+source is checked without allowances. ^inndoor-m8sw
 
 `INN_ETA_GUIDE_SNIPPET=1` includes the compiled exporter snippet and its test
 against an isolated Inn, keeping `docs/guides/ox.md` aligned with the Ox API.

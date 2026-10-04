@@ -20,7 +20,8 @@ Each spec's frontmatter carries its status (completed = implemented and accepted
 | 13 | [eta-next-migration](eta-next-migration/01-eta-next-migration.md) | in progress |
 | 14 | [caps](caps/01-caps.md) | done (uncommitted; ox row 52) |
 | 15 | [caps-on-ox-lint](caps-on-ox-lint/01-caps-on-ox-lint.md) | done |
-| 16 | [thread-door-capabilities](thread-door-capabilities/01-thread-door-capabilities.md) | ready-for-agent |
+| 16 | [thread-door-capabilities](thread-door-capabilities/01-thread-door-capabilities.md) | done (uncommitted for review) |
+| 17 | [restart-daemon-exec](restart-daemon-exec/01-restart-daemon-exec.md) | ready-for-agent |
 
 Specs 3–11 all touch the store and server, so they are implemented one at a
 time, in this order.

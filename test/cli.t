@@ -6,6 +6,8 @@
   desc-85u9: inn docs lists, reads, and fails loudly on an unknown name
   $ python3 check_service.py ../bin/main.exe
   svc-pehm svc-dh98: SIGTERM drains an in-flight request and exits 0, SIGINT exits 0, both traces survive reopen, and startup logs config
+  $ python3 check_door_cli.py ../bin/main.exe
+  inndoor-k4px: delay errors and daemon start/status/refusal/stop preserve behavior
   $ python3 check_hints.py ../bin/main.exe
   svc-xd4x: the CLI and MCP connect hints name systemctl --user start inn and inn server
   $ python3 check_install.py

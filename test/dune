@@ -1,5 +1,7 @@
 (test
  (name test_inn)
+ ; ^inndoor-m8sw: @check must type each entry with its own dependencies.
+ (modules test_inn)
  (package inn)
  (deps ../README.md ../docs/guides/ox.md ox_guide_snippet.ml)
  (libraries inn alcotest ox ox_caps ox_http ox_sql ox_test eio_main unix)
@@ -16,6 +18,8 @@
 
 (test
  (name test_mcp)
+ ; ^inndoor-m8sw: @check must type each entry with its own dependencies.
+ (modules test_mcp)
  (package inn)
  (libraries inn alcotest yojson))
 
@@ -27,6 +31,8 @@
 
 (executable
  (name ox_guide_snippet)
+ ; ^inndoor-m8sw: @check must type each entry with its own dependencies.
+ (modules ox_guide_snippet)
  (enabled_if
   (= %{env:INN_ETA_GUIDE_SNIPPET=0} 1))
  (flags
@@ -48,6 +54,7 @@
   ../docs/guides/effect.md
   check_mcp.py
   check_cli.py
+  check_door_cli.py
   check_trace_cli.py
   check_service.py
   check_hints.py

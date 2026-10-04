@@ -24,8 +24,6 @@ if [ -z "$gate" ]; then
 fi
 
 # ^innlint-b7km: typed rules need this tree's fresh compiler evidence.
-dune build @install
-# Temporary allowance (^inndoor-m8sw): door_slot is a mutable global; five
-# entry points draw their authority from it. Keep only until issue row 16 threads
-# the Door's capabilities through arguments and removes this entry.
-exec bash "$gate" --allow bin/main.ml "$@" lib bin
+dune build @install @check
+# ^inndoor-m8sw: every production file is checked, including the CLI.
+exec bash "$gate" --require-typed "$@" lib bin
