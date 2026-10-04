@@ -50,41 +50,43 @@ a short-lived debugging cache.
 
 ## Build
 
-With the existing shared OxCaml opam switch (`~/.cache/opam/5.4.0+ox`) and a
-local Ox checkout next to Inn, run the local-source build and full test suite:
+Use `nix develop`, which loads the shared OxCaml opam switch
+(`~/.cache/opam/5.4.0+ox`). Shared Ox packages are installed from committed source
+by the Ox checkout's `ox-opam-install`; Inn declares `ox_lint` as a build-only
+dependency alongside `ox_caps`.
+
+Run all four gates before committing:
 
 ```sh
-./scripts/test-local-ox.sh
+export INN_ETA_GUIDE_SNIPPET=1
+nix develop -c dune build @install
+nix develop -c dune test
+nix develop -c dune build @fmt
+nix develop -c scripts/caps-gate
 ```
 
-Set `OX_PATH=/path/to/Ox` before the command if the checkout is elsewhere.
-The script enters Ox's Nix shell for native SQLite/OpenSSL dependencies, uses
-only the OCaml packages already installed in the shared switch, and builds a
-source-file-symlink mirror of Ox under ignored `_dev/`. It installs the
-needed Ox libraries under `_dev/ox-install`, then builds and tests Inn
-with that local installation first in `OCAMLPATH`. It neither pins nor
-installs packages into the shared switch and does not edit Ox. Missing OCaml
-dependencies must be addressed outside this workflow, not installed into the
-shared switch.
+The capability gate runs **after a build** with the same compiler and dependency
+graph. Its mandatory source tier needs no build artefacts; the typed tier needs
+Inn's own fresh `.cmt`/`.cmti` evidence and matching CMI fingerprints. The local
+launcher rebuilds `@install` before invoking the installed Ox gate beside
+`ox_caps`, which resolves executable `bin/ox-lint` in the same prefix. Require
+zero findings and zero modules with typed rules undecided for non-allowed sources;
+an undecided module is not checked typed coverage.
 
-The same run compiles the Ox guide's exporter snippet
-(`test/ox_guide_snippet.ml`) against that local Ox and fails when
-`docs/guides/ox.md` no longer carries it verbatim, so the guide cannot drift
-from the API it documents.
+The sole temporary allowance is `bin/main.ml`: its Door slot is a mutable global,
+and five entry points take their authority from it.
+[Issue row 16](docs/issues/thread-door-capabilities/01-thread-door-capabilities.md)
+threads the Door's capabilities through arguments and removes this allowance.
 
-The Alcotest suite runs with `EIO_BACKEND=posix` (set by `test/dune`). Each
-short-lived Eio runtime otherwise creates an io_uring ring, and ring creation
-fails with `ENOMEM` under a small per-user locked-memory cap, which hides real
-failures. The posix backend is the same Eio API without io_uring; the server
-itself keeps the default backend.
+`INN_ETA_GUIDE_SNIPPET=1` includes the compiled exporter snippet and its test
+against an isolated Inn, keeping `docs/guides/ox.md` aligned with the Ox API.
+The Alcotest suite uses `EIO_BACKEND=posix` (set by `test/dune`): repeated
+io_uring creation can exhaust the per-user locked-memory cap and hide real
+failures. The server keeps the default backend.
 
-To check Inn against the previously installed Ox in the shared switch instead:
-
-```sh
-export OPAMROOT="$HOME/.cache/opam"
-eval "$(opam env --switch 5.4.0+ox --set-switch)"
-dune build && dune runtest
-```
+`scripts/test-local-ox.sh` is a historical alternate source-mirror workflow, not
+the current gate workflow above. It predates the current Ox package layout and
+the installed lint evidence; updating it is separate work.
 
 ## Run
 

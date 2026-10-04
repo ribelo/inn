@@ -17,6 +17,7 @@
   ox
   ox_app
   ox_caps
+  (ox_lint :build)
   ox_http
   ox_sql
   eio

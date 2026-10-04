@@ -24,6 +24,29 @@ uncommitted work is effectively lost work.
   and commits it before starting dependent work.
 - Push only when the user asks.
 
+## Gates (before any commit)
+
+```sh
+export INN_ETA_GUIDE_SNIPPET=1
+nix develop -c dune build @install
+nix develop -c dune test
+nix develop -c dune build @fmt
+nix develop -c scripts/caps-gate
+```
+
+Build before the capability gate with the same shared OxCaml switch and
+dependencies. The source tier needs no build artefacts; the typed tier needs this
+tree's fresh `.cmt`/`.cmti` evidence with matching CMI fingerprints.
+`scripts/caps-gate` rebuilds `@install` before forwarding to the installed
+`share/ox_caps/caps-gate`, which resolves `bin/ox-lint` in the same prefix.
+A green full gate has no findings and no typed-undecided modules among checked
+sources. ^innlint-b7km
+
+The sole temporary allowance is `bin/main.ml`: its Door slot is a mutable global,
+and five entry points obtain authority from it. Do not treat it as typed-clean.
+[Issue row 16](docs/issues/thread-door-capabilities/01-thread-door-capabilities.md)
+threads capabilities through arguments and removes the allowance. ^inndoor-m8sw
+
 ## Agent skills
 
 ### Issue tracker

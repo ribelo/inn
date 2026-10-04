@@ -2,4 +2,11 @@
  (name main)
  (public_name inn)
  (package inn)
+ ; ^innlint-b7km: retain implementation CMT evidence for the native entry point.
+ (modes byte exe)
  (libraries inn cmdliner ox ox_app ox_caps ox_http eio_main yojson unix))
+
+(alias
+ (name install)
+ (package inn)
+ (deps main.bc))
