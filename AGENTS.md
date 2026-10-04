@@ -23,3 +23,17 @@ uncommitted work is effectively lost work.
 - When subagents implement slices, the coordinating session reviews each result
   and commits it before starting dependent work.
 - Push only when the user asks.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as committed markdown files under `docs/issues/`; wayfinder maps under `docs/wayfinder/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles, with label strings equal to their names. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `GLOSSARY.md` at the repo root once terms are resolved. See `docs/agents/domain.md`.
