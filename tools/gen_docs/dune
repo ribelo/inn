@@ -1,3 +1,4 @@
 (executable
  (name gen_docs)
- (modules gen_docs))
+ (modules gen_docs)
+ (libraries ox_app ox_caps ox_caps.door))

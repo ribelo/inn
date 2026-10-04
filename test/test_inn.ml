@@ -537,7 +537,10 @@ let free_port ~(caps : < Ox_caps.Cap.network ; .. >) () =
 
 let http_get_opt ~sw:_ ~net:_ ~clock:_ client url =
   match Ox_http.Client.request client ~method_:"GET" ~url () with
-  | Ok response -> Some (response.status, Bytes.to_string response.body)
+  | Ok response -> (
+      match response.body with
+      | `Read bytes -> Some (response.status, Bytes.to_string bytes)
+      | `Skipped -> None)
   | Error _ -> None
 
 let http_get ~sw ~net ~clock client url =

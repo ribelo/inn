@@ -187,7 +187,16 @@ let describe_http_error = function
   | `Protocol message -> "HTTP protocol: " ^ message
   | `Timeout -> "HTTP request timed out"
   | `Idle_timeout -> "HTTP response idle timeout"
-  | `Body_too_large -> "HTTP response exceeds body limit"
+  | `Body failure -> (
+      match failure.H.Client.reason with
+      | `Too_large -> "HTTP response exceeds body limit"
+      | `Truncated -> "HTTP protocol: truncated response body"
+      | `Malformed message -> "HTTP protocol: " ^ message
+      | `Timeout -> "HTTP request timed out"
+      | `Idle_timeout -> "HTTP response idle timeout"
+      | `Tls message -> "TLS: " ^ message
+      | `Closed -> "HTTP connection closed"
+      | `Connect message -> "connection refused: " ^ message)
   | `Closed -> "HTTP connection closed"
 
 let http_request ~runtime config method_ path =
@@ -202,7 +211,10 @@ let http_request ~runtime config method_ path =
             outcome :=
               Some
                 (match H.Client.request client ~method_ ~url () with
-                | Ok response -> Ok (response.status, Bytes.to_string response.body)
+                | Ok response -> (
+                    match response.body with
+                    | `Read bytes -> Ok (response.status, Bytes.to_string bytes)
+                    | `Skipped -> Error "HTTP response body was not read")
                 | Error error -> Error (describe_http_error error))
           with exn -> outcome := Some (Error (Printexc.to_string exn)));
          0));

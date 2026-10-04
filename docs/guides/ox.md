@@ -11,7 +11,9 @@ is `http://127.0.0.1:27687`.
 The HTTP client and exporter share a caller-owned Eio switch. The exporter
 borrows the HTTP client; create the client first, and call `shutdown` before
 leaving the switch. An exporter also registers a switch release hook for
-pending records when the application stops without an explicit shutdown.
+pending records when the application stops without an explicit shutdown. The
+required `~ending_budget` bounds the entire shutdown or switch-release drain;
+this example uses five seconds, after which remaining exports are abandoned.
 
 `test/ox_guide_snippet.ml` is compiled against ox and checked against
 this example by Inn's test suite. The example exports to a collector it starts
@@ -100,7 +102,7 @@ let run ~(caps : < Ox_caps.Cap.env ; Ox_caps.Cap.random ; .. >) () =
   let exporter =
     match
       Ox_otel.create ~caps ~sw ~clock ~http_client ~endpoint
-        ~service_name:"my-app"
+        ~service_name:"my-app" ~ending_budget:(Ox.Duration.seconds 5)
         ~resource:[ ("service.version", "0.1.0") ] ()
     with
     | Ok exporter -> exporter
@@ -158,9 +160,9 @@ transport/status errors (render with `Ox_otel.pp_error`).
 
 `Ox_otel.flush exporter` settles earlier records but keeps admission open.
 `Ox_otel.shutdown exporter` closes admission and returns
-`(unit, Ox_otel.error) result`. Both can report an HTTP error; shutdown also
-takes an optional `Ox.Duration.t` timeout and can return
-`` `Drain_deadline ``.
+`(unit, Ox_otel.error) result`. Both can report an HTTP error; shutdown can
+return `` `Drain_deadline `` when the construction-time `~ending_budget` expires.
+There is no per-call shutdown timeout.
 
 ## Record measurements
 
