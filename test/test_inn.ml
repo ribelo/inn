@@ -8,7 +8,7 @@ let hour_ms = 60 * 60 * 1000
    test depends on wall-clock time. *)
 let base_time = 1_700_000_000_000
 
-let wall_now_ms () = int_of_float (Unix.gettimeofday () *. 1000.)
+let wall_now_ms ~(caps : < Ox_caps.Cap.time ; .. >) () = int_of_float (Ox_caps.Cap_unix.gettimeofday ~caps () *. 1000.)
 
 let contains haystack needle =
   let haystack = String.lowercase_ascii haystack in
@@ -24,8 +24,8 @@ let contains haystack needle =
 
 (* Config ---------------------------------------------------------------- *)
 
-let test_config_defaults_are_user_level () =
-  match Config.resolve ~caps:(Ox_test.powerbox ()) ~env:(env []) ~home:"/home/alice" () with
+let test_config_defaults_are_user_level ~(caps : < Ox_caps.Cap.env ; .. >) () =
+  match Config.resolve ~caps ~env:(env []) ~home:"/home/alice" () with
   | Error message -> Alcotest.fail message
   | Ok config ->
       Alcotest.(check string)
@@ -45,7 +45,7 @@ let test_config_defaults_are_user_level () =
         "prune interval (ret-qd9f)" 300 config.prune_interval_seconds;
       Alcotest.(check int) "max db size" 1024 config.max_db_size_mb
 
-let test_config_env_overrides () =
+let test_config_env_overrides ~(caps : < Ox_caps.Cap.env ; .. >) () =
   let env =
     env
       [
@@ -62,7 +62,7 @@ let test_config_env_overrides () =
         ("INN_MAX_DB_SIZE_MB", "2048");
       ]
   in
-  match Config.resolve ~caps:(Ox_test.powerbox ()) ~env ~home:"/home/alice" () with
+  match Config.resolve ~caps ~env ~home:"/home/alice" () with
   | Error message -> Alcotest.fail message
   | Ok config ->
       Alcotest.(check string) "state dir" "/custom/state" config.state_dir;
@@ -81,9 +81,9 @@ let test_config_env_overrides () =
         "prune interval override (ret-qd9f)" 45 config.prune_interval_seconds;
       Alcotest.(check int) "max db" 2048 config.max_db_size_mb
 
-let test_config_rejects_legacy_retention () =
+let test_config_rejects_legacy_retention ~(caps : < Ox_caps.Cap.env ; .. >) () =
   let env = env [ ("INN_RETENTION_HOURS", "72") ] in
-  match Config.resolve ~caps:(Ox_test.powerbox ()) ~env ~home:"/home/alice" () with
+  match Config.resolve ~caps ~env ~home:"/home/alice" () with
   | Ok _ -> Alcotest.fail "INN_RETENTION_HOURS must be rejected"
   | Error message ->
       Alcotest.(check bool)
@@ -96,10 +96,10 @@ let test_config_rejects_legacy_retention () =
         "names the metrics setting (ret-f1oo)" true
         (contains message "INN_METRICS_RETENTION_HOURS")
 
-let test_config_rejects_invalid_values () =
+let test_config_rejects_invalid_values ~(caps : < Ox_caps.Cap.env ; .. >) () =
   let check_invalid name value =
     let env = env [ (name, value) ] in
-    match Config.resolve ~caps:(Ox_test.powerbox ()) ~env ~home:"/home/alice" () with
+    match Config.resolve ~caps ~env ~home:"/home/alice" () with
     | Ok _ -> Alcotest.failf "%s = %S must be rejected" name value
     | Error message ->
         Alcotest.(check bool)
@@ -216,9 +216,9 @@ let test_metric ?(service_name = "svc") ?(name = "requests.total")
 
 (* Store helpers --------------------------------------------------------- *)
 
-let temp_db_path () =
-  let db_path = Filename.temp_file "inn-test-" ".sqlite" in
-  Sys.remove db_path;
+let temp_db_path ~(caps : < Ox_caps.Cap.fs_write ; Ox_caps.Cap.tmp ; .. >) () =
+  let db_path = Ox_caps.Cap_stdlib.Filename.temp_file ~caps "inn-test-" ".sqlite" in
+  Ox_caps.Cap_sys.remove ~caps db_path;
   db_path
 
 let test_config ?(port = Config.default_port) ?(traces_retention_hours = 48)
@@ -237,15 +237,15 @@ let test_config ?(port = Config.default_port) ?(traces_retention_hours = 48)
     max_db_size_mb;
   }
 
-let temp_config ?port ?traces_retention_hours ?logs_retention_hours
+let temp_config ~(caps : < Ox_caps.Cap.fs_write ; Ox_caps.Cap.tmp ; .. >) ?port ?traces_retention_hours ?logs_retention_hours
     ?metrics_retention_hours ?prune_interval_seconds ?max_db_size_mb () =
   test_config ?port ?traces_retention_hours ?logs_retention_hours
     ?metrics_retention_hours ?prune_interval_seconds ?max_db_size_mb
-    (temp_db_path ())
+    ((temp_db_path ~caps) ())
 
-let cleanup_config config =
+let cleanup_config ~(caps : < Ox_caps.Cap.fs_write ; .. >) config =
   List.iter
-    (fun path -> if Sys.file_exists path then Sys.remove path)
+    (fun path -> if Sys.file_exists path then Ox_caps.Cap_sys.remove ~caps path)
     [ config.Config.db_path; config.db_path ^ "-wal"; config.db_path ^ "-shm" ]
 
 let active_store_switch = ref None
@@ -279,8 +279,8 @@ let run_store_in ~sw ~clock:_ program =
   | Ok value -> value
   | Error error -> Alcotest.failf "%a" Store.pp_error error
 
-let with_store ?now_ms ?report config f =
-  run_store (fun sw -> Store.with_db ~caps:(Ox_test.powerbox ()) ~sw ?now_ms ?report config f)
+let with_store ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; .. >) ?now_ms ?report config f =
+  run_store (fun sw -> Store.with_db ~caps ~sw ?now_ms ?report config f)
 
 (* Test-only database probes. The store's public interface cannot produce a
    stale schema version or a foreign database, and it cannot prove that no
@@ -373,13 +373,13 @@ module Test_metric_attributes = struct
   let owner_id = column "owner_id" Ox_sql.text
 end
 
-let run_test_db path program =
+let run_test_db ~(caps : < Ox_caps.Cap.time ; .. >) path program =
   Eio_main.run @@ fun _env ->
   Eio.Switch.run @@ fun sw ->
   let ( let* ) = Result.bind in
   let program =
     let* pool =
-      Ox_sql.Pool.create ~caps:(Ox_test.powerbox ())
+      Ox_sql.Pool.create ~caps
         ~sw ~default_timeout:(Ox.Duration.seconds 5)
         (Ox_sql.Sqlite.default_config path)
     in
@@ -391,8 +391,8 @@ let run_test_db path program =
   | Ok value -> value
   | Error error -> Alcotest.failf "%a" pp_pool_error error
 
-let write_schema_version path version =
-  run_test_db path (fun pool ->
+let write_schema_version ~(caps : < Ox_caps.Cap.time ; .. >) path version =
+  (run_test_db ~caps) path (fun pool ->
       let ( let* ) = Result.bind in
       let update =
         Ox_sql.Update.(
@@ -404,8 +404,8 @@ let write_schema_version path version =
       let* _ = Ox_sql.Pool.Typed.execute_compiled pool update in
       Result.ok ())
 
-let create_foreign_database path =
-  run_test_db path (fun pool ->
+let create_foreign_database ~(caps : < Ox_caps.Cap.time ; .. >) path =
+  (run_test_db ~caps) path (fun pool ->
       let ( let* ) = Result.bind in
       let schema =
         Ox_sql.Ox_schema.(
@@ -423,16 +423,16 @@ let create_foreign_database path =
       let* _ = Ox_sql.Pool.Typed.execute_compiled pool insert in
       Result.ok ())
 
-let foreign_rows path =
-  run_test_db path (fun pool ->
+let foreign_rows ~(caps : < Ox_caps.Cap.time ; .. >) path =
+  (run_test_db ~caps) path (fun pool ->
       Ox_sql.Pool.Typed.select pool
         (Ox_sql.Select.compile
            Ox_sql.Select.(
              from Test_foreign.table (Ox_sql.Projection.one Test_foreign.id))))
 
 (* Attribute rows whose owner row is gone (ret-hy7e). *)
-let orphan_attribute_rows path =
-  run_test_db path (fun pool ->
+let orphan_attribute_rows ~(caps : < Ox_caps.Cap.time ; .. >) path =
+  (run_test_db ~caps) path (fun pool ->
       let ( let* ) = Result.bind in
       let owners table owner_id =
         Ox_sql.Pool.Typed.select pool
@@ -525,8 +525,8 @@ let json_list_length field = function
       | _ -> Alcotest.failf "expected JSON list field %s" field)
   | _ -> Alcotest.fail "expected JSON object"
 
-let free_port () =
-  let socket = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+let free_port ~(caps : < Ox_caps.Cap.network ; .. >) () =
+  let socket = Ox_caps.Cap_unix.socket ~caps Unix.PF_INET Unix.SOCK_STREAM 0 in
   Fun.protect
     ~finally:(fun () -> Unix.close socket)
     (fun () ->
@@ -545,11 +545,11 @@ let http_get ~sw ~net ~clock client url =
   | Some value -> value
   | None -> Alcotest.failf "GET %s failed" url
 
-let wait_until ~clock ~timeout_seconds predicate =
-  let deadline = Unix.gettimeofday () +. timeout_seconds in
+let wait_until ~(caps : < Ox_caps.Cap.time ; .. >) ~clock ~timeout_seconds predicate =
+  let deadline = Ox_caps.Cap_unix.gettimeofday ~caps () +. timeout_seconds in
   let rec loop () =
     if predicate () then true
-    else if Unix.gettimeofday () > deadline then false
+    else if Ox_caps.Cap_unix.gettimeofday ~caps () > deadline then false
     else (
       Eio.Time.sleep clock 0.05;
       loop ())
@@ -568,16 +568,16 @@ let test_schema_fingerprint_matches_version () =
     "schema fingerprint (schm-hnis)" recorded_schema_fingerprint
     Store.schema_fingerprint
 
-let test_schema_reopen_keeps_data () =
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  with_store config (fun store ->
+let test_schema_reopen_keeps_data ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
+  (with_store ~caps) config (fun store ->
       let ( let* ) = Result.bind in
       let* _ = Store.ingest_traces store [ test_span () ] in
       let* _ = Store.ingest_logs store [ test_log () ] in
       Result.ok ());
   let stats =
-    with_store config (fun store ->
+    (with_store ~caps) config (fun store ->
         let ( let* ) = Result.bind in
         let* _ = Store.ingest_metrics store [ test_metric () ] in
         Store.stats store)
@@ -587,17 +587,17 @@ let test_schema_reopen_keeps_data () =
   Alcotest.(check int) "logs kept (schm-ld81)" 1 stats.Model.logs;
   Alcotest.(check int) "metrics kept (schm-ld81)" 1 stats.Model.metric_points
 
-let test_schema_mismatch_recreates_database () =
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  with_store config (fun store ->
+let test_schema_mismatch_recreates_database ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
+  (with_store ~caps) config (fun store ->
       let ( let* ) = Result.bind in
       let* _ = Store.ingest_logs store [ test_log () ] in
       Result.ok ());
-  write_schema_version config.Config.db_path "0";
+  (write_schema_version ~caps) config.Config.db_path "0";
   let messages = ref [] in
   let stats, ingested =
-    with_store
+    (with_store ~caps)
       ~report:(fun message -> messages := message :: !messages)
       config
       (fun store ->
@@ -622,11 +622,11 @@ let test_schema_mismatch_recreates_database () =
   | messages ->
       Alcotest.failf "expected one schema warning, got %d" (List.length messages))
 
-let test_schema_refuses_foreign_database () =
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
-  create_foreign_database config.Config.db_path;
-  (match run_store_error (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) with
+let test_schema_refuses_foreign_database ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
+  (create_foreign_database ~caps) config.Config.db_path;
+  (match run_store_error (fun sw -> Store.open_ ~caps ~sw config) with
   | Some message ->
       Alcotest.(check bool)
         "error names the missing metadata table (schm-xkk2)" true
@@ -637,23 +637,23 @@ let test_schema_refuses_foreign_database () =
     (Sys.file_exists config.db_path);
   Alcotest.(check (list string))
     "the foreign file still holds its data (schm-xkk2)" [ "row-1" ]
-    (foreign_rows config.Config.db_path);
+    ((foreign_rows ~caps) config.Config.db_path);
   (* A file that is not SQLite at all is refused for the same reason. *)
-  let other = test_config (temp_db_path ()) in
+  let other = test_config ((temp_db_path ~caps) ()) in
   Fun.protect
-    ~finally:(fun () -> cleanup_config other)
+    ~finally:(fun () -> (cleanup_config ~caps) other)
     (fun () ->
       let contents = "not a database\n" in
-      let channel = open_out_bin other.Config.db_path in
+      let channel = Ox_caps.Cap_stdlib.open_out_bin ~caps other.Config.db_path in
       output_string channel contents;
       close_out channel;
-      (match run_store_error (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw other) with
+      (match run_store_error (fun sw -> Store.open_ ~caps ~sw other) with
       | Some message ->
           Alcotest.(check bool)
             "error says the file is not a database (schm-xkk2)" true
             (contains message "not an SQLite database")
       | None -> Alcotest.fail "expected the store to refuse a non-SQLite file");
-      let channel = open_in_bin other.Config.db_path in
+      let channel = Ox_caps.Cap_stdlib.open_in_bin ~caps other.Config.db_path in
       let read = really_input_string channel (in_channel_length channel) in
       close_in channel;
       Alcotest.(check string)
@@ -661,9 +661,9 @@ let test_schema_refuses_foreign_database () =
 
 (* Store ----------------------------------------------------------------- *)
 
-let test_store_ingests_and_queries_all_signals () =
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+let test_store_ingests_and_queries_all_signals ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   let spans =
     match Otlp.decode_traces_json trace_fixture with
     | Ok decoded -> decoded.items
@@ -702,7 +702,7 @@ let test_store_ingests_and_queries_all_signals () =
       stats )
     =
     let ( let* ) = Result.bind in
-    (fun sw -> Store.with_db ~caps:(Ox_test.powerbox ()) ~sw config (fun store ->
+    (fun sw -> Store.with_db ~caps ~sw config (fun store ->
         let* inserted_spans = Store.ingest_traces store spans in
         let* inserted_logs = Store.ingest_logs store logs in
         let* inserted_metrics = Store.ingest_metrics store metrics in
@@ -926,12 +926,12 @@ let test_store_ingests_and_queries_all_signals () =
 
 (* Retention ------------------------------------------------------------- *)
 
-let test_prune_per_signal_ttl () =
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+let test_prune_per_signal_ttl ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   let clock = ref base_time in
   let after_logs, after_traces, stats_after_logs, stats_after_traces =
-    with_store ~now_ms:(fun () -> !clock) config (fun store ->
+    (with_store ~caps) ~now_ms:(fun () -> !clock) config (fun store ->
         let ( let* ) = Result.bind in
         let* _ = Store.ingest_traces store [ test_span () ] in
         let* _ = Store.ingest_logs store [ test_log () ] in
@@ -965,12 +965,12 @@ let test_prune_per_signal_ttl () =
   Alcotest.(check int)
     "metrics left after 48h" 0 stats_after_traces.Model.metric_points
 
-let test_prune_uses_ingestion_time () =
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+let test_prune_uses_ingestion_time ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   let clock = ref base_time in
   let early, late, left =
-    with_store ~now_ms:(fun () -> !clock) config (fun store ->
+    (with_store ~caps) ~now_ms:(fun () -> !clock) config (fun store ->
         let ( let* ) = Result.bind in
         let* _ =
           Store.ingest_logs store
@@ -992,14 +992,14 @@ let test_prune_uses_ingestion_time () =
     "both rows expire on ingestion time (ret-ovry)" 2 late.Model.logs;
   Alcotest.(check int) "no logs left (ret-ovry)" 0 left.Model.logs
 
-let test_prune_keeps_trace_with_fresh_span () =
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+let test_prune_keeps_trace_with_fresh_span ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   let clock = ref base_time in
   let kept_trace = "cccccccccccccccccccccccccccccccc" in
   let stale_trace = "dddddddddddddddddddddddddddddddd" in
   let report, stats, kept, gone, attr_spans, attr_traces =
-    with_store ~now_ms:(fun () -> !clock) config (fun store ->
+    (with_store ~caps) ~now_ms:(fun () -> !clock) config (fun store ->
         let ( let* ) = Result.bind in
         let* _ =
           Store.ingest_traces store
@@ -1074,15 +1074,15 @@ let test_prune_keeps_trace_with_fresh_span () =
     (List.length attr_traces);
   Alcotest.(check int)
     "no orphaned attribute rows (ret-hy7e)" 0
-    (orphan_attribute_rows config.Config.db_path)
+    ((orphan_attribute_rows ~caps) config.Config.db_path)
 
-let test_prune_batches_large_backlog () =
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+let test_prune_batches_large_backlog ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   let clock = ref base_time in
   let bulk_logs = 5_000 in
   let report, stats =
-    with_store ~now_ms:(fun () -> !clock) config (fun store ->
+    (with_store ~caps) ~now_ms:(fun () -> !clock) config (fun store ->
         let ( let* ) = Result.bind in
         let logs =
           List.init bulk_logs (fun index ->
@@ -1099,12 +1099,12 @@ let test_prune_batches_large_backlog () =
     report.Model.logs;
   Alcotest.(check int) "no logs left (ret-xbij)" 0 stats.Model.logs
 
-let test_ingest_does_not_prune () =
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+let test_ingest_does_not_prune ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   let clock = ref base_time in
   let after_ingest, report, after_prune =
-    with_store ~now_ms:(fun () -> !clock) config (fun store ->
+    (with_store ~caps) ~now_ms:(fun () -> !clock) config (fun store ->
         let ( let* ) = Result.bind in
         let* _ = Store.ingest_logs store [ test_log ~body:"first" () ] in
         clock := base_time + (25 * hour_ms);
@@ -1121,15 +1121,15 @@ let test_ingest_does_not_prune () =
     "the pruner deletes the expired row (ret-rkrf)" 1 report.Model.logs;
   Alcotest.(check int) "the fresh row stays (ret-rkrf)" 1 after_prune.Model.logs
 
-let test_prune_size_cap_removes_only_oldest () =
+let test_prune_size_cap_removes_only_oldest ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   let max_db_size_mb = 1 in
-  let config = temp_config ~max_db_size_mb () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let config = (temp_config ~caps) ~max_db_size_mb () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   let clock = ref base_time in
   let old_logs = 150 and new_logs = 20 in
   let body = String.make (8 * 1024) 'x' in
   let report, second_report, stats, new_left, old_left =
-    with_store ~now_ms:(fun () -> !clock) config (fun store ->
+    (with_store ~caps) ~now_ms:(fun () -> !clock) config (fun store ->
         let ( let* ) = Result.bind in
         let old =
           List.init old_logs (fun index ->
@@ -1207,16 +1207,16 @@ let test_prune_size_cap_removes_only_oldest () =
     "a second prune does not trigger the size cap (ret-zjzs)" false
     second_report.Model.size_cap_triggered
 
-let test_stats_reports_retention () =
+let test_stats_reports_retention ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   let config =
-    temp_config ~traces_retention_hours:12 ~logs_retention_hours:6
+    (temp_config ~caps) ~traces_retention_hours:12 ~logs_retention_hours:6
       ~metrics_retention_hours:18 ~prune_interval_seconds:60
       ~max_db_size_mb:512 ()
   in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   let clock = ref base_time in
   let stats =
-    with_store ~now_ms:(fun () -> !clock) config (fun store ->
+    (with_store ~caps) ~now_ms:(fun () -> !clock) config (fun store ->
         let ( let* ) = Result.bind in
         let* _ = Store.ingest_logs store [ test_log () ] in
         let* _ = Store.prune ~now_ms:(base_time + (7 * hour_ms)) store in
@@ -1255,11 +1255,11 @@ let test_stats_reports_retention () =
 
 (* Server ---------------------------------------------------------------- *)
 
-let test_server_handler_ingests_and_queries_services () =
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+let test_server_handler_ingests_and_queries_services ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw config) in
   Fun.protect
     ~finally:(fun () -> run_store (fun _sw -> Store.close store))
     (fun () ->
@@ -1485,16 +1485,16 @@ let test_server_handler_ingests_and_queries_services () =
         "openapi version" "3.1.0"
         (openapi |> response_json |> json_string_field "openapi"))
 
-let test_server_pruner_prunes_without_ingest () =
-  let port = free_port () in
+let test_server_pruner_prunes_without_ingest ~(caps : < Ox_caps.Cap.env ; Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.network ; Ox_caps.Cap.signal ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  let port = (free_port ~caps) () in
   let config =
-    temp_config ~port ~traces_retention_hours:1 ~logs_retention_hours:1
+    (temp_config ~caps) ~port ~traces_retention_hours:1 ~logs_retention_hours:1
       ~metrics_retention_hours:1 ~prune_interval_seconds:1 ()
   in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   (* Telemetry that expired while the server was not running (ret-sbgj). *)
-  with_store
-    ~now_ms:(fun () -> wall_now_ms () - (2 * hour_ms))
+  (with_store ~caps)
+    ~now_ms:(fun () -> (wall_now_ms ~caps) () - (2 * hour_ms))
     config
     (fun store ->
       let ( let* ) = Result.bind in
@@ -1507,7 +1507,7 @@ let test_server_pruner_prunes_without_ingest () =
   let net = Eio.Stdenv.net env in
   let clock = Eio.Stdenv.clock env in
   Eio.Fiber.first
-    (fun () -> Inn.Server.run ~caps:(Ox_test.powerbox ()) ~sw ~env config)
+    (fun () -> Inn.Server.run ~caps ~sw ~env config)
     (fun () ->
       let client = Ox_http.Client.create ~sw ~net ~clock () in
       let base_url = Printf.sprintf "http://127.0.0.1:%d" port in
@@ -1521,13 +1521,13 @@ let test_server_pruner_prunes_without_ingest () =
       in
       Alcotest.(check bool)
         "server is up" true
-        (wait_until ~clock ~timeout_seconds:10.0 (fun () ->
+        ((wait_until ~caps) ~clock ~timeout_seconds:10.0 (fun () ->
              match http_get_opt ~sw ~net ~clock client (base_url ^ "/health") with
              | Some (status, _) -> status = 200
              | None -> false));
       Alcotest.(check bool)
         "the startup pass prunes without ingest (ret-sj15, ret-sbgj)" true
-        (wait_until ~clock ~timeout_seconds:10.0 (fun () -> log_count () = 0));
+        ((wait_until ~caps) ~clock ~timeout_seconds:10.0 (fun () -> log_count () = 0));
       let retention =
         Yojson.Safe.Util.member "retention" (stats_json ())
       in
@@ -1540,8 +1540,8 @@ let test_server_pruner_prunes_without_ingest () =
       (* A later interval pass prunes data that arrives while the server keeps
          running without any ingest request (ret-sj15). *)
       run_store_in ~sw ~clock
-        (fun sw -> Store.with_db ~caps:(Ox_test.powerbox ()) ~sw
-           ~now_ms:(fun () -> wall_now_ms () - (2 * hour_ms))
+        (fun sw -> Store.with_db ~caps ~sw
+           ~now_ms:(fun () -> (wall_now_ms ~caps) () - (2 * hour_ms))
            config
            (fun store ->
              let ( let* ) = Result.bind in
@@ -1551,10 +1551,10 @@ let test_server_pruner_prunes_without_ingest () =
              Result.ok ()));
       Alcotest.(check bool)
         "the expired row becomes visible" true
-        (wait_until ~clock ~timeout_seconds:5.0 (fun () -> log_count () = 1));
+        ((wait_until ~caps) ~clock ~timeout_seconds:5.0 (fun () -> log_count () = 1));
       Alcotest.(check bool)
         "the interval pass prunes it (ret-sj15)" true
-        (wait_until ~clock ~timeout_seconds:10.0 (fun () -> log_count () = 0)))
+        ((wait_until ~caps) ~clock ~timeout_seconds:10.0 (fun () -> log_count () = 0)))
 
 (* OTLP/HTTP JSON conformance regression cases. *)
 let member field = function
@@ -1594,11 +1594,11 @@ let test_otlp_conformance_decoder () =
   Alcotest.(check (option string)) "attribute span (otlp-beaj)"
     (Some "bbbbbbbbbbbbbbbb") log.span_id
 
-let test_otlp_conformance_handler () =
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+let test_otlp_conformance_handler ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw config) in
   let post ?(headers = Ox_http.Header.empty) path body =
     run_server_effect (Inn.Server.handler config store
       (request ~method_:"POST" ~target:path ~body ~headers ())) in
@@ -1676,11 +1676,11 @@ let test_otlp_conformance_handler () =
   Alcotest.(check int) "OK filter includes OK and UNSET (otlp-u6rw)" 2
     (json_list_length "spans" (get "/api/spans/search?status=ok&lookback=all"))
 
-let test_otlp_store_retry () =
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+let test_otlp_store_retry ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw config) in
   run_store (fun _sw -> Store.close store);
   let response = run_server_effect
     (Inn.Server.handler config store
@@ -1872,12 +1872,12 @@ let test_list_policy_cursor () =
         (Option.map (fun position -> position.Model.sort_key_ns) policy.cursor)
   | Error message -> Alcotest.fail message)
 
-let test_query_windows () =
+let test_query_windows ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   (* win-nzur, win-e7k8, win-m4ld, win-jee9, win-3ghy, win-xl30 *)
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw ~now_ms:(fun () -> base_time) config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw ~now_ms:(fun () -> base_time) config) in
   Fun.protect
     ~finally:(fun () -> run_store (fun _sw -> Store.close store))
     (fun () ->
@@ -2053,12 +2053,12 @@ let check_walk ~config ~store ~name ~key ~limit path =
   | [] -> Alcotest.fail "expected at least one page");
   items
 
-let test_pagination_walk_logs () =
+let test_pagination_walk_logs ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   (* win-edze, win-7xet, win-fl8w, win-xi3q, win-xpfn *)
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw ~now_ms:(fun () -> base_time) config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw ~now_ms:(fun () -> base_time) config) in
   Fun.protect
     ~finally:(fun () -> run_store (fun _sw -> Store.close store))
     (fun () ->
@@ -2150,12 +2150,12 @@ let test_pagination_walk_logs () =
         "log ids are unique (win-xpfn)" 100
         (List.length (List.sort_uniq String.compare ids)))
 
-let test_pagination_endpoints () =
+let test_pagination_endpoints ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   (* win-5hgv, win-ggl7, win-7xet, win-xl30 *)
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw ~now_ms:(fun () -> base_time) config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw ~now_ms:(fun () -> base_time) config) in
   Fun.protect
     ~finally:(fun () -> run_store (fun _sw -> Store.close store))
     (fun () ->
@@ -2239,12 +2239,12 @@ let test_pagination_endpoints () =
         (server_get config store ("/logs?lookback=all&cursor=" ^ trace_cursor))
         "cursor")
 
-let test_exact_queries_above_old_caps () =
+let test_exact_queries_above_old_caps ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   (* acc-879n, acc-laac, acc-whoa, acc-gkoz, acc-efzp. *)
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw ~now_ms:(fun () -> base_time) config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw ~now_ms:(fun () -> base_time) config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let span_count = 12_050 and log_count = 188_025 in
   let spans = List.init span_count (fun i ->
@@ -2287,7 +2287,7 @@ let test_exact_queries_above_old_caps () =
         && json_member "count" row = `Int expected) rows) in
   (* acc-1ccu: 200,075 rows. Time bounded SQL queries, not fixture ingest.
      Thirty seconds leaves ample room for slower CI hosts. *)
-  let query_started = Unix.gettimeofday () in
+  let query_started = Ox_caps.Cap_unix.gettimeofday ~caps () in
   Alcotest.(check int) "acc-gkoz old AI call beyond 10k newer spans" 1
     (List.length (response "/ai/calls?lookback=all&model=old-model" "calls"));
   Alcotest.(check int) "acc-879n old trace beyond 10k spans" 1
@@ -2323,14 +2323,14 @@ let test_exact_queries_above_old_caps () =
     "/facets?lookback=all&type=logs&field=attribute_values&key=http.method"
     "facets") "GET" log_count;
   Alcotest.(check bool) "acc-1ccu 200k-row queries finish within 30 seconds"
-    true (Unix.gettimeofday () -. query_started < 30.)
+    true (Ox_caps.Cap_unix.gettimeofday ~caps () -. query_started < 30.)
 
-let test_search_filters_and_exact_stats () =
+let test_search_filters_and_exact_stats ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   (* sf-*, acc-*: literal filters, typed joins, complete aggregates. *)
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw ~now_ms:(fun () -> base_time) config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw ~now_ms:(fun () -> base_time) config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let trace_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in
   let trace_b = "cccccccccccccccccccccccccccccccc" in
@@ -2696,8 +2696,8 @@ module Test_trace_summaries = struct
   let trace_id = column "trace_id" Ox_sql.text
 end
 
-let delete_trace_summary path trace_id =
-  run_test_db path (fun pool ->
+let delete_trace_summary ~(caps : < Ox_caps.Cap.time ; .. >) path trace_id =
+  (run_test_db ~caps) path (fun pool ->
       let ( let* ) = Result.bind in
       let delete =
         Ox_sql.Delete.(
@@ -2708,14 +2708,14 @@ let delete_trace_summary path trace_id =
       let* _ = Ox_sql.Pool.Typed.execute_compiled pool delete in
       Result.ok ())
 
-let test_trace_tree_handlers () =
+let test_trace_tree_handlers ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   (* tree-o79f, tree-uv04, tree-ddll, tree-6vac, tree-3w92, tree-sih1 *)
-  let config = temp_config () in
+  let config = (temp_config ~caps) () in
   Fun.protect
-    ~finally:(fun () -> cleanup_config config)
+    ~finally:(fun () -> (cleanup_config ~caps) config)
     (fun () ->
       run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw ~now_ms:(fun () -> base_time) config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw ~now_ms:(fun () -> base_time) config) in
       Fun.protect
         ~finally:(fun () -> run_store (fun _sw -> Store.close store))
         (fun () ->
@@ -2813,7 +2813,7 @@ let test_trace_tree_handlers () =
             (match json_member "warningCount" listed_summary with
             | `Int _ -> true
             | _ -> false);
-          delete_trace_summary config.Config.db_path trace_id;
+          (delete_trace_summary ~caps) config.Config.db_path trace_id;
           let still = server_get config store ("/traces/" ^ trace_id) in
           Alcotest.(check int)
             "tree-ddll a trace without its summary row still answers" 200
@@ -3162,15 +3162,15 @@ let test_ai_extraction () =
   Alcotest.(check bool) "aic-gywl text covers tool results" true
     (contains search "sunny")
 
-let test_ai_call_store_and_handlers () =
+let test_ai_call_store_and_handlers ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   (* aic-cw6h, aic-jupv, aic-qs41, aic-q5qt, aic-hjcg, aic-yfcd, aic-gywl,
      aic-qpv6, aic-e67r, aic-t8tl *)
-  let config = temp_config () in
+  let config = (temp_config ~caps) () in
   Fun.protect
-    ~finally:(fun () -> cleanup_config config)
+    ~finally:(fun () -> (cleanup_config ~caps) config)
     (fun () ->
       run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw ~now_ms:(fun () -> base_time) config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw ~now_ms:(fun () -> base_time) config) in
       Fun.protect
         ~finally:(fun () -> run_store (fun _sw -> Store.close store))
         (fun () ->
@@ -3497,14 +3497,14 @@ let test_ai_call_store_and_handlers () =
               | _ -> []) = false)))
 
 (* aic-6xrr: the field provenance table lives in the README. *)
-let read_repository_file names =
+let read_repository_file ~(caps : < Ox_caps.Cap.fs_read ; .. >) names =
   match List.find_opt Sys.file_exists names with
-  | Some path -> In_channel.with_open_bin path In_channel.input_all
+  | Some path -> Ox_caps.Cap_stdlib.In_channel.with_open_bin ~caps path In_channel.input_all
   | None -> Alcotest.failf "none of %s exists" (String.concat ", " names)
 
-let test_ai_field_provenance_documented () =
+let test_ai_field_provenance_documented ~(caps : < Ox_caps.Cap.fs_read ; .. >) () =
   let readme =
-    read_repository_file [ "../README.md"; "README.md"; "../../README.md" ]
+    (read_repository_file ~caps) [ "../README.md"; "README.md"; "../../README.md" ]
   in
   Alcotest.(check bool) "aic-6xrr the provenance table exists" true
     (contains readme "AI call field provenance");
@@ -3606,13 +3606,13 @@ let declared_response (endpoint : Inn.Endpoint.t) status =
     (fun (response : Inn.Endpoint.response) -> response_status response = status)
     endpoint.Inn.Endpoint.responses
 
-let test_declarations_drive_the_router () =
+let test_declarations_drive_the_router ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   (* desc-iduq, desc-de6o: one declaration list is the router, the /endpoints
      inventory, and the OpenAPI document. *)
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let inventory =
     json_list "endpoints" (server_json config store "/endpoints")
@@ -3783,13 +3783,13 @@ let test_declarations_drive_the_router () =
       | _ -> ()))
     endpoint_declarations
 
-let test_declared_responses_match_handlers () =
+let test_declared_responses_match_handlers ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   (* desc-iduq: the declared response schema covers what the handler returns,
      and an undeclared query parameter is rejected with the supported list. *)
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   List.iter
     (fun (endpoint : Inn.Endpoint.t) ->
@@ -3846,12 +3846,12 @@ let test_declared_responses_match_handlers () =
   let typed = server_get config store "/traces?limit=abc" in
   check_invalid_query "a wrongly typed parameter" typed "limit must be an integer"
 
-let test_hidden_routes_are_documented () =
+let test_hidden_routes_are_documented ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   (* desc-dmuw: nothing the server serves stays out of the inventory. *)
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let inventory =
     json_list "endpoints" (server_json config store "/endpoints")
@@ -3891,12 +3891,12 @@ let test_hidden_routes_are_documented () =
           (Inn.Server.handler config store
              (request ~method_:"POST" ~target:"/api/v1/metrics" ()))))
 
-let test_docs_endpoints () =
+let test_docs_endpoints ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   (* desc-bqwh, desc-7wwz *)
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let guides = json_list "guides" (server_json config store "/docs") in
   Alcotest.(check int)
@@ -4021,12 +4021,12 @@ let fenced_block language text =
    API (the stanza is enabled on the local-Ox build path). Keeping the two
    texts identical is what stops the guide from drifting away from an API it
    does not compile against. *)
-let test_eta_guide_snippet_is_compiled () =
+let test_eta_guide_snippet_is_compiled ~(caps : < Ox_caps.Cap.fs_read ; .. >) () =
   let guide =
-    read_repository_file [ "../docs/guides/ox.md"; "docs/guides/ox.md" ]
+    (read_repository_file ~caps) [ "../docs/guides/ox.md"; "docs/guides/ox.md" ]
   in
   let source =
-    read_repository_file
+    (read_repository_file ~caps)
       [ "ox_guide_snippet.ml"; "../test/ox_guide_snippet.ml" ]
   in
   match fenced_block "ocaml" guide with
@@ -4036,13 +4036,13 @@ let test_eta_guide_snippet_is_compiled () =
         "the guide's Ox snippet is test/ox_guide_snippet.ml verbatim" source
         block
 
-let test_health_identity () =
+let test_health_identity ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   (* desc-8syr: version, an ISO 8601 start time, and an uptime.
      desc-lqpr: the same real version everywhere. *)
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let health = server_json config store "/health" in
   let healthz = server_json config store "/healthz" in
@@ -4102,12 +4102,12 @@ let test_health_identity () =
   Alcotest.(check string)
     "ready reports the store" "ok" (json_string_field "store" ready)
 
-let test_instructions_point_at_the_docs () =
+let test_instructions_point_at_the_docs ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   (* desc-qv27 *)
-  let config = temp_config () in
-  Fun.protect ~finally:(fun () -> cleanup_config config) @@ fun () ->
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
   run_store_scope @@ fun () ->
-  let store = run_store (fun sw -> Store.open_ ~caps:(Ox_test.powerbox ()) ~sw config) in
+  let store = run_store (fun sw -> Store.open_ ~caps ~sw config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
   let body = response_body_string (server_get config store "/instructions") in
   List.iter
@@ -4120,60 +4120,61 @@ let test_instructions_point_at_the_docs () =
       "/endpoints"; "/v1/traces"; "/v1/logs"; "/v1/metrics";
     ]
 let () =
+  let caps = Ox_test.powerbox () in
   Alcotest.run "inn"
     [
       ( "config",
         [
           Alcotest.test_case "defaults are user-level" `Quick
-            test_config_defaults_are_user_level;
+            (test_config_defaults_are_user_level ~caps);
           Alcotest.test_case "environment overrides are explicit" `Quick
-            test_config_env_overrides;
+            (test_config_env_overrides ~caps);
           Alcotest.test_case "INN_RETENTION_HOURS is rejected (ret-f1oo)" `Quick
-            test_config_rejects_legacy_retention;
+            (test_config_rejects_legacy_retention ~caps);
           Alcotest.test_case "invalid values are rejected (ret-6pix)" `Quick
-            test_config_rejects_invalid_values;
+            (test_config_rejects_invalid_values ~caps);
         ] );
       ( "schema",
         [
           Alcotest.test_case "fingerprint matches the version (schm-hnis)"
             `Quick test_schema_fingerprint_matches_version;
           Alcotest.test_case "reopen keeps data (schm-ld81)" `Quick
-            test_schema_reopen_keeps_data;
+            (test_schema_reopen_keeps_data ~caps);
           Alcotest.test_case "version mismatch recreates (schm-s13e, schm-s52b)"
-            `Quick test_schema_mismatch_recreates_database;
+            `Quick (test_schema_mismatch_recreates_database ~caps);
           Alcotest.test_case "foreign database is refused (schm-xkk2)" `Quick
-            test_schema_refuses_foreign_database;
+            (test_schema_refuses_foreign_database ~caps);
         ] );
       ( "otlp",
         [
           Alcotest.test_case "decodes traces, logs, and metrics" `Quick
             test_otlp_decodes_traces_logs_and_metrics;
           Alcotest.test_case "decoder contracts (otlp-r73z, otlp-6ul3, otlp-8avj, otlp-l0be, otlp-e9t0, otlp-beaj)" `Quick test_otlp_conformance_decoder;
-          Alcotest.test_case "HTTP contracts (otlp-dtfh, otlp-2k5g, otlp-ohmj, otlp-qso2, otlp-l754, otlp-zc8b, otlp-u6rw)" `Quick test_otlp_conformance_handler;
+          Alcotest.test_case "HTTP contracts (otlp-dtfh, otlp-2k5g, otlp-ohmj, otlp-qso2, otlp-l754, otlp-zc8b, otlp-u6rw)" `Quick (test_otlp_conformance_handler ~caps);
           Alcotest.test_case "store unavailable retries (otlp-2wg5)" `Quick
-            test_otlp_store_retry;
+            (test_otlp_store_retry ~caps);
         ] );
       ( "store",
         [
           Alcotest.test_case "ingests and queries all signals" `Quick
-            test_store_ingests_and_queries_all_signals;
+            (test_store_ingests_and_queries_all_signals ~caps);
         ] );
       ( "retention",
         [
           Alcotest.test_case "per-signal ttl (ret-mvsc, ret-57b8, ret-ggir)"
-            `Quick test_prune_per_signal_ttl;
+            `Quick (test_prune_per_signal_ttl ~caps);
           Alcotest.test_case "ingestion time decides expiry (ret-ovry)" `Quick
-            test_prune_uses_ingestion_time;
+            (test_prune_uses_ingestion_time ~caps);
           Alcotest.test_case "fresh span keeps its trace (ret-4hhb, ret-hy7e)"
-            `Quick test_prune_keeps_trace_with_fresh_span;
+            `Quick (test_prune_keeps_trace_with_fresh_span ~caps);
           Alcotest.test_case "bounded batches clear a backlog (ret-xbij)" `Quick
-            test_prune_batches_large_backlog;
+            (test_prune_batches_large_backlog ~caps);
           Alcotest.test_case "ingest does not prune (ret-rkrf)" `Quick
-            test_ingest_does_not_prune;
+            (test_ingest_does_not_prune ~caps);
           Alcotest.test_case "size cap deletes oldest first (ret-zjzs, ret-bizv)"
-            `Quick test_prune_size_cap_removes_only_oldest;
+            `Quick (test_prune_size_cap_removes_only_oldest ~caps);
           Alcotest.test_case "stats carry the retention section (ret-eeb1)"
-            `Quick test_stats_reports_retention;
+            `Quick (test_stats_reports_retention ~caps);
         ] );
       ( "windows",
         [
@@ -4184,26 +4185,26 @@ let () =
           Alcotest.test_case "cursor round trips and rejects garbage (win-edze, win-xl30)"
             `Quick test_list_policy_cursor;
           Alcotest.test_case "list, stats, facet, service, and store windows (win-nzur, win-e7k8, win-m4ld, win-jee9, win-3ghy)"
-            `Quick test_query_windows;
+            `Quick (test_query_windows ~caps);
         ] );
       ( "pagination",
         [
           Alcotest.test_case "walk 250 logs in pages of 100 (win-edze, win-7xet, win-fl8w, win-xi3q, win-xpfn)"
-            `Quick test_pagination_walk_logs;
+            `Quick (test_pagination_walk_logs ~caps);
           Alcotest.test_case "cursor pagination on every long list (win-5hgv, win-ggl7, win-7xet, win-xl30)"
-            `Quick test_pagination_endpoints;
+            `Quick (test_pagination_endpoints ~caps);
         ] );
       ( "search",
         [ Alcotest.test_case "literal filters and SQL aggregates (sf-*, acc-*)"
-            `Quick test_search_filters_and_exact_stats;
+            `Quick (test_search_filters_and_exact_stats ~caps);
           Alcotest.test_case "complete 12k spans and 188k logs (acc-*)"
-            `Slow test_exact_queries_above_old_caps ] );
+            `Slow (test_exact_queries_above_old_caps ~caps) ] );
       ( "server",
         [
           Alcotest.test_case "handler ingests and queries services" `Quick
-            test_server_handler_ingests_and_queries_services;
+            (test_server_handler_ingests_and_queries_services ~caps);
           Alcotest.test_case "pruner runs without ingest (ret-sj15, ret-sbgj)"
-            `Slow test_server_pruner_prunes_without_ingest;
+            `Slow (test_server_pruner_prunes_without_ingest ~caps);
         ] );
       ( "tree",
         [
@@ -4214,7 +4215,7 @@ let () =
             `Quick test_trace_tree_warnings;
           Alcotest.test_case
             "trace, span, and summary handlers (tree-o79f, tree-uv04, tree-ddll, tree-6vac)"
-            `Quick test_trace_tree_handlers;
+            `Quick (test_trace_tree_handlers ~caps);
         ] );
       ( "ai",
         [
@@ -4226,32 +4227,32 @@ let () =
             test_ai_extraction;
           Alcotest.test_case
             "search, stats, and hints (aic-cw6h, aic-jupv, aic-qs41, aic-q5qt, aic-hjcg, aic-yfcd, aic-gywl, aic-qpv6, aic-e67r, aic-t8tl)"
-            `Quick test_ai_call_store_and_handlers;
+            `Quick (test_ai_call_store_and_handlers ~caps);
           Alcotest.test_case "field provenance in the docs (aic-6xrr)" `Quick
-            test_ai_field_provenance_documented;
+            (test_ai_field_provenance_documented ~caps);
         ] );
       ( "self-description",
         [
           Alcotest.test_case
             "declarations drive the router, the inventory, and OpenAPI (desc-iduq, desc-de6o)"
-            `Quick test_declarations_drive_the_router;
+            `Quick (test_declarations_drive_the_router ~caps);
           Alcotest.test_case
             "declared responses cover handler output (desc-iduq)" `Quick
-            test_declared_responses_match_handlers;
+            (test_declared_responses_match_handlers ~caps);
           Alcotest.test_case "hidden routes and aliases are documented (desc-dmuw)"
-            `Quick test_hidden_routes_are_documented;
+            `Quick (test_hidden_routes_are_documented ~caps);
           Alcotest.test_case
             "docs index, guide content, and the 404 (desc-bqwh, desc-7wwz)"
-            `Quick test_docs_endpoints;
+            `Quick (test_docs_endpoints ~caps);
           Alcotest.test_case "guide instructions (desc-wy48, desc-od3y, desc-62du)"
             `Quick test_guide_content;
           Alcotest.test_case
             "the Ox guide snippet is the compiled source (guide-ox-snippet)"
-            `Quick test_eta_guide_snippet_is_compiled;
+            `Quick (test_eta_guide_snippet_is_compiled ~caps);
           Alcotest.test_case "health identity (desc-8syr, desc-lqpr)" `Quick
-            test_health_identity;
+            (test_health_identity ~caps);
           Alcotest.test_case
             "instructions link the guides and the OpenAPI document (desc-qv27)"
-            `Quick test_instructions_point_at_the_docs;
+            `Quick (test_instructions_point_at_the_docs ~caps);
         ] );
     ]

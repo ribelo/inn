@@ -1,29 +1,27 @@
 #!/usr/bin/env bash
-# Inn capability gate (^inncap-m2pd): the installed Ox gate beside ox_caps.
-# Nix findlib is deeper than an opam switch, so walk up from ocamlfind's
-# directory until share/ox_caps/caps-gate appears.
+# innlint-b7km: require fresh compiler-backed capability evidence.
 set -euo pipefail
 cd "$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 
-if ! lib_dir="$(ocamlfind query ox_caps 2>/dev/null)"; then
-  echo "caps-gate: ox_caps is not installed (ocamlfind query ox_caps failed)" >&2
-  exit 2
+# Prefer the explicit Nix output, then the findlib prefix, then PATH.
+installed=""
+if lib_dir="$(ocamlfind query ox_lint 2>/dev/null)"; then
+  installed="$lib_dir/../../bin/ox-lint"
 fi
-dir="$lib_dir"
-gate=""
-while [ "$dir" != "/" ]; do
-  if [ -f "$dir/share/ox_caps/caps-gate" ]; then
-    gate="$dir/share/ox_caps/caps-gate"
+engine=""
+for candidate in "${OX_LINT:-}" "$installed" "$(command -v ox-lint 2>/dev/null || true)"; do
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+    engine="$candidate"
     break
   fi
-  dir="$(dirname "$dir")"
 done
-if [ -z "$gate" ]; then
-  echo "caps-gate: no gate script beside $lib_dir" >&2
+if [ -z "$engine" ]; then
+  echo "caps-gate: ox-lint not found; install ox_lint or set OX_LINT to its executable" >&2
   exit 2
 fi
 
-# ^innlint-b7km: typed rules need this tree's fresh compiler evidence.
+# @check also produces executable modules' fresh typed evidence.
 dune build @install @check
-# ^inndoor-m8sw: every production file is checked, including the CLI.
-exec bash "$gate" --require-typed "$@" lib bin
+
+# No exemptions: generators receive narrow authority from their process entry.
+exec "$engine" --caps-gate --require-typed "$@"

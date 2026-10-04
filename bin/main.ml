@@ -1301,8 +1301,7 @@ let exception_exit_code = function
 
 let () =
   exn_hook := (fun exn -> (friendly_exception exn, exception_exit_code exn));
-  exit
-    (Ox_app.run_with_args ~name:"inn"
+  Ox_app.run_and_exit_with_args ~name:"inn"
        ~doc:"cwd-independent local OpenTelemetry collector and query service"
        ~version ~bare:`Help ~service_command:"door" ~usage_exit:124
        ~log_level:Ox_observability.Logger.Error
@@ -1313,4 +1312,4 @@ let () =
        ~commands_with_env_code:(fun env _run_owned owned ->
          commands ~caps:env.Ox_app.Env.caps
            ~runtime:{ base = env.Ox_app.Env.base; owned })
-       (fun _env _source () () _sw -> Ok ()))
+       (fun _env _source () () _sw -> Ok ())

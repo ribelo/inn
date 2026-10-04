@@ -82,7 +82,7 @@ let check_metrics received =
       if not (mentions body "bucketCounts") then
         failwith "the histogram's samples were never aggregated"
 
-let run () =
+let run ~(caps : < Ox_caps.Cap.env ; Ox_caps.Cap.random ; .. >) () =
   Eio_main.run @@ fun stdenv ->
   Eio.Switch.run @@ fun sw ->
   let net = Eio.Stdenv.net stdenv in
@@ -90,7 +90,7 @@ let run () =
   (* Inn, or any OTLP collector, when the environment names one; otherwise the
      stand-in collector above, which also lets the example check what arrived. *)
   let endpoint, received =
-    match Sys.getenv_opt "OTEL_EXPORTER_OTLP_ENDPOINT" with
+    match Ox_caps.Cap_sys.getenv_opt ~caps "OTEL_EXPORTER_OTLP_ENDPOINT" with
     | Some endpoint -> (endpoint, None)
     | None ->
         let endpoint, received = start_collector ~sw ~net ~clock in
@@ -99,7 +99,6 @@ let run () =
   let http_client = Ox_http.Client.create ~sw ~net ~clock () in
   let exporter =
     match
-      let caps = Ox_test.powerbox () in
       Ox_otel.create ~caps ~sw ~clock ~http_client ~endpoint
         ~service_name:"my-app"
         ~resource:[ ("service.version", "0.1.0") ] ()
@@ -134,12 +133,16 @@ let run () =
   (match received with Some received -> check_metrics received | None -> ());
   (result, settlement)
 
-let () =
-  let _, settlement = run () in
+let main ~(caps : < Ox_caps.Cap.env ; Ox_caps.Cap.random ; Ox_caps.Cap.stdout ; .. >) () =
+  let _, settlement = run ~caps () in
   match settlement with
   | Ok () ->
-      print_endline "spans, logs, the counter and the histogram reached the collector"
+      Ox_caps.Cap_stdlib.print_endline ~caps "spans, logs, the counter and the histogram reached the collector"
   | Error error -> failwith (Format.asprintf "%a" Ox_otel.pp_error error)
+
+let () =
+  let caps = Ox_test.powerbox () in
+  main ~caps ()
 ```
 
 The application's Dune stanza needs `ox`, `ox_http`, `ox_otel`,
