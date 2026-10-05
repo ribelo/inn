@@ -177,6 +177,9 @@ val open_ :
 
     Exceptions from [report], [Ox_sql.Pool], [Ox_caps.Cap_unix.mkdir] and Stdlib
     input-channel operations propagate.
+    @raise Eio.Cancel.Cancelled if [Eio.Switch.run] observes an already-cancelled
+    calling fiber while entering a temporary [Ox_sql.Pool] scope, or cancellation
+    propagates from delegated pool waits or the caller-supplied [report] callback.
     @raise Invalid_argument if [Ox_sql.Pool.create] registers on a finished [sw]. *)
 
 val close : t -> (unit, error) result
@@ -223,6 +226,9 @@ val with_db :
 
     Exceptions from the store callback, [report], [Ox_sql.Pool] and [open_]'s
     [Ox_caps.Cap_unix.mkdir] and Stdlib input-channel operations propagate.
+    @raise Eio.Cancel.Cancelled if [open_]'s [Eio.Switch.run] observes caller
+    cancellation on entry to a temporary [Ox_sql.Pool] scope, or cancellation
+    propagates from delegated pool waits or either caller callback.
     @raise Invalid_argument if [Ox_sql.Pool.create] registers on a finished [sw]. *)
 
 val now_ms : t -> int
