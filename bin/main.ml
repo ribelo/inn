@@ -16,7 +16,10 @@ let exn_hook = ref (fun _exn -> ("internal error", 125))
 let delay ~caps:(caps : < Cap.stderr; .. >) body =
   fun () ->
     try body ()
-    with exn ->
+    with
+    | Eio.Cancel.Cancelled _ as exn ->
+        Printexc.raise_with_backtrace exn (Printexc.get_raw_backtrace ())
+    | exn ->
       let message, code = !exn_hook exn in
       Ox_caps.Cap_stdlib.prerr_endline ~caps message;
       code
@@ -202,6 +205,9 @@ let describe_http_error = function
 let http_request ~runtime config method_ path =
   let url = trim_trailing_slash config.Inn.Config.base_url ^ path in
   let outcome = ref None in
+  (* The owned boundary classifies cancellation to an exit code; retain the
+     exception so this helper still propagates it to its caller. ^innlint-b7km *)
+  let cancellation = ref None in
   ignore
     (runtime.owned (fun sw ->
          let net = Eio.Stdenv.net runtime.base in
@@ -216,11 +222,19 @@ let http_request ~runtime config method_ path =
                     | `Read bytes -> Ok (response.status, Bytes.to_string bytes)
                     | `Skipped -> Error "HTTP response body was not read")
                 | Error error -> Error (describe_http_error error))
-          with exn -> outcome := Some (Error (Printexc.to_string exn)));
+          with
+          | Eio.Cancel.Cancelled _ as exn ->
+              let backtrace = Printexc.get_raw_backtrace () in
+              cancellation := Some (exn, backtrace);
+              Printexc.raise_with_backtrace exn backtrace
+          | exn -> outcome := Some (Error (Printexc.to_string exn)));
          0));
-  match !outcome with
-  | Some result -> result
-  | None -> Error "HTTP request did not run"
+  match !cancellation with
+  | Some (exn, backtrace) -> Printexc.raise_with_backtrace exn backtrace
+  | None -> (
+      match !outcome with
+      | Some result -> result
+      | None -> Error "HTTP request did not run")
 
 let friendly_http_error config message =
   if
@@ -330,7 +344,7 @@ let registry_instance_id ~caps config =
           | Some (`String value) -> Some value
           | _ -> None)
       | _ -> None
-      | exception _ -> None)
+      | exception Yojson.Json_error _ -> None)
 
 let json_bool name value = (name, `Bool value)
 let json_string name value = (name, `String value)
@@ -355,7 +369,7 @@ let health_identity ~runtime config =
           in
           Ok (pid, instance_id)
       | _ -> Error "health response was not a JSON object"
-      | exception exn -> Error (Printexc.to_string exn))
+      | exception (Yojson.Json_error _ as exn) -> Error (Printexc.to_string exn))
   | Ok (status, body) ->
       Error (Printf.sprintf "health returned HTTP %d: %s" status body)
 
@@ -452,7 +466,7 @@ let exec_server ~caps instance_id =
   let env = Ox_caps.Cap_unix.environment ~caps () in
   let env = Array.append env [| "INN_INSTANCE_ID=" ^ instance_id |] in
   try Ox_caps.Cap_unix.execve ~caps argv.(0) argv env
-  with _ -> Ox_caps.Cap_unix._exit ~caps 127
+  with Unix.Unix_error _ -> Ox_caps.Cap_unix._exit ~caps 127
 
 let daemon
     ~caps:(caps : < Cap.fork; Cap.exec; Cap.exit; Cap.env; Cap.signal; Cap.time;
@@ -633,7 +647,7 @@ let trace ~caps:(caps : < Cap.stdout; Cap.stderr; .. >) ~runtime json_flag trace
         | json ->
             Ox_caps.Cap_stdlib.print_string ~caps (render_trace json);
             0
-        | exception _ ->
+        | exception Yojson.Json_error _ ->
             Ox_caps.Cap_stdlib.print_string ~caps body;
             0)
   | Ok (_status, body) ->

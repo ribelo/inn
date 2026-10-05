@@ -22,6 +22,7 @@ Each spec's frontmatter carries its status (completed = implemented and accepted
 | 15 | [caps-on-ox-lint](caps-on-ox-lint/01-caps-on-ox-lint.md) | done |
 | 16 | [thread-door-capabilities](thread-door-capabilities/01-thread-door-capabilities.md) | done (uncommitted for review) |
 | 17 | [restart-daemon-exec](restart-daemon-exec/01-restart-daemon-exec.md) | ready-for-agent |
+| 18 | [delayed-command-cancellation](delayed-command-cancellation/01-classify-delayed-command-cancellation.md) | ready-for-agent |
 
 Specs 3–11 all touch the store and server, so they are implemented one at a
 time, in this order.

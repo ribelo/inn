@@ -5,6 +5,7 @@ CLI checks. This check owns an isolated daemon and exercises process authority.
 """
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -34,6 +35,60 @@ with tempfile.TemporaryDirectory(prefix="inn-door-") as state:
     failed = run("daemon", "--state-dir", os.path.join(obstruction, "child"), code=1)
     assert failed.stdout == "", failed.stdout
     assert "mkdir" in failed.stderr and "Not a directory" in failed.stderr, failed.stderr
+
+    # ^innlint-b7km: hold an actual HTTP read, then cancel only after the
+    # request arrives. No sleep or race with the owned signal monitor.
+    def http_check(response=None):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(10)
+            url = "http://127.0.0.1:%d" % listener.getsockname()[1]
+            child_env = dict(env, OCAMLRUNPARAM="b")
+            child = subprocess.Popen(
+                [exe, "health", "--base-url", url], env=child_env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            try:
+                connection, _ = listener.accept()
+                with connection:
+                    connection.settimeout(10)
+                    request = b""
+                    while b"\r\n\r\n" not in request:
+                        chunk = connection.recv(4096)
+                        assert chunk, request
+                        request += chunk
+                    if response is None:
+                        child.send_signal(signal.SIGINT)
+                    else:
+                        connection.sendall(response)
+                    stdout, stderr = child.communicate(timeout=10)
+                return child.returncode, stdout, stderr
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate()
+
+    code, stdout, stderr = http_check()
+    assert code == 2 and stdout == "", (code, stdout, stderr)
+    assert stderr.splitlines()[0] == (
+        "Fatal error: exception Cancelled: Cancelled: Ox__Interrupt_id.Stop(0)"
+    ), stderr
+    # The original suspended HTTP read survives both re-raises: neither the
+    # ordinary HTTP-error branch nor delay's exception hook erased its trace.
+    assert "Raised at Stdlib__Effect.Deep.discontinue" in stderr, stderr
+    assert "Called from Ox_http__Client.read_head" in stderr, stderr
+    assert "Re-raised at Dune__exe__Main.http_request" in stderr, stderr
+    assert "Re-raised at Dune__exe__Main.delay" in stderr, stderr
+    assert "HTTP request did not run" not in stderr, stderr
+
+    ordinary = b"ordinary HTTP error"
+    response = (
+        b"HTTP/1.1 503 Unavailable\r\nContent-Length: "
+        + str(len(ordinary)).encode()
+        + b"\r\nConnection: close\r\n\r\n" + ordinary
+    )
+    assert http_check(response) == (1, "", ordinary.decode())
 
     registry_path = os.path.join(state, "server.json")
     saved_registry = None

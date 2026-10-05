@@ -185,7 +185,7 @@ let decode_cursor ~kind text =
   | None -> Error malformed_cursor
   | Some raw -> (
       match Yojson.Safe.from_string raw with
-      | exception _ -> Error malformed_cursor
+      | exception Yojson.Json_error _ -> Error malformed_cursor
       | json -> (
           match
             ( json_field "kind" json,

@@ -144,7 +144,40 @@ val open_ :
   (t, error) result
 (** Open the store, recreating a database whose schema version differs from
     [schema_version]. [now_ms] is the ingestion clock (the wall clock by the
-    default) and [report] receives schema diagnostics (stderr by default). *)
+    default) and [report] receives schema diagnostics (stderr by default).
+    [now_ms] is stored for later use, not called while opening. ^innlint-b7km
+
+    Opening delegates filesystem work to [Ox_caps.Cap_unix.mkdir],
+    [Ox_caps.Cap_stdlib.open_in_bin] and [Ox_caps.Cap_sys.remove], query construction
+    to [Ox_sql.Dsl], schema compilation to [Ox_sql.Ox_schema.compile], execution
+    to [Ox_sql.Pool], error rendering to
+    [Ox_sql.pp_error], timeout conversion to [Ox.Duration.seconds], and temporary
+    scope management to [Eio.Switch.run]. Named Stdlib helpers are [Sys.file_exists],
+    [Filename.dirname], [close_in], [in_channel_length], [really_input_string],
+    [Printf.sprintf], [Format.asprintf], [Format.fprintf], [Format.pp_print_string],
+    comparisons and concatenation, and [String], [List] and [Result] operations.
+
+    Suspension: may suspend in the caller-supplied [report] callback and waits
+    delegated to [Ox_sql.Pool] and [Eio.Switch.run]; [Ox_caps] filesystem calls
+    and Stdlib channel operations may block the domain, while other behaviour
+    is delegated to [Ox_sql.Dsl], [Ox_sql.Ox_schema.compile], [Ox_sql.pp_error],
+    [Ox.Duration.seconds] and the named Stdlib helpers.
+    Cancellation: propagates from [report] and calls delegated to [Ox_sql.Pool],
+    [Eio.Switch.run], [Ox_caps], [Ox_sql.Dsl], [Ox_sql.Ox_schema.compile], [Ox_sql.pp_error],
+    [Ox.Duration.seconds] and the named Stdlib helpers; [Ox_sql.Pool] owns
+    protection of its bookkeeping and cleanup.
+    Finalizers: Stdlib [Fun.protect] closes the inspected file; temporary pools
+    are owned by local Eio switches, while the returned pool is owned by [sw],
+    whose release shuts it down even after cancellation during schema setup.
+    Locking: [Ox_sql.Pool] owns its lease and internal locks; no Inn lock spans
+    [report], and SQLite calls retain their native locking.
+    Cancellation safety: unsafe because data is lost if an obsolete database
+    has been deleted before cancellation; directory creation and completed SQL
+    are not rolled back.
+
+    Exceptions from [report], [Ox_sql.Pool], [Ox_caps.Cap_unix.mkdir] and Stdlib
+    input-channel operations propagate.
+    @raise Invalid_argument if [Ox_sql.Pool.create] registers on a finished [sw]. *)
 
 val close : t -> (unit, error) result
 
@@ -164,6 +197,33 @@ val with_db :
   Config.t ->
   (t -> ('a, error) result) ->
   ('a, error) result
+(** Open a store, call the supplied callback and then close the store when the
+    callback returns a result; its [Error] takes precedence over a close error.
+    ^innlint-b7km
+
+    Suspension: may suspend in the caller-supplied store callback or [report],
+    and waits delegated to [Ox_sql.Pool] and [Eio.Switch.run]; opening also
+    delegates filesystem work to [Ox_caps], query construction to [Ox_sql.Dsl],
+    schema compilation to [Ox_sql.Ox_schema.compile], error rendering to
+    [Ox_sql.pp_error], timeout conversion to
+    [Ox.Duration.seconds], and other behaviour to the Stdlib helpers named in
+    [open_], including blocking channel I/O.
+    Cancellation: propagates from the caller callbacks and calls delegated to
+    [Ox_sql.Pool], [Eio.Switch.run], [Ox_caps], [Ox_sql.Dsl], [Ox_sql.Ox_schema.compile], [Ox_sql.pp_error],
+    [Ox.Duration.seconds] and the Stdlib helpers named in [open_]; [Ox_sql.Pool]
+    owns protection of its bookkeeping and cleanup.
+    Finalizers: on a normal callback return [close] is called; an exception or
+    cancellation bypasses that call, leaving the pool owned by [sw] until its
+    release hook runs; temporary opening resources follow [open_]'s cleanup.
+    Locking: no Inn lock spans the store callback or [report]; [Ox_sql.Pool] and
+    SQLite own locks taken by database operations.
+    Cancellation safety: unsafe because progress is lost; completed SQL and
+    caller callback effects are not rolled back, and [open_] may already have
+    deleted an obsolete database.
+
+    Exceptions from the store callback, [report], [Ox_sql.Pool] and [open_]'s
+    [Ox_caps.Cap_unix.mkdir] and Stdlib input-channel operations propagate.
+    @raise Invalid_argument if [Ox_sql.Pool.create] registers on a finished [sw]. *)
 
 val now_ms : t -> int
 (** The store clock. The HTTP layer resolves a lookback window once per request

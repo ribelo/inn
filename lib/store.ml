@@ -388,7 +388,7 @@ let attrs_of_json text =
   | `Assoc fields ->
       fields
   | _ -> []
-  | exception _ -> []
+  | exception Yojson.Json_error _ -> []
 
 let links_of_json text =
   match Yojson.Safe.from_string text with
@@ -401,7 +401,7 @@ let links_of_json text =
           | _ -> None)
       | _ -> None) links
   | _ -> []
-  | exception _ -> []
+  | exception Yojson.Json_error _ -> []
 
 let links_json links =
   Yojson.Safe.to_string (`List (List.map (fun (link : Model.span_link) ->
@@ -435,7 +435,7 @@ let events_of_json text =
           | _ -> None)
         events
   | _ -> []
-  | exception _ -> []
+  | exception Yojson.Json_error _ -> []
 
 let q_schema_pool runner schema =
   Q.Pool.Typed.run_schema runner (Q.Ox_schema.compile schema)
@@ -1043,7 +1043,7 @@ let metric_projection =
         let raw_json =
           match Yojson.Safe.from_string raw_json with
           | json -> json
-          | exception _ -> `Assoc []
+          | exception Yojson.Json_error _ -> `Assoc []
         in
         {
           Model.service_name;

@@ -250,7 +250,7 @@ let status_string (span : Model.span) = Model.span_status_to_string span.status
 let json_of_string text =
   match Yojson.Safe.from_string text with
   | json -> Some json
-  | exception _ -> None
+  | exception Yojson.Json_error _ -> None
 
 let rec text_of_json = function
   | `String value -> Some value
