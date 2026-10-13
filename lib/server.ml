@@ -25,7 +25,7 @@ let error_response status code message =
         ("message", `String message);
       ])
 
-(* A 404 that can say where to look instead (aic-t8tl). *)
+(* An error with extra fields, such as the guide names that a 404 lists. *)
 let error_response_with_details status code message details =
   json_response ~status
     (`Assoc
@@ -203,7 +203,6 @@ Query API:
   %s/api/traces?service=<service>
   %s/api/traces/search?service=<service>&operation=<operation>&attr.<key>=<value>
   %s/api/logs/search?service=<service>&body=<text>
-  %s/api/ai/calls?model=<model>&lookback=1h
   %s/api/facets?type=traces&field=attribute_keys
 
 Documentation:
@@ -214,12 +213,12 @@ Documentation:
   %s/openapi.json    OpenAPI 3.1: every parameter and response schema
   %s/endpoints       endpoint inventory
 |}
-       url url url url url url url url url url url url url url url url url url url)
+       url url url url url url url url url url url url url url url url url url)
 
 let root_text config =
   text_response
     (Printf.sprintf
-       "inn local telemetry server\n\nPOST /v1/traces\nPOST /v1/logs\nPOST /v1/metrics\nGET /health\nGET /healthz\nGET /ready\nGET /api/services\nGET /api/traces\nGET /api/traces/search\nGET /api/traces/stats\nGET /api/traces/<trace-id>\nGET /api/traces/<trace-id>/spans\nGET /api/traces/<trace-id>/logs\nGET /api/spans/search\nGET /api/spans/<span-id>\nGET /api/spans/<span-id>/logs\nGET /api/logs\nGET /api/logs/search\nGET /api/logs/stats\nGET /api/ai/calls\nGET /api/ai/calls/<span-id>\nGET /api/ai/stats\nGET /api/metrics\nGET /api/facets?type=logs&field=severity\nGET /api/stats\nGET /docs\nGET /docs/<name>\nGET /instructions\nGET /endpoints\nGET /openapi.json\n\nstate: %s\ndatabase: %s\n"
+       "inn local telemetry server\n\nPOST /v1/traces\nPOST /v1/logs\nPOST /v1/metrics\nGET /health\nGET /healthz\nGET /ready\nGET /api/services\nGET /api/traces\nGET /api/traces/search\nGET /api/traces/stats\nGET /api/traces/<trace-id>\nGET /api/traces/<trace-id>/spans\nGET /api/traces/<trace-id>/logs\nGET /api/spans/search\nGET /api/spans/<span-id>\nGET /api/spans/<span-id>/logs\nGET /api/logs\nGET /api/logs/search\nGET /api/logs/stats\nGET /api/metrics\nGET /api/facets?type=logs&field=severity\nGET /api/stats\nGET /docs\nGET /docs/<name>\nGET /instructions\nGET /endpoints\nGET /openapi.json\n\nstate: %s\ndatabase: %s\n"
        config.Config.state_dir config.db_path)
 
 let store_json result encode =
@@ -473,229 +472,6 @@ let span_logs store span_id req =
       store_json (Store.search_logs ~attr_contains filter store)
         (page_json "logs" Model.log_to_json policy)
 
-(* AI calls -------------------------------------------------------------- *)
-
-(* Every filter the AI call spec defines, resolved for the store: the HTTP
-   layer parses, the store only queries (aic-yfcd). The attribute key table
-   behind the stored summary lives in [Ai] and the README. *)
-let ai_span_filter params policy cursor limit : Store.ai_call_filter =
-  {
-    Store.service = param "service" params;
-    trace_id = param "traceId" params;
-    operation = param "operation" params;
-    status = param "status" params;
-    provider = param "provider" params;
-    model = param "model" params;
-    session_id = param "sessionId" params;
-    function_id = param "functionId" params;
-    finish_reason = param "finishReason" params;
-    text = param "text" params;
-    attrs = attr_filters params;
-    window = policy.List_policy.window;
-    cursor;
-    limit;
-  }
-
-(* AI calls only, from the AI call table that ingest maintains; paging never
-   scans unrelated spans (acc-gkoz). *)
-let ai_calls store req =
-  with_query req @@ fun params ->
-  match
-    List_policy.list_request ~kind:List_policy.Ai_call
-      ~now_ms:(Store.now_ms store) params
-  with
-  | Error message -> Ok (error_response 400 "invalid_query" message)
-  | Ok policy ->
-      with_search_filters ~duration:true ~contains:true params @@
-      fun min_duration_ms _ attr_contains ->
-      store_json
-        (Store.search_ai_calls ~attr_contains ?min_duration_ms
-           (ai_span_filter params policy policy.cursor policy.limit) store)
-        (page_json "calls" Model.ai_call_to_json policy)
-
-(* The hint is best-effort: a store failure while looking up the parent must
-   not turn the 404 into a 500. *)
-let optional_store = function
-  | Ok value -> value
-  | Error _ -> None
-
-let ai_call_hint store kind (span : Model.span) =
-  let parent =
-    match span.Model.parent_span_id with
-    | None -> None
-    | Some parent_id -> optional_store (Store.get_span store parent_id)
-  in
-  let parent_is_call =
-    match parent with
-    | None -> false
-    | Some (parent : Model.span) ->
-        optional_store (Store.span_ai_kind store parent.Model.span_id) = Some "call"
-  in
-  let label =
-    match kind with
-    | "tool" -> "a tool call"
-    | "nested" -> "a nested provider span"
-    | _ -> "not an AI call"
-  in
-  let parent_call =
-    match parent with
-    | Some (parent : Model.span) when parent_is_call -> Some parent
-    | _ -> None
-  in
-  [
-      ("kind", `String kind);
-      ( "aiCallSpanId",
-        match parent_call with
-        | Some (parent : Model.span) -> `String parent.span_id
-        | None -> `Null );
-      ( "aiCallOperationName",
-        match parent_call with
-        | Some (parent : Model.span) -> `String parent.operation_name
-        | None -> `Null );
-      ( "hint",
-        match parent_call with
-        | Some (parent : Model.span) ->
-            `String
-              (Printf.sprintf
-                 "this span is %s; read its AI call with GET /ai/calls/%s" label
-                 parent.span_id)
-        | None ->
-            `String
-              (Printf.sprintf
-                 "this span is %s; no stored AI call parent was found" label) );
-    ]
-
-let ai_call_detail_json config (detail : Model.ai_call_detail) span logs =
-  let links =
-    [
-      ( "trace",
-        `String
-          (config.Config.base_url ^ "/traces/" ^ detail.Model.call.trace_id) );
-      ( "traceSpans",
-        `String
-          (config.Config.base_url ^ "/traces/" ^ detail.Model.call.trace_id
-         ^ "/spans") );
-    ]
-  in
-  match Model.ai_call_detail_to_json detail with
-  | `Assoc fields ->
-      `Assoc
-        (fields
-        @ [
-            ("span", Model.span_to_json span);
-            ("logs", `List (List.map Model.log_to_json logs));
-            ("links", `Assoc links);
-          ])
-  | json -> json
-
-(* The detail classifies from the stored kind, not from the span alone: a
-   nested provider span's parent is outside the span (aic-t8tl). *)
-let ai_call config store span_id _req =
-  let kind_result =
-    (Store.span_ai_kind store span_id)
-  in
-  match kind_result with
-  | Error error ->
-      Ok
-        (error_response 500 "store_error" (store_error_message error))
-  | Ok None ->
-      Ok
-        (error_response 404 "ai_call_not_found"
-           ("AI call was not found for span " ^ span_id))
-  | Ok (Some kind) when not (String.equal kind "call") ->
-      let span_result =
-        (Store.get_span store span_id)
-      in
-      (match span_result with
-      | Error error ->
-          Ok
-            (error_response 500 "store_error" (store_error_message error))
-      | Ok None ->
-          Ok
-            (error_response 404 "ai_call_not_found"
-               ("AI call was not found for span " ^ span_id))
-      | Ok (Some span) ->
-          let details = ai_call_hint store kind span in
-          Ok
-            (error_response_with_details 404 "ai_call_not_found"
-               ("span " ^ span_id ^ " is not an AI call")
-               details))
-  | Ok (Some _) ->
-      let span_result =
-        (Store.get_span store span_id)
-      in
-      (match span_result with
-      | Error error ->
-          Ok
-            (error_response 500 "store_error" (store_error_message error))
-      | Ok None ->
-          Ok
-            (error_response 404 "ai_call_not_found"
-               ("AI call was not found for span " ^ span_id))
-      | Ok (Some span) -> (
-          let children_result =
-            (Store.list_span_children store span.Model.span_id)
-          in
-          match children_result with
-          | Error error ->
-              Ok
-                (error_response 500 "store_error" (store_error_message error))
-          | Ok children -> (
-              let logs_result =
-                (Store.list_span_logs store ~window:Model.window_all
-                     ~limit:10_000 span.Model.span_id)
-              in
-              match logs_result with
-              | Error error ->
-                  Ok
-                    (error_response 500 "store_error"
-                       (store_error_message error))
-              | Ok logs ->
-                  let detail = Ai.detail_of_span ~children span in
-                  Ok
-                    (json_response
-                       (ai_call_detail_json config detail span
-                          logs.Store.items)))))
-
-(* Every group and aggregate runs in SQL over the whole window; an unknown
-   groupBy or agg is rejected with the allowed values (aic-qpv6, aic-e67r). *)
-let ai_stats store req =
-  with_query req @@ fun params ->
-  match
-    ( param "groupBy" params,
-      param "agg" params,
-      List_policy.summary_request ~now_ms:(Store.now_ms store) params )
-  with
-  | None, _, _ ->
-      Ok
-        (error_response 400 "invalid_query" "groupBy is required")
-  | _, None, _ ->
-      Ok (error_response 400 "invalid_query" "agg is required")
-  | _, _, Error message ->
-      Ok (error_response 400 "invalid_query" message)
-  | Some group_by, Some _, Ok _ when not (List.mem group_by Endpoint.ai_group_by)
-    ->
-      Ok
-        (error_response 400 "invalid_query"
-           (Endpoint.allowed_values "groupBy" Endpoint.ai_group_by))
-  | Some _, Some agg, Ok _ when not (List.mem agg Endpoint.ai_agg) ->
-      Ok
-        (error_response 400 "invalid_query" (Endpoint.allowed_values "agg" Endpoint.ai_agg))
-  | Some group_by, Some agg, Ok policy ->
-      with_search_filters ~duration:true ~contains:true params @@
-      fun min_duration_ms _ attr_contains ->
-      store_json
-        (Store.ai_stats ~attr_contains ?min_duration_ms ~group_by ~agg
-           (ai_span_filter params policy None policy.limit) store)
-        (fun stats ->
-          `Assoc
-            [
-              ("stats", `List (List.map Model.stat_item_to_json stats));
-              ( "meta",
-                List_policy.stats_meta ~lookback:policy.lookback
-                  ~limit:policy.limit );
-            ])
-
 let search_spans store req =
   with_query req @@ fun params ->
   match
@@ -745,8 +521,7 @@ let search_traces store req =
           limit = policy.limit;
         }
       in
-      store_json (Store.search_traces ~attr_contains ?min_duration_ms
-        ?text:(param "text" params) filter store)
+      store_json (Store.search_traces ~attr_contains ?min_duration_ms filter store)
         (page_json "traces" Model.trace_summary_to_json policy)
 
 let trace_stats store req =
@@ -1009,9 +784,6 @@ let route_for config store (endpoint : Endpoint.t) =
   | "logs" -> logs store
   | "log_search" -> search_logs store
   | "log_stats" -> log_stats store
-  | "ai_calls" -> ai_calls store
-  | "ai_call" -> with_route_param "spanId" (ai_call config store)
-  | "ai_stats" -> ai_stats store
   | "metrics" -> metrics store
   | "facets" -> facets store
   | "stats" -> stats store

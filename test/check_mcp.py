@@ -21,7 +21,7 @@ version = subprocess.run([sys.argv[1], "--version"], text=True, capture_output=T
 assert version.returncode == 0 and version.stderr == "", (version.returncode, version.stderr)
 assert responses[0]["result"]["serverInfo"]["version"] == version.stdout.strip() != "dev"
 tools = responses[1]["result"]["tools"]
-assert responses[1]["id"] == 2 and len(tools) == 23, tools
+assert responses[1]["id"] == 2 and len(tools) == 20, tools
 names = [tool["name"] for tool in tools]
 assert "inn_docs_index" in names and "inn_get_doc" in names, names
 assert responses[2]["id"] is None and responses[2]["error"]["code"] == -32700

@@ -190,9 +190,6 @@ GET /spans/<span-id>/logs
 GET /logs?service=<name>&severity=<text>&contains=<text>&limit=<n>
 GET /logs/search?service=<name>&body=<text>&attr.<key>=<value>
 GET /logs/stats?groupBy=<field>
-GET /ai/calls?model=<model>&provider=<provider>&operation=<name>&finishReason=<text>&text=<text>
-GET /ai/calls/<span-id>
-GET /ai/stats?groupBy=<provider|model|functionId|sessionId|status|operation|finishReason>&agg=<count|avg_duration|p95_duration|total_input_tokens|total_output_tokens|total_tokens|error_rate>
 GET /metrics?service=<name>&name=<metric>&limit=<n>
 GET /facets?type=<traces|logs>&field=<field>&key=<attribute-key>
 GET /stats
@@ -214,8 +211,7 @@ returns one guide as Markdown. The guides are Markdown files under
 depend on a checkout path at run time:
 
 - `debug` — the agent debugging workflow: find the service, narrow the window,
-  search traces and logs, open the trace tree, check AI calls, and use stats and
-  facets.
+  search traces and logs, open the trace tree, and use stats and facets.
 - `effect` — point an Effect app's `OtlpTracer`, `OtlpLogger`, and
   `OtlpMetrics` layers at Inn with JSON serialization.
 - `ox` — point an Ox app's `ox_otel` exporter at Inn.
@@ -245,24 +241,22 @@ and `info.version` in `/openapi.json` all report the same build version.
 ### Search filters and exact results
 
 `operation` and `parentOperation` match a case-insensitive substring; a parent
-must belong to the candidate span in the same trace. Log `body`/`contains` and AI
-`text` are also literal, case-insensitive substrings. This means `%`, `_`, and
+must belong to the candidate span in the same trace. Log `body`/`contains` are also literal, case-insensitive substrings. This means `%`, `_`, and
 backslashes are characters, not SQL wildcards. Repeated `attr.<key>` filters require
 exact attribute values, while `attrContains.<key>` requires a literal substring
 of the string form of an attribute value. Different filters combine with AND.
 These attribute filters work on trace/span searches, log list/search, trace/log
 stats, and trace/span correlated log lists.
 
-`minDurationMs` (nonnegative number) applies to trace search/stats, span
-search, and AI call search/stats. `minSeverity` accepts
+`minDurationMs` (nonnegative number) applies to trace search/stats and span
+search. `minSeverity` accepts
 `trace`, `debug`, `info`, `warn`, `error`, or `fatal` on log
 lists/search/stats. It compares OTLP severity numbers, falling back to text
 when no number is present. Exact `severity` comparisons ignore case.
 Trace `status` describes the entire trace: `error` means any span failed,
 and `ok` means none failed. Span status remains span-specific.
 
-Trace search `text` matches AI prompt/response content in a trace, even if
-the matching AI span is not its root. Searches and aggregates run in SQL over
+Searches and aggregates run in SQL over
 the complete selected window rather than sampling a result page. p95 duration
 uses the exact nearest-rank percentile. No sampling or safety cap remains on
 aggregate inputs: these responses are exact, not approximate. Trace service filters match any service
@@ -296,69 +290,6 @@ span detail (`GET /spans/<id>`) share one order and one set of annotations:
   from the list.
 - A trace that has spans is served even if its summary row is missing; only a
   trace with no span at all is a `404`.
-
-### AI calls
-
-Inn classifies AI spans at ingest, and only AI calls are searchable:
-
-- **AI call**: a span from the OpenTelemetry GenAI conventions
-  (`gen_ai.operation.name` such as `chat` or `text_completion`, or
-  `gen_ai.request.model`, or any other `gen_ai.*`/`ai.*` attribute) or a
-  top-level Vercel AI SDK span.
-- **Tool execution**: `gen_ai.operation.name=execute_tool` or a Vercel
-  `ai.toolCall` span. Counted on its AI call, never listed as a call.
-- **Nested provider span**: a Vercel `ai.*.do*` span whose parent is an AI
-  call, such as `ai.generateText.doGenerate`. Excluded from the call list.
-  Without its parent it is the only record of the call and is listed.
-
-`GET /ai/calls` and `GET /ai/stats` read the AI call table written at ingest,
-so they are exact over the window and never scan unrelated spans. Filters are
-`service`, `traceId`, `sessionId`, `functionId`, `provider`, `model`,
-`operation` (substring), `finishReason` (substring), `status`, `text`
-(literal substring of the prompt, response, and tool content, ignoring case),
-`minDurationMs`, `lookback`, and `cursor`. `GET /ai/calls/<span-id>` adds the
-parsed prompt messages, the full response text, the tool calls (name, span id,
-status, duration, arguments, result), the available tools, provider metadata,
-timing (time to first chunk, time to finish, output tokens per second), the
-correlated logs, and links to the parent trace. Asking for the detail of a tool
-execution or a nested provider span is a `404` whose body names the kind and
-points at the AI call parent.
-
-An unsupported `groupBy` or `agg` is a `400` that lists the allowed values.
-
-### AI call field provenance
-
-Every AI call field is read from the OpenTelemetry GenAI semantic conventions
-first and the Vercel AI SDK keys second. This table is the contract for what
-instrumentation must emit.
-
-| Field | GenAI convention | Vercel AI SDK |
-|---|---|---|
-| operation | `gen_ai.operation.name` | `ai.operationId` |
-| provider | `gen_ai.provider.name`, `gen_ai.system` | `ai.model.provider` |
-| model | `gen_ai.request.model`, `gen_ai.response.model` | `ai.model.id` |
-| input tokens | `gen_ai.usage.input_tokens`, `gen_ai.usage.prompt_tokens` | `ai.usage.inputTokens`, `ai.usage.promptTokens` |
-| output tokens | `gen_ai.usage.output_tokens`, `gen_ai.usage.completion_tokens` | `ai.usage.outputTokens`, `ai.usage.completionTokens` |
-| total tokens | `gen_ai.usage.total_tokens` | `ai.usage.totalTokens` (otherwise input + output) |
-| cached input tokens | `gen_ai.usage.cached_input_tokens`, `gen_ai.usage.cache_read.input_tokens` | `ai.usage.cachedInputTokens` |
-| reasoning tokens | `gen_ai.usage.reasoning_tokens` | `ai.usage.reasoningTokens` |
-| finish reason | `gen_ai.response.finish_reasons` | `ai.response.finishReason` |
-| prompt | `gen_ai.input.messages`, `gen_ai.prompt` | `ai.prompt.messages`, `ai.prompt` |
-| response | `gen_ai.output.messages`, `gen_ai.completion` | `ai.response.text`, `ai.response.messages` |
-| available tools | `gen_ai.tool.definitions` | `ai.prompt.tools` |
-| provider metadata | — | `ai.response.providerMetadata` |
-| time to first chunk | `gen_ai.response.time_to_first_chunk` (seconds) | `ai.response.msToFirstChunk` (milliseconds) |
-| time to finish | — | `ai.response.msToFinish` |
-| output tokens per second | — | `ai.response.avgOutputTokensPerSecond` |
-| tool call | `gen_ai.operation.name=execute_tool`, `gen_ai.tool.name`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result` | `ai.toolCall`, `ai.toolCall.name`, `ai.toolCall.args`, `ai.toolCall.result`, `ai.response.toolCalls` |
-| session id | `gen_ai.session.id` | `ai.telemetry.metadata.sessionId` |
-| function id | `gen_ai.function.id` | `ai.telemetry.functionId` |
-| user id | `gen_ai.user.id` | `ai.telemetry.metadata.userId` |
-
-Session and function ids also fall back to `session.id`, `ai.session.id`,
-`function.id`, and `ai.function.id`; a user id also falls back to
-`ai.user.id` and `user.id`. Content values that are JSON strings are parsed
-(the prompt as messages, the response as text) and kept raw otherwise.
 
 ### Windows and cursors
 
@@ -401,7 +332,7 @@ inn status
 inn health
 inn services
 inn traces --service api
-inn search-traces --service api --operation users --status error --attr-contains route=/users --min-duration-ms 5 --text checkout
+inn search-traces --service api --operation users --status error --attr-contains route=/users --min-duration-ms 5
 inn trace aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 inn trace-spans aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 inn trace-logs aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -413,9 +344,6 @@ inn search-logs --service api --body timeout --attr-contains route=/users --min-
 inn trace-stats operation count --service api
 inn log-stats severity --service api
 inn facets traces attribute_keys --service api
-inn ai-calls --model gpt-test --provider openai --finish-reason stop
-inn ai-call bbbbbbbbbbbbbbbb
-inn ai-stats finishReason count --service api
 inn metrics --service api --name requests.total
 inn stats
 inn endpoints
@@ -427,8 +355,7 @@ inn docs debug
 
 `inn trace` prints one indented line per span by default — the operation, the
 service, the duration, and an error mark — followed by the trace warnings. Add
-`--json` for the raw trace response. `inn ai-calls` and `inn ai-stats` accept
-`--finish-reason` next to the other AI filters.
+`--json` for the raw trace response.
 
 Query commands that accept a time window or page through results use
 `--lookback` and `--cursor`; the values are passed to the HTTP API unchanged:
@@ -459,7 +386,7 @@ inn mcp
 
 The MCP tools proxy to the configured Inn HTTP API and include status, services,
 trace/span/log search, trace/log stats, store stats, facets, metrics, endpoint
-inventory, AI call search/stats/detail, instructions, OpenAPI, and the guides
+inventory, instructions, OpenAPI, and the guides
 (`inn_docs_index`, and `inn_get_doc` with a `name` argument).
 
 `inn_stats` returns the store row counts and the retention section, including
@@ -467,11 +394,8 @@ the last prune report, so the pruner is observable without reading server
 logs.
 
 List and search tools take `lookback` and `cursor`. `inn_stats`,
-`inn_services`, `inn_trace_stats`, `inn_log_stats`, `inn_facets`, and
-`inn_ai_stats` take `lookback` only. The AI tools take the same
-`operation`, `finishReason`, `text`, and `minDurationMs` filters the HTTP API
-does, and `inn_ai_stats` groups by every field the API accepts. The tool
-arguments become the same HTTP query parameters the CLI sends.
+`inn_services`, `inn_trace_stats`, `inn_log_stats`, and `inn_facets` take
+`lookback` only. The tool arguments become the same HTTP query parameters the CLI sends.
 
 ## Ox SQL
 
@@ -480,9 +404,6 @@ transactions. Raw SQL is not used in the application storage path. The one
 exception is SQLite pragmas, which have no typed API: `page_count`,
 `freelist_count`, `page_size`, `auto_vacuum`, and `incremental_vacuum` all run
 through one store helper that uses `Ox_sql.Pool.Raw`, the escape hatch
-`Ox_sql.mli` documents for pragmas. AI token totals are summed over the
-nullable token columns with `Q.Projection.sum_int_nullable`: NULL inputs are
-ignored and a group with no reported tokens decodes as `None`, so the columns
-keep their `Q.nullable` declaration and no alias is needed (Ox `d64f1e88`).
+`Ox_sql.mli` documents for pragmas.
 Known Ox SQL API gaps found while building Inn are recorded in
 [.spec/OX_SQL_DOGFOODING.md](.spec/OX_SQL_DOGFOODING.md).

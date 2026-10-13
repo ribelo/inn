@@ -14,7 +14,7 @@ Each spec's frontmatter carries its status (completed = implemented and accepted
 | 7 | [search-filters](search-filters/01-search-filters.md) | done (6154c60) |
 | 8 | [query-accuracy](query-accuracy/01-exact-bounded-queries.md) | done (6154c60) |
 | 9 | [trace-tree](trace-tree/01-trace-tree-view.md) | done (3426a91) |
-| 10 | [ai-calls](ai-calls/01-ai-call-insight.md) | done (3426a91) |
+| 10 | [ai-calls](ai-calls/01-ai-call-insight.md) | removed by bounded-cache (^bcache-n0ai) |
 | 11 | [self-description](self-description/01-openapi-and-guides.md) | done (c03f279) |
 | 12 | [systemd-service](systemd-service/01-service-runs.md) | done (fb9bd18) |
 | 13 | [eta-next-migration](eta-next-migration/01-eta-next-migration.md) | in progress |

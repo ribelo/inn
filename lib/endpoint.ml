@@ -82,28 +82,6 @@ let trace_agg = [ "count"; "avg_duration"; "p95_duration"; "error_rate" ]
 let log_agg = [ "count" ]
 let log_group_by = [ "service"; "severity"; "scope"; "attr.<key>" ]
 
-let ai_group_by =
-  [
-    "provider";
-    "model";
-    "functionId";
-    "sessionId";
-    "status";
-    "operation";
-    "finishReason";
-  ]
-
-let ai_agg =
-  [
-    "count";
-    "avg_duration";
-    "p95_duration";
-    "total_input_tokens";
-    "total_output_tokens";
-    "total_tokens";
-    "error_rate";
-  ]
-
 let severity_levels = [ "trace"; "debug"; "info"; "warn"; "error"; "fatal" ]
 let facet_types = [ "traces"; "logs" ]
 let service_signals = [ "metrics" ]
@@ -253,10 +231,6 @@ let schema_error =
     [
       ("error", schema_string);
       ("message", schema_string);
-      ("kind", schema_nullable schema_string);
-      ("aiCallSpanId", schema_nullable schema_string);
-      ("aiCallOperationName", schema_nullable schema_string);
-      ("hint", schema_nullable schema_string);
       ("available", schema_array schema_string);
     ]
 
@@ -369,76 +343,6 @@ let trace_summary_properties =
     ("isRunning", schema_boolean);
     ("warningCount", schema_integer);
   ]
-
-let token_usage_properties =
-  [
-    ("inputTokens", schema_nullable schema_integer);
-    ("outputTokens", schema_nullable schema_integer);
-    ("totalTokens", schema_nullable schema_integer);
-    ("cachedInputTokens", schema_nullable schema_integer);
-    ("reasoningTokens", schema_nullable schema_integer);
-  ]
-
-let ai_call_properties =
-  [
-    ("spanId", schema_string);
-    ("traceId", schema_string);
-    ("serviceName", schema_string);
-    ("operation", schema_string);
-    ("provider", schema_nullable schema_string);
-    ("model", schema_nullable schema_string);
-    ("status", schema_string);
-    ("startTimeMs", schema_number);
-    ("startTimeUnixNano", schema_string);
-    ("durationMs", schema_nullable schema_number);
-    ("isRunning", schema_boolean);
-    ("finishReason", schema_nullable schema_string);
-    ("sessionId", schema_nullable schema_string);
-    ("functionId", schema_nullable schema_string);
-    ("userId", schema_nullable schema_string);
-    ("toolCallCount", schema_integer);
-    ("usage", schema_object token_usage_properties);
-    ("promptPreview", schema_nullable schema_string);
-    ("responsePreview", schema_nullable schema_string);
-  ]
-
-let ai_call_detail_properties =
-  ai_call_properties
-  @ [
-      ( "prompt",
-        schema_object [
-          ("messages", schema_array schema_any);
-          ("raw", schema_nullable schema_string);
-        ] );
-      ( "response",
-        schema_object [
-          ("text", schema_nullable schema_string);
-          ("raw", schema_nullable schema_string);
-        ] );
-      ( "toolCalls",
-        schema_array
-          (schema_object [
-             ("name", schema_string);
-             ("spanId", schema_nullable schema_string);
-             ("status", schema_string);
-             ("durationMs", schema_nullable schema_number);
-             ("arguments", schema_nullable schema_string);
-             ("result", schema_nullable schema_string);
-           ]) );
-      ("tools", schema_array schema_any);
-      ("providerMetadata", schema_any);
-      ( "timing",
-        schema_object [
-          ("timeToFirstChunkMs", schema_nullable schema_number);
-          ("timeToFinishMs", schema_nullable schema_number);
-          ("outputTokensPerSecond", schema_nullable schema_number);
-        ] );
-      ("span", schema_object span_properties);
-      ("logs", schema_array (schema_object log_properties));
-      ( "links",
-        schema_object [ ("trace", schema_string); ("traceSpans", schema_string) ]
-      );
-    ]
 
 let stat_item_properties =
   [
@@ -574,10 +478,6 @@ let trace_search_params =
     service;
     operation;
     status;
-    param "text" String
-      "Literal, case-insensitive substring of the AI prompt, response, or tool \
-       content anywhere in the trace, even when the matching AI span is not \
-       the root.";
     min_duration;
   ]
   @ attributes
@@ -651,52 +551,6 @@ let log_stats_params =
     body_param "body";
     body_param "contains";
     min_severity;
-  ]
-  @ attributes
-
-let ai_call_params =
-  [
-    lookback ();
-    limit ();
-    cursor;
-    service;
-    param "traceId" String "Only calls of this trace id.";
-    param "sessionId" String "Only calls with this AI session id.";
-    param "functionId" String "Only calls with this AI function id.";
-    param "provider" String "Only calls from this provider.";
-    param "model" String "Only calls that used this model.";
-    operation;
-    status;
-    param "finishReason" String
-      "Case-insensitive substring of the model finish reason.";
-    param "text" String
-      "Literal, case-insensitive substring of the prompt, response, and tool \
-       content.";
-    min_duration;
-  ]
-  @ attributes
-
-let ai_stats_params =
-  [
-    lookback ~default:List_policy.history_lookback ();
-    limit ~default:List_policy.default_stats_limit ();
-    param ~required:true ~allowed:ai_group_by "groupBy" String
-      (Printf.sprintf "Group key: %s." (String.concat ", " ai_group_by));
-    agg "agg" ai_agg;
-    service;
-    param "traceId" String "Only calls of this trace id.";
-    param "sessionId" String "Only calls with this AI session id.";
-    param "functionId" String "Only calls with this AI function id.";
-    param "provider" String "Only calls from this provider.";
-    param "model" String "Only calls that used this model.";
-    operation;
-    status;
-    param "finishReason" String
-      "Case-insensitive substring of the model finish reason.";
-    param "text" String
-      "Literal, case-insensitive substring of the prompt, response, and tool \
-       content.";
-    min_duration;
   ]
   @ attributes
 
@@ -812,8 +666,8 @@ let all =
       [ lookback (); limit (); cursor; service ]
       (query_responses (page_schema "traces" trace_summary_properties));
     query_endpoint "trace_search" "/traces/search" "Search trace summaries"
-      "Searches traces by service, operation, status, attribute, duration, and \
-       AI text. Every filter must match inside the trace."
+      "Searches traces by service, operation, status, attribute, and duration. \
+       Every filter must match inside the trace."
       trace_search_params
       (query_responses (page_schema "traces" trace_summary_properties));
     query_endpoint "trace_stats" "/traces/stats" "Aggregate trace statistics"
@@ -877,28 +731,6 @@ let all =
       "Exact counts over the whole window, grouped by service, severity, \
        scope, or an attribute value."
       log_stats_params
-      (query_responses (summary_schema "stats" stat_item_properties));
-    query_endpoint "ai_calls" "/ai/calls" "Search AI calls"
-      "AI calls only, read from the AI call table written at ingest, so the \
-       result is exact over the window."
-      ai_call_params
-      (query_responses (page_schema "calls" ai_call_properties));
-    query_endpoint "ai_call" "/ai/calls/{spanId}" "One AI call"
-      "The call summary plus the parsed prompt messages, the response text, \
-       the tool calls, the available tools, provider metadata, timing, the \
-       correlated logs, and links to the trace. Asking for a tool execution \
-       or a nested provider span is a 404 that names the kind and points at \
-       the AI call parent."
-      [ span_id_param ]
-      [
-        json_body (schema_object ~required:[ "call" ] ai_call_detail_properties);
-        not_found_response;
-        store_error_response;
-      ];
-    query_endpoint "ai_stats" "/ai/stats" "Aggregate AI call statistics"
-      "Exact SQL aggregates over the AI call table, grouped by provider, \
-       model, functionId, sessionId, status, operation, or finishReason."
-      ai_stats_params
       (query_responses (summary_schema "stats" stat_item_properties));
     query_endpoint "metrics" "/metrics" "Recent metric points"
       "Newest-first metric points over the window, with keyset paging."

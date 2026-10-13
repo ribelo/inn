@@ -88,8 +88,6 @@ val document : base_url:string -> t list -> Yojson.Safe.t
 val trace_agg : string list
 val log_agg : string list
 val log_group_by : string list
-val ai_group_by : string list
-val ai_agg : string list
 val severity_levels : string list
 val facet_types : string list
 val service_signals : string list

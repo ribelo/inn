@@ -5,7 +5,7 @@
     store never parses a parameter: it receives a resolved window and a
     decoded cursor position. *)
 
-type kind = Trace | Span | Log | Ai_call | Metric
+type kind = Trace | Span | Log | Metric
 (** The row family a cursor belongs to. A cursor issued for another family is
     rejected with an error. *)
 

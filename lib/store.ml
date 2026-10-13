@@ -69,23 +69,6 @@ type log_search_filter = {
   limit : int;
 }
 
-type ai_call_filter = {
-  service : string option;
-  trace_id : string option;
-  operation : string option;
-  status : string option;
-  provider : string option;
-  model : string option;
-  session_id : string option;
-  function_id : string option;
-  finish_reason : string option;
-  text : string option;
-  attrs : (string * string) list;
-  window : Model.window;
-  cursor : Model.cursor_position option;
-  limit : int;
-}
-
 type trace_stats_filter = {
   group_by : string;
   agg : string;
@@ -137,7 +120,7 @@ type metric_filter = {
    every change to the statements in [schemas]. [open_] recreates any database
    whose stored version differs, so a schema change without a bump would be
    silently skipped on an existing database (schm-hnis). *)
-let schema_version = 5
+let schema_version = 6
 
 let schema_version_text = string_of_int schema_version
 
@@ -171,8 +154,6 @@ module Spans = struct
   let end_time_ns = column "end_time_ns" Q.int
   let duration_ms = column "duration_ms" Q.float
   let status = column "status" Q.text
-  let is_ai_call = column "is_ai_call" Q.bool
-  let ai_kind = column "ai_kind" Q.text
   let status_message = column "status_message" (Q.nullable Q.text)
   let attributes_json = column "attributes_json" Q.text
   let resource_json = column "resource_json" Q.text
@@ -247,43 +228,6 @@ module Trace_summaries = struct
   let error_count = column "error_count" Q.int
   let is_running = column "is_running" Q.bool
   let warning_count = column "warning_count" Q.int
-  let updated_at_ms = column "updated_at_ms" Q.int
-end
-
-(* AI call summaries are denormalized at ingest so search, filters, grouping,
-   and aggregates run in SQL over the complete window (aic-q5qt, aic-qpv6). *)
-module Ai_calls = struct
-  module T = Q.Table.Make (struct
-    let name = "ai_calls"
-  end)
-
-  include T
-
-  let span_id = column "span_id" Q.text
-  let trace_id = column "trace_id" Q.text
-  let service_name = column "service_name" Q.text
-  let operation = column "operation" Q.text
-  let provider = column "provider" (Q.nullable Q.text)
-  let model = column "model" (Q.nullable Q.text)
-  let status = column "status" Q.text
-  let start_time_ns = column "start_time_ns" Q.int
-  let duration_ms = column "duration_ms" Q.float
-  let is_running = column "is_running" Q.bool
-  (* An empty finish reason means "not reported"; a non-nullable column keeps
-     the typed LIKE and GROUP BY builders available (see [none_if_empty]). *)
-  let finish_reason = column "finish_reason" Q.text
-  let session_id = column "session_id" (Q.nullable Q.text)
-  let function_id = column "function_id" (Q.nullable Q.text)
-  let user_id = column "user_id" (Q.nullable Q.text)
-  let tool_call_count = column "tool_call_count" Q.int
-  let input_tokens = column "input_tokens" (Q.nullable Q.int)
-  let output_tokens = column "output_tokens" (Q.nullable Q.int)
-  let total_tokens = column "total_tokens" (Q.nullable Q.int)
-  let cached_input_tokens = column "cached_input_tokens" (Q.nullable Q.int)
-  let reasoning_tokens = column "reasoning_tokens" (Q.nullable Q.int)
-  let prompt_preview = column "prompt_preview" (Q.nullable Q.text)
-  let response_preview = column "response_preview" (Q.nullable Q.text)
-  let search_text = column "search_text" Q.text
   let updated_at_ms = column "updated_at_ms" Q.int
 end
 
@@ -503,8 +447,6 @@ let schemas =
         column ~not_null:true Spans.end_time_ns;
         column ~not_null:true Spans.duration_ms;
         column ~not_null:true Spans.status;
-        column ~not_null:true Spans.is_ai_call;
-        column ~not_null:true Spans.ai_kind;
         column Spans.status_message;
         column ~not_null:true Spans.attributes_json;
         column ~not_null:true Spans.resource_json;
@@ -526,8 +468,6 @@ let schemas =
       [ Q.Column.any Spans.service_name; Q.Column.any Spans.start_time_ns ];
     create_index ~if_not_exists:true ~name:"idx_spans_trace_parent" Spans.table
       [ Q.Column.any Spans.trace_id; Q.Column.any Spans.parent_span_id ];
-    create_index ~if_not_exists:true ~name:"idx_spans_ai_start" Spans.table
-      [ Q.Column.any Spans.is_ai_call; Q.Column.any Spans.start_time_ns ];
     create_table ~if_not_exists:true Span_attributes.table
       [
         column ~primary_key:true Span_attributes.id;
@@ -612,51 +552,6 @@ let schemas =
     create_index ~if_not_exists:true ~name:"idx_trace_summaries_service_start"
       Trace_summaries.table
       [ Q.Column.any Trace_summaries.service_name; Q.Column.any Trace_summaries.started_at_ns ];
-    create_table ~if_not_exists:true Ai_calls.table
-      [
-        column ~primary_key:true Ai_calls.span_id;
-        column ~not_null:true Ai_calls.trace_id;
-        column ~not_null:true Ai_calls.service_name;
-        column ~not_null:true Ai_calls.operation;
-        column Ai_calls.provider;
-        column Ai_calls.model;
-        column ~not_null:true Ai_calls.status;
-        column ~not_null:true Ai_calls.start_time_ns;
-        column ~not_null:true Ai_calls.duration_ms;
-        column ~not_null:true Ai_calls.is_running;
-        column ~not_null:true Ai_calls.finish_reason;
-        column Ai_calls.session_id;
-        column Ai_calls.function_id;
-        column Ai_calls.user_id;
-        column ~not_null:true Ai_calls.tool_call_count;
-        column Ai_calls.input_tokens;
-        column Ai_calls.output_tokens;
-        column Ai_calls.total_tokens;
-        column Ai_calls.cached_input_tokens;
-        column Ai_calls.reasoning_tokens;
-        column Ai_calls.prompt_preview;
-        column Ai_calls.response_preview;
-        column ~not_null:true Ai_calls.search_text;
-        column ~not_null:true Ai_calls.updated_at_ms;
-      ];
-    create_index ~if_not_exists:true ~name:"idx_ai_calls_start" Ai_calls.table
-      [ Q.Column.any Ai_calls.start_time_ns ];
-    create_index ~if_not_exists:true ~name:"idx_ai_calls_trace" Ai_calls.table
-      [ Q.Column.any Ai_calls.trace_id ];
-    create_index ~if_not_exists:true ~name:"idx_ai_calls_model" Ai_calls.table
-      [ Q.Column.any Ai_calls.model; Q.Column.any Ai_calls.start_time_ns ];
-    create_index ~if_not_exists:true ~name:"idx_ai_calls_provider" Ai_calls.table
-      [ Q.Column.any Ai_calls.provider; Q.Column.any Ai_calls.start_time_ns ];
-    create_index ~if_not_exists:true ~name:"idx_ai_calls_operation" Ai_calls.table
-      [ Q.Column.any Ai_calls.operation ];
-    create_index ~if_not_exists:true ~name:"idx_ai_calls_status" Ai_calls.table
-      [ Q.Column.any Ai_calls.status ];
-    create_index ~if_not_exists:true ~name:"idx_ai_calls_finish_reason"
-      Ai_calls.table [ Q.Column.any Ai_calls.finish_reason ];
-    create_index ~if_not_exists:true ~name:"idx_ai_calls_session" Ai_calls.table
-      [ Q.Column.any Ai_calls.session_id ];
-    create_index ~if_not_exists:true ~name:"idx_ai_calls_function" Ai_calls.table
-      [ Q.Column.any Ai_calls.function_id ];
     create_table ~if_not_exists:true Metric_points.table
       [
         column ~primary_key:true Metric_points.id;
@@ -1384,10 +1279,8 @@ let insert_metric_attrs runner owner_id attrs =
   in
   Ok ()
 
-(* One trace refresh owns every derived row of a trace: the span's stored AI
-   classification (which can change when a late parent or child arrives), the
-   denormalized AI call summaries, the trace summary (tree order, running
-   state, warnings), and the participating services. *)
+(* One trace refresh owns every derived row of a trace: the trace summary
+   (tree order, running state, warnings) and the participating services. *)
 let refresh_trace ~now_ms runner trace_id =
   let open Result.Syntax in
   let* spans = select_spans_for_trace_pool runner trace_id in
@@ -1395,85 +1288,6 @@ let refresh_trace ~now_ms runner trace_id =
   | [] -> Ok ()
   | spans ->
       let tree = Trace_tree.assemble spans in
-      let classifications = Ai.classify_spans spans in
-      let children_by_parent = Hashtbl.create (List.length spans) in
-      List.iter
-        (fun (span : Model.span) ->
-          match span.parent_span_id with
-          | Some parent ->
-              let existing =
-                Option.value (Hashtbl.find_opt children_by_parent parent)
-                  ~default:[]
-              in
-              Hashtbl.replace children_by_parent parent (span :: existing)
-          | None -> ())
-        spans;
-      let children_of span_id =
-        Option.value (Hashtbl.find_opt children_by_parent span_id) ~default:[]
-      in
-      let* () =
-        result_iter classifications (fun ((span : Model.span), kind) ->
-            let* _ =
-              q_exec_pool runner
-                Q.Update.(
-                  table Spans.table
-                  |> set Spans.ai_kind (Ai.classification_to_string kind)
-                  |> set Spans.is_ai_call (kind = Ai.Ai_call)
-                  |> where Q.Expr.(eq Spans.id (span_row_id span))
-                  |> compile)
-            in
-            Ok ())
-      in
-      let* _ =
-        q_exec_pool runner
-          Q.Delete.(
-            from Ai_calls.table
-            |> where Q.Expr.(eq Ai_calls.trace_id trace_id)
-            |> compile)
-      in
-      let* () =
-        result_iter classifications (fun ((span : Model.span), kind) ->
-            match kind with
-            | Ai.Ai_call ->
-                let children = children_of span.span_id in
-                let call = Ai.call_of_span ~children span in
-                let search_text = Ai.search_text ~children span in
-                let insert =
-                  Q.Insert.(
-                    into Ai_calls.table
-                    |> value Ai_calls.span_id call.Model.span_id
-                    |> value Ai_calls.trace_id call.trace_id
-                    |> value Ai_calls.service_name call.service_name
-                    |> value Ai_calls.operation call.operation
-                    |> value Ai_calls.provider call.provider
-                    |> value Ai_calls.model call.model
-                    |> value Ai_calls.status call.status
-                    |> value Ai_calls.start_time_ns call.start_time_ns
-                    |> value Ai_calls.duration_ms
-                         (Option.value call.duration_ms ~default:0.)
-                    |> value Ai_calls.is_running call.is_running
-                    |> value Ai_calls.finish_reason
-                         (Option.value call.finish_reason ~default:"")
-                    |> value Ai_calls.session_id call.session_id
-                    |> value Ai_calls.function_id call.function_id
-                    |> value Ai_calls.user_id call.user_id
-                    |> value Ai_calls.tool_call_count call.tool_call_count
-                    |> value Ai_calls.input_tokens call.usage.Model.input_tokens
-                    |> value Ai_calls.output_tokens call.usage.output_tokens
-                    |> value Ai_calls.total_tokens call.usage.total_tokens
-                    |> value Ai_calls.cached_input_tokens
-                         call.usage.cached_input_tokens
-                    |> value Ai_calls.reasoning_tokens call.usage.reasoning_tokens
-                    |> value Ai_calls.prompt_preview call.prompt_preview
-                    |> value Ai_calls.response_preview call.response_preview
-                    |> value Ai_calls.search_text search_text
-                    |> value Ai_calls.updated_at_ms now_ms
-                    |> compile)
-                in
-                let* _ = q_exec_pool runner insert in
-                Ok ()
-            | _ -> Ok ())
-      in
       let insert =
         Q.Insert.(
           into Trace_summaries.table
@@ -1646,13 +1460,6 @@ let delete_trace_batch runner ~batch cutoff =
     from Trace_services.table
     |> where Q.Expr.(in_select Trace_services.trace_id trace_ids)
     |> compile) in
-  let* _ =
-    q_exec_pool runner
-      Q.Delete.(
-        from Ai_calls.table
-        |> where Q.Expr.(in_select Ai_calls.trace_id trace_ids)
-        |> compile)
-  in
   let* spans =
     q_exec_pool runner
       Q.Delete.(
@@ -1812,17 +1619,6 @@ let ingest_traces t spans =
   let open Result.Syntax in
   let now_ms = t.now_ms () in
   let touched = Hashtbl.create 16 in
-  (* The batch classifies what it can see; [refresh_trace] re-classifies against
-     the complete trace, so a provider sub-span whose parent arrives in another
-     export is corrected in the same transaction. *)
-  let kinds = Hashtbl.create (List.length spans) in
-  List.iter
-    (fun ((span : Model.span), kind) ->
-      Hashtbl.replace kinds span.span_id kind)
-    (Ai.classify_spans spans);
-  let kind_of (span : Model.span) =
-    Option.value (Hashtbl.find_opt kinds span.span_id) ~default:Ai.Not_ai
-  in
   let insert_span runner (span : Model.span) =
     let id = span_row_id span in
     let insert =
@@ -1840,8 +1636,6 @@ let ingest_traces t spans =
         |> value Spans.end_time_ns span.end_time_ns
         |> value Spans.duration_ms span.duration_ms
         |> value Spans.status (Model.span_status_to_string span.status)
-        |> value Spans.is_ai_call (kind_of span = Ai.Ai_call)
-        |> value Spans.ai_kind (Ai.classification_to_string (kind_of span))
         |> value Spans.status_message span.status_message
         |> value Spans.attributes_json (Model.attrs_json_string span.attributes)
         |> value Spans.resource_json (Model.attrs_json_string span.resource)
@@ -1855,7 +1649,6 @@ let ingest_traces t spans =
                     Q.Column.any Spans.operation_name; Q.Column.any Spans.kind;
                     Q.Column.any Spans.start_time_ns; Q.Column.any Spans.end_time_ns;
                     Q.Column.any Spans.duration_ms; Q.Column.any Spans.status;
-                    Q.Column.any Spans.is_ai_call; Q.Column.any Spans.ai_kind;
                     Q.Column.any Spans.status_message;
                     Q.Column.any Spans.attributes_json; Q.Column.any Spans.resource_json;
                     Q.Column.any Spans.events_json; Q.Column.any Spans.links_json;
@@ -2181,158 +1974,6 @@ let span_search_predicate ?(attr_contains = []) ?min_duration_ms
     | Some x -> Q.Expr.and_ p (Q.Expr.eq Spans.status x) in
   Q.Expr.and_ p (keyset_predicate ~sort_key:Spans.start_time_ns ~tie_breaker:Spans.id filter.cursor)
 
-(* AI call summaries are read from their own table, so a filter or an
-   aggregate never scans non-AI spans (acc-gkoz, aic-yfcd). Token totals are
-   summed over the nullable token columns themselves: [sum_int_nullable]
-   ignores NULL and decodes an all-NULL group as [None], so no alias is needed
-   (Ox d64f1e88; see .spec/OX_SQL_DOGFOODING.md). *)
-
-let none_if_empty value = if String.equal value "" then None else Some value
-
-let ai_call_projection =
-  Q.Projection.(
-    map
-      (fun ( ( span_id,
-               trace_id,
-               service_name,
-               operation,
-               provider,
-               model,
-               status,
-               start_time_ns ),
-             ( duration_ms,
-               is_running,
-               finish_reason,
-               session_id,
-               function_id,
-               user_id,
-               tool_call_count,
-               input_tokens ),
-             ( output_tokens,
-               total_tokens,
-               cached_input_tokens,
-               reasoning_tokens,
-               prompt_preview,
-               response_preview ) ) ->
-        {
-          Model.span_id;
-          trace_id;
-          service_name;
-          operation;
-          provider;
-          model;
-          status;
-          start_time_ns;
-          duration_ms = (if is_running then None else Some duration_ms);
-          is_running;
-          finish_reason = none_if_empty finish_reason;
-          session_id;
-          function_id;
-          user_id;
-          tool_call_count;
-          usage =
-            {
-              Model.input_tokens;
-              output_tokens;
-              total_tokens;
-              cached_input_tokens;
-              reasoning_tokens;
-            };
-          prompt_preview;
-          response_preview;
-        })
-      (t3
-         (t8 (one Ai_calls.span_id) (one Ai_calls.trace_id)
-            (one Ai_calls.service_name) (one Ai_calls.operation)
-            (one Ai_calls.provider) (one Ai_calls.model) (one Ai_calls.status)
-            (one Ai_calls.start_time_ns))
-         (t8 (one Ai_calls.duration_ms) (one Ai_calls.is_running)
-            (one Ai_calls.finish_reason) (one Ai_calls.session_id)
-            (one Ai_calls.function_id) (one Ai_calls.user_id)
-            (one Ai_calls.tool_call_count) (one Ai_calls.input_tokens))
-         (t6 (one Ai_calls.output_tokens) (one Ai_calls.total_tokens)
-            (one Ai_calls.cached_input_tokens) (one Ai_calls.reasoning_tokens)
-            (one Ai_calls.prompt_preview) (one Ai_calls.response_preview))))
-
-let ai_call_position (call : Model.ai_call) =
-  { Model.sort_key_ns = call.start_time_ns; tie_breaker = call.span_id }
-
-let substring_predicate column value =
-  let pattern, escape = Q.Expr.contains_pattern value in
-  Q.Expr.like ~escape column pattern
-
-let ai_call_predicate ?(attr_contains = []) ?min_duration_ms
-    (filter : ai_call_filter) =
-  let p =
-    Q.Expr.and_
-      (window_predicate Ai_calls.start_time_ns filter.window)
-      (keyset_predicate ~sort_key:Ai_calls.start_time_ns
-         ~tie_breaker:Ai_calls.span_id filter.cursor)
-  in
-  let and_ = Q.Expr.and_ in
-  let p = match filter.service with
-    | None -> p | Some x -> and_ p (Q.Expr.eq Ai_calls.service_name x) in
-  let p = match filter.trace_id with
-    | None -> p | Some x -> and_ p (Q.Expr.eq Ai_calls.trace_id x) in
-  let p = match filter.provider with
-    | None -> p | Some x -> and_ p (Q.Expr.eq Ai_calls.provider (Some x)) in
-  let p = match filter.model with
-    | None -> p | Some x -> and_ p (Q.Expr.eq Ai_calls.model (Some x)) in
-  let p = match filter.session_id with
-    | None -> p | Some x -> and_ p (Q.Expr.eq Ai_calls.session_id (Some x)) in
-  let p = match filter.function_id with
-    | None -> p | Some x -> and_ p (Q.Expr.eq Ai_calls.function_id (Some x)) in
-  let p = match filter.operation with
-    | None -> p | Some x -> and_ p (substring_predicate Ai_calls.operation x) in
-  let p = match filter.finish_reason with
-    | None -> p | Some x -> and_ p (substring_predicate Ai_calls.finish_reason x) in
-  let p = match filter.text with
-    | None -> p | Some x -> and_ p (substring_predicate Ai_calls.search_text x) in
-  let p = match filter.status with
-    | None -> p
-    | Some "ok" -> and_ p Q.Expr.(not_ (eq Ai_calls.status "error"))
-    | Some x -> and_ p (Q.Expr.eq Ai_calls.status x) in
-  let p = match min_duration_ms with
-    | None -> p | Some x -> and_ p (Q.Expr.ge Ai_calls.duration_ms x) in
-  if filter.attrs = [] && attr_contains = [] then p
-  else
-    let span_ids =
-      Q.Select.(
-        from Spans.table Q.Projection.(one Spans.id)
-        |> where (span_attrs_predicate ~contains:attr_contains Spans.id filter.attrs)
-        |> compile)
-    in
-    and_ p (Q.Expr.in_select Ai_calls.span_id span_ids)
-
-let search_ai_calls ?(attr_contains = []) ?min_duration_ms
-    (filter : ai_call_filter) t =
-  q_select t.pool
-    Q.Select.(
-      from Ai_calls.table ai_call_projection
-      |> where (ai_call_predicate ~attr_contains ?min_duration_ms filter)
-      |> order_by ~desc:true Ai_calls.start_time_ns
-      |> order_by ~desc:true Ai_calls.span_id
-      |> limit (filter.limit + 1))
-  |> Result.map (page_of_rows ~limit:filter.limit ~position:ai_call_position)
-
-(* The stored AI classification of one span, which is what the 404 hint needs:
-   a nested provider span's parent is outside the span itself (aic-t8tl). *)
-let span_ai_kind t span_id =
-  q_select t.pool
-    Q.Select.(
-      from Spans.table Q.Projection.(one Spans.ai_kind)
-      |> where Q.Expr.(eq Spans.span_id span_id)
-      |> limit 1)
-  |> Result.map (function [] -> None | kind :: _ -> Some kind)
-
-(* Direct children of one span, for the AI call's tool calls (aic-fy0u). *)
-let list_span_children t span_id =
-  q_select t.pool
-    Q.Select.(
-      from Spans.table span_projection
-      |> where Q.Expr.(eq Spans.parent_span_id (Some span_id))
-      |> order_by Spans.start_time_ns)
-
 let search_spans ?(attr_contains = []) ?min_duration_ms (filter : span_search_filter) t =
   q_select t.pool Q.Select.(
     from Spans.table span_projection
@@ -2342,28 +1983,7 @@ let search_spans ?(attr_contains = []) ?min_duration_ms (filter : span_search_fi
     |> limit (filter.limit + 1))
   |> Result.map (page_of_rows ~limit:filter.limit ~position:span_position)
 
-let ai_content_keys = [
-  "ai.prompt"; "ai.response"; "ai.tool.input"; "ai.tool.output";
-  "ai.telemetry.prompt"; "ai.telemetry.response";
-  "gen_ai.prompt"; "gen_ai.completion";
-  "gen_ai.input.messages"; "gen_ai.output.messages";
-  "gen_ai.tool.call.arguments"; "gen_ai.tool.call.result";
-]
-
-let ai_text_trace_predicate text =
-  let owners = Q.Select.(
-    from Span_attributes.table Q.Projection.(one Span_attributes.owner_id)
-    |> where Q.Expr.(and_
-         (in_values Span_attributes.key ai_content_keys)
-         (like ~escape:'\\' Span_attributes.value (literal_like_pattern text)))
-    |> compile) in
-  let traces = Q.Select.(
-    from Spans.table Q.Projection.(one Spans.trace_id)
-    |> where Q.Expr.(and_ (eq Spans.is_ai_call true) (in_select Spans.id owners))
-    |> compile) in
-  Q.Expr.in_select Trace_summaries.trace_id traces
-
-let trace_summary_predicate ?(attr_contains = []) ?min_duration_ms ?text
+let trace_summary_predicate ?(attr_contains = []) ?min_duration_ms
     (filter : trace_search_filter) =
   let p = Q.Expr.and_ (window_predicate Trace_summaries.started_at_ns filter.window)
       (keyset_predicate ~sort_key:Trace_summaries.started_at_ns ~tie_breaker:Trace_summaries.trace_id filter.cursor) in
@@ -2375,8 +1995,6 @@ let trace_summary_predicate ?(attr_contains = []) ?min_duration_ms ?text
     | Some _ -> p in
   let p = match min_duration_ms with None -> p | Some x ->
     Q.Expr.and_ p (Q.Expr.ge Trace_summaries.duration_ms x) in
-  let p = match text with None -> p | Some x ->
-    Q.Expr.and_ p (ai_text_trace_predicate x) in
   if Option.is_none filter.operation && filter.attrs = [] && attr_contains = [] then p
   else
     let span_p = Q.Expr.and_ (window_predicate Spans.start_time_ns filter.window)
@@ -2387,17 +2005,17 @@ let trace_summary_predicate ?(attr_contains = []) ?min_duration_ms ?text
       |> where span_p |> compile) in
     Q.Expr.and_ p (Q.Expr.in_select Trace_summaries.trace_id matching)
 
-let trace_summary_search_query ?(attr_contains = []) ?min_duration_ms ?text
+let trace_summary_search_query ?(attr_contains = []) ?min_duration_ms
     (filter : trace_search_filter) =
   Q.Select.(from Trace_summaries.table trace_summary_projection
-    |> where (trace_summary_predicate ~attr_contains ?min_duration_ms ?text filter)
+    |> where (trace_summary_predicate ~attr_contains ?min_duration_ms filter)
     |> order_by ~desc:true Trace_summaries.started_at_ns
     |> order_by ~desc:true Trace_summaries.trace_id
     |> limit (filter.limit + 1))
 
-let search_traces ?(attr_contains = []) ?min_duration_ms ?text
+let search_traces ?(attr_contains = []) ?min_duration_ms
     (filter : trace_search_filter) t =
-  q_select t.pool (trace_summary_search_query ~attr_contains ?min_duration_ms ?text filter)
+  q_select t.pool (trace_summary_search_query ~attr_contains ?min_duration_ms filter)
   |> Result.map (page_of_rows ~limit:filter.limit ~position:trace_position)
 
 let severity_predicate ?min_severity severity =
@@ -2634,102 +2252,6 @@ let trace_stats ?(attr_contains = []) ?min_duration_ms (filter : trace_stats_fil
                  Ok (item :: tail) in
            let* items = collect groups in
            Ok (sort_stat_items filter.limit items))
-
-(* Every group and aggregate runs in SQL over the complete window; no group
-   samples a page (aic-qpv6). *)
-let ai_stats ?(attr_contains = []) ?min_duration_ms
-    ~group_by ~agg (filter : ai_call_filter) t =
-  let open Result.Syntax in
-  let predicate = ai_call_predicate ~attr_contains ?min_duration_ms filter in
-  let p95 count group_pred =
-    let ranked =
-      Q.Select.(
-        from Ai_calls.table
-          Q.Projection.(
-            t2 (one Ai_calls.duration_ms)
-              (row_number ~as_:"rank" ~order_by:Ai_calls.duration_ms ()))
-        |> where Q.Expr.(and_ predicate (group_pred ()))
-        |> compile)
-    in
-    let rank = int_of_float (ceil (0.95 *. float_of_int count)) in
-    let* durations =
-      q_select t.pool
-        Q.Select.(
-          from Ranked_trace_duration.table
-            Q.Projection.(one Ranked_trace_duration.duration_ms)
-          |> with_cte ~name:"ranked_trace_duration" ranked
-          |> where Q.Expr.(eq Ranked_trace_duration.rank rank))
-    in
-    Ok (match durations with duration :: _ -> duration | [] -> 0.)
-  in
-  let by_column label col =
-    let* groups =
-      q_select t.pool
-        Q.Select.(
-          from Ai_calls.table
-            Q.Projection.(
-              t6 (one col) (count ())
-                (avg Q.Numeric.float Ai_calls.duration_ms)
-                (sum_int_nullable Ai_calls.input_tokens)
-                (sum_int_nullable Ai_calls.output_tokens)
-                (sum_int_nullable Ai_calls.total_tokens))
-          |> where predicate |> group_by col)
-    in
-    let* error_groups =
-      if agg = "error_rate" then
-        q_select t.pool
-          Q.Select.(
-            from Ai_calls.table Q.Projection.(t2 (one col) (count ()))
-            |> where Q.Expr.(and_ predicate (eq Ai_calls.status "error"))
-            |> group_by col)
-      else Ok []
-    in
-    let error_counts = Hashtbl.create (List.length error_groups) in
-    List.iter
-      (fun (key, count) -> Hashtbl.replace error_counts (label key) count)
-      error_groups;
-    let rec collect = function
-      | [] -> Ok []
-      | (key, count, avg, input_tokens, output_tokens, total_tokens) :: rest ->
-          let group = label key in
-          let* value =
-            match agg with
-            | "avg_duration" -> Ok (Option.value avg ~default:0.)
-            | "p95_duration" -> p95 count (fun () -> Q.Expr.eq col key)
-            | "total_input_tokens" ->
-                Ok
-                  (float_of_int (Option.value input_tokens ~default:0))
-            | "total_output_tokens" ->
-                Ok
-                  (float_of_int (Option.value output_tokens ~default:0))
-            | "total_tokens" ->
-                Ok
-                  (float_of_int (Option.value total_tokens ~default:0))
-            | "error_rate" ->
-                let errors =
-                  Option.value (Hashtbl.find_opt error_counts group) ~default:0
-                in
-                Ok
-                  (float_of_int errors /. float_of_int (max 1 count))
-            | _ -> Ok (float_of_int count)
-          in
-          let* tail = collect rest in
-          Ok ({ Model.group; value; count } :: tail)
-    in
-    let* items = collect groups in
-    Ok (sort_stat_items filter.limit items)
-  in
-  let label = function Some "" | None -> "unknown" | Some value -> value in
-  let report_label value = if String.equal value "" then "unknown" else value in
-  match group_by with
-  | "model" -> by_column label Ai_calls.model
-  | "provider" -> by_column label Ai_calls.provider
-  | "sessionId" -> by_column label Ai_calls.session_id
-  | "functionId" -> by_column label Ai_calls.function_id
-  | "finishReason" -> by_column report_label Ai_calls.finish_reason
-  | "operation" -> by_column Fun.id Ai_calls.operation
-  | "status" -> by_column Fun.id Ai_calls.status
-  | _ -> Ok []
 
 let log_stats ?(attr_contains = []) ?min_severity
     (filter : log_stats_filter) t =

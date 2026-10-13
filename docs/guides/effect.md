@@ -114,10 +114,6 @@ content type other than `application/json` is a `415`, an oversized body is a
 - Log records with `severityText`, `severityNumber`, body, attributes, and the
   correlation `traceId`/`spanId` when Effect provides the span context.
 - Metric points with name, kind, timestamps, value, and attributes.
-- AI calls: spans that carry OpenTelemetry GenAI attributes or Vercel AI SDK
-  keys are classified at ingest, so `GET /ai/calls` finds them with `model`,
-  `provider`, `sessionId`, `functionId`, `finishReason`, token usage, and the
-  prompt/response previews.
 
 ## Instrument usefully
 
@@ -151,7 +147,6 @@ curl -s 'http://127.0.0.1:27687/services?lookback=all'
 curl -s 'http://127.0.0.1:27687/traces?service=my-app&lookback=15m'
 curl -s 'http://127.0.0.1:27687/logs?service=my-app&lookback=15m'
 curl -s 'http://127.0.0.1:27687/metrics?service=my-app&lookback=15m'
-curl -s 'http://127.0.0.1:27687/ai/calls?service=my-app&lookback=15m'
 ```
 
 If `services` is empty, check the exporter first: the layer was never provided,

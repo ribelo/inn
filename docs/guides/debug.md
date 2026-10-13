@@ -100,7 +100,6 @@ curl -s 'http://127.0.0.1:27687/traces/search?service=api&minDurationMs=500&look
 | `attr.<key>` | Exact attribute value; keys may repeat |
 | `attrContains.<key>` | Literal, case-insensitive substring of an attribute value |
 | `minDurationMs` | Trace duration at least this many milliseconds |
-| `text` | Literal, case-insensitive substring of AI prompt, response, or tool content anywhere in the trace |
 | `lookback`, `limit`, `cursor` | Window, page size, page cursor |
 
 Filters combine with AND, and `%`, `_`, and `\` are literal characters, not
@@ -156,40 +155,7 @@ curl -s 'http://127.0.0.1:27687/spans/bbbbbbbbbbbbbbbb/logs?lookback=all'
 - `GET /traces/{traceId}/logs` and `GET /spans/{spanId}/logs` list correlated
   logs directly.
 
-### 7. Check AI calls
-
-Inn classifies AI spans at ingest. `GET /ai/calls` reads that table, so the
-result is exact over the window and never scans unrelated spans.
-
-```sh
-curl -s 'http://127.0.0.1:27687/ai/calls?model=gpt-5&status=error&lookback=2h'
-curl -s 'http://127.0.0.1:27687/ai/calls?text=refund&sessionId=session-42'
-curl -s 'http://127.0.0.1:27687/ai/calls?operation=chat&finishReason=tool_calls'
-curl -s http://127.0.0.1:27687/ai/calls/dddddddddddddddd
-curl -s 'http://127.0.0.1:27687/ai/stats?groupBy=model&agg=total_tokens&lookback=all'
-```
-
-Filters: `service`, `traceId`, `sessionId`, `functionId`, `provider`, `model`,
-`operation` (substring), `finishReason` (substring), `status`, `text` (literal
-substring of prompt, response, and tool content), `minDurationMs`, `lookback`,
-`cursor`, and `attr.<key>` / `attrContains.<key>`.
-
-`GET /ai/calls/{spanId}` adds the parsed prompt messages, the full response
-text, the tool calls (name, span id, status, duration, arguments, result), the
-available tools, provider metadata, timing (time to first chunk, time to
-finish, output tokens per second), the correlated logs, and links to the trace.
-A tool execution or a nested provider span is a `404` whose body names the kind
-and points at the AI call parent span id — read that call instead.
-
-`GET /ai/stats` groups by `provider`, `model`, `functionId`, `sessionId`,
-`status`, `operation`, or `finishReason` and aggregates with `count`,
-`avg_duration`, `p95_duration`, `total_input_tokens`, `total_output_tokens`,
-`total_tokens`, or `error_rate`. Group by tokens to find the expensive call
-sites; group by `status` or `finishReason` to separate model failures from
-tool-loop problems. An unsupported `groupBy` or `agg` is a `400` that lists the
-allowed values.
-
-### 8. Aggregate and enumerate
+### 7. Aggregate and enumerate
 
 ```sh
 curl -s 'http://127.0.0.1:27687/traces/stats?groupBy=operation&agg=p95_duration&service=api&lookback=1d'
@@ -250,14 +216,13 @@ The MCP server (`inn mcp`) exposes the same surfaces as tools:
 - `inn_search_traces`, `inn_get_trace`, `inn_get_trace_spans`, `inn_get_trace_logs`
 - `inn_search_spans`, `inn_get_span`, `inn_get_span_logs`
 - `inn_search_logs`
-- `inn_trace_stats`, `inn_log_stats`, `inn_ai_stats`, `inn_stats`
-- `inn_search_ai_calls`, `inn_get_ai_call`
+- `inn_trace_stats`, `inn_log_stats`, `inn_stats`
 - `inn_metrics`, `inn_facets`
 - `inn_endpoints`, `inn_instructions`, `inn_openapi`
 - `inn_docs_index`, `inn_get_doc`
 
 List and search tools take `lookback` and `cursor`; `inn_stats`, `inn_services`,
-`inn_trace_stats`, `inn_log_stats`, `inn_facets`, and `inn_ai_stats` take
+`inn_trace_stats`, `inn_log_stats`, and `inn_facets` take
 `lookback` only. Tool arguments become the same HTTP query parameters the CLI
 sends. Read this guide over MCP with `inn_get_doc {\"name\": \"debug\"}`.
 
@@ -276,15 +241,13 @@ CLI equivalents: `inn docs`, `inn docs debug`, `inn endpoints`, `inn openapi`,
 `inn instructions`, `inn services`, `inn traces`, `inn search-traces`,
 `inn trace`, `inn trace-spans`, `inn trace-logs`, `inn search-spans`,
 `inn span`, `inn span-logs`, `inn logs`, `inn search-logs`, `inn trace-stats`,
-`inn log-stats`, `inn facets`, `inn ai-calls`, `inn ai-call`, `inn ai-stats`,
-`inn metrics`, `inn stats`.
+`inn log-stats`, `inn facets`, `inn metrics`, `inn stats`.
 
 ## Errors tell you what to do
 
 - `400 invalid_query` names the offending parameter and, for an unknown one,
   lists the supported parameters for that route.
-- `404` on a drilldown means the id is not in the retained window; on an AI
-  call it names the span kind and the parent call.
+- `404` on a drilldown means the id is not in the retained data.
 - `503` on ingest means the store is busy; retry after one second.
 - An empty page is not an error: widen `lookback` (or use `all`) and check that
   the service name matches exactly.

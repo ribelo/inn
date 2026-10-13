@@ -95,7 +95,6 @@ let mcp_tools =
         ("attributes", mcp_attributes_property);
         ("attributeContains", mcp_attribute_contains_property);
         ("minDurationMs", mcp_number_property "Minimum duration in milliseconds");
-        ("text", mcp_string_property "AI prompt or response substring");
         ("lookback", mcp_lookback_property);
         ("cursor", mcp_cursor_property);
         ("limit", mcp_int_property "Maximum number of traces");
@@ -209,56 +208,6 @@ let mcp_tools =
         ("lookback", mcp_lookback_property);
         ("limit", mcp_int_property "Maximum number of values");
       ];
-    mcp_tool "inn_search_ai_calls"
-      "Search AI calls by service, model, provider, session, function, \
-       operation, status, finish reason, and text."
-      [
-        ("service", mcp_string_property "OTel service.name");
-        ("traceId", mcp_string_property "Trace id");
-        ("sessionId", mcp_string_property "AI session id");
-        ("functionId", mcp_string_property "AI function id");
-        ("provider", mcp_string_property "AI provider");
-        ("model", mcp_string_property "AI model");
-        ("operation", mcp_string_property "GenAI operation name");
-        ("status", mcp_string_property "ok or error");
-        ("finishReason", mcp_string_property "Model finish reason substring");
-        ( "text",
-          mcp_string_property "Text contained in the prompt, response, or tools" );
-        ("minDurationMs", mcp_number_property "Minimum duration in milliseconds");
-        ("lookback", mcp_lookback_property);
-        ("cursor", mcp_cursor_property);
-        ("limit", mcp_int_property "Maximum number of calls");
-      ];
-    mcp_tool ~required:[ "spanId" ] "inn_get_ai_call"
-      "Fetch one AI call by span id, including span and correlated logs."
-      [ ("spanId", mcp_string_property "AI call span id") ];
-    mcp_tool ~required:[ "groupBy"; "agg" ] "inn_ai_stats"
-      "Aggregate AI call statistics by provider, model, functionId, sessionId, \
-       status, operation, or finishReason."
-      [
-        ( "groupBy",
-          mcp_string_property
-            "provider, model, functionId, sessionId, status, operation, or \
-             finishReason" );
-        ( "agg",
-          mcp_string_property
-            "count, avg_duration, p95_duration, total_input_tokens, \
-             total_output_tokens, total_tokens, or error_rate" );
-        ("service", mcp_string_property "OTel service.name");
-        ("traceId", mcp_string_property "Trace id");
-        ("sessionId", mcp_string_property "AI session id");
-        ("functionId", mcp_string_property "AI function id");
-        ("provider", mcp_string_property "AI provider");
-        ("model", mcp_string_property "AI model");
-        ("operation", mcp_string_property "GenAI operation name");
-        ("status", mcp_string_property "ok or error");
-        ("finishReason", mcp_string_property "Model finish reason substring");
-        ( "text",
-          mcp_string_property "Text contained in the prompt, response, or tools" );
-        ("minDurationMs", mcp_number_property "Minimum duration in milliseconds");
-        ("lookback", mcp_lookback_property);
-        ("limit", mcp_int_property "Maximum number of rows");
-      ];
     mcp_tool "inn_metrics" "List recent metric points."
       [
         ("service", mcp_string_property "OTel service.name");
@@ -357,7 +306,6 @@ let tool_call ~request ~status ~base_url name args =
                optional_arg "service" "service" args;
                optional_arg "operation" "operation" args;
                optional_arg "status" "status" args;
-               optional_arg "text" "text" args;
                 ("minDurationMs", json_number_arg "minDurationMs" args);
                optional_arg "lookback" "lookback" args;
                optional_arg "cursor" "cursor" args;
@@ -502,57 +450,6 @@ let tool_call ~request ~status ~base_url name args =
                   ("field", Some field);
                   optional_arg "key" "key" args;
                   optional_arg "service" "service" args;
-                  optional_arg "lookback" "lookback" args;
-                  ("limit", json_limit_arg ~default:20 args);
-                ])
-      | Error message, _ | _, Error message -> Error message)
-  | "inn_search_ai_calls" ->
-      http_tool ~request ~base_url
-        ("/ai/calls"
-        ^ query
-            [
-              optional_arg "service" "service" args;
-              optional_arg "traceId" "traceId" args;
-              optional_arg "sessionId" "sessionId" args;
-              optional_arg "functionId" "functionId" args;
-              optional_arg "provider" "provider" args;
-              optional_arg "model" "model" args;
-              optional_arg "operation" "operation" args;
-              optional_arg "status" "status" args;
-              optional_arg "finishReason" "finishReason" args;
-              optional_arg "text" "text" args;
-                ("minDurationMs", json_number_arg "minDurationMs" args);
-              optional_arg "lookback" "lookback" args;
-              optional_arg "cursor" "cursor" args;
-              ("limit", json_limit_arg args);
-            ])
-  | "inn_get_ai_call" -> (
-      match json_required_string "spanId" args with
-      | Ok span_id ->
-          http_tool ~request ~base_url ("/ai/calls/" ^ percent_encode span_id)
-      | Error message -> Error message)
-  | "inn_ai_stats" -> (
-      match
-        (json_required_string "groupBy" args, json_required_string "agg" args)
-      with
-      | Ok group_by, Ok agg ->
-          http_tool ~request ~base_url
-            ("/ai/stats"
-            ^ query
-                [
-                  ("groupBy", Some group_by);
-                  ("agg", Some agg);
-                  optional_arg "service" "service" args;
-                  optional_arg "traceId" "traceId" args;
-                  optional_arg "sessionId" "sessionId" args;
-                  optional_arg "functionId" "functionId" args;
-                  optional_arg "provider" "provider" args;
-                  optional_arg "model" "model" args;
-                  optional_arg "operation" "operation" args;
-                  optional_arg "status" "status" args;
-                  optional_arg "finishReason" "finishReason" args;
-                  optional_arg "text" "text" args;
-                ("minDurationMs", json_number_arg "minDurationMs" args);
                   optional_arg "lookback" "lookback" args;
                   ("limit", json_limit_arg ~default:20 args);
                 ])

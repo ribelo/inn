@@ -26,8 +26,6 @@ windowed = [
     "trace-stats",
     "log-stats",
     "facets",
-    "ai-calls",
-    "ai-stats",
     "metrics",
     "stats",
 ]
@@ -40,7 +38,6 @@ paginated = [
     "search-traces",
     "logs",
     "search-logs",
-    "ai-calls",
     "metrics",
 ]
 
@@ -53,7 +50,7 @@ for command in paginated:
     assert "--cursor" in output, (command, output)
 
 """desc-85u9: inn docs is a plain command: no window or cursor flags."""
-for command in ["health", "status", "instructions", "endpoints", "openapi", "docs", "trace", "span", "ai-call"]:
+for command in ["health", "status", "instructions", "endpoints", "openapi", "docs", "trace", "span"]:
     output = help_text(command)
     assert "--lookback" not in output, (command, output)
     assert "--cursor" not in output, (command, output)
@@ -62,10 +59,8 @@ for command in ["health", "status", "instructions", "endpoints", "openapi", "doc
 filter_commands = {
     "--attr-contains": ["search-traces", "search-spans", "logs", "search-logs",
                         "trace-stats", "log-stats", "trace-logs", "span-logs"],
-    "--min-duration-ms": ["search-traces", "trace-stats", "search-spans",
-                          "ai-calls", "ai-stats"],
+    "--min-duration-ms": ["search-traces", "trace-stats", "search-spans"],
     "--min-severity": ["logs", "search-logs", "log-stats"],
-    "--text": ["search-traces", "ai-calls", "ai-stats"],
 }
 for flag, commands in filter_commands.items():
     for command in commands:
@@ -77,29 +72,8 @@ for command in ["health", "stats", "facets"]:
 """tree-d24c: inn trace renders a tree by default and JSON with --json."""
 trace_help = help_text("trace")
 assert "--json" in trace_help, trace_help
-for command in ["span", "ai-call", "traces"]:
+for command in ["span", "traces"]:
     assert "--json" not in help_text(command), command
 
-"""aic-5j9w: the AI insight filters reach the CLI that can use them."""
-ai_call_flags = [
-    "--model",
-    "--provider",
-    "--operation",
-    "--finish-reason",
-    "--text",
-    "--min-duration-ms",
-    "--session-id",
-    "--function-id",
-    "--lookback",
-    "--cursor",
-]
-for flag in ai_call_flags:
-    assert flag in help_text("ai-calls"), (flag, help_text("ai-calls"))
-for flag in ["--finish-reason", "--operation", "--text", "--min-duration-ms",
-             "--lookback", "GROUP_BY", "AGG"]:
-    assert flag in help_text("ai-stats"), (flag, help_text("ai-stats"))
-for command in ["traces", "logs", "facets", "stats"]:
-    assert "--finish-reason" not in help_text(command), command
-
 print("win-y63l and srch-fe5d: windows and search flags match CLI commands")
-print("tree-d24c and aic-5j9w: tree rendering and AI flags match CLI commands")
+print("tree-d24c: tree rendering matches CLI commands")

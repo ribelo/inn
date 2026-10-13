@@ -697,10 +697,10 @@ let search_spans ~caps ~runtime service trace_id operation parent_operation stat
      @ List.map attr_contains_param attr_contains)) config
 
 let search_traces ~caps ~runtime service operation status lookback cursor attrs attr_contains
-    min_duration text limit config =
+    min_duration limit config =
   get ~caps ~runtime ("/traces/search" ^ query
     ([ ("service", service); ("operation", operation); ("status", status);
-       ("lookback", lookback); ("cursor", cursor); ("text", text);
+       ("lookback", lookback); ("cursor", cursor);
        ("minDurationMs", Option.map string_of_float min_duration);
        ("limit", Some (string_of_int limit)) ]
      @ List.map attr_param attrs
@@ -760,55 +760,6 @@ let facets ~caps ~runtime kind field key service lookback limit config =
         ])
     config
 
-let ai_calls ~caps ~runtime service trace_id session_id function_id provider model operation
-    status finish_reason text lookback cursor min_duration limit config =
-  get ~caps ~runtime
-    ("/ai/calls"
-    ^ query
-        [
-          ("service", service);
-          ("traceId", trace_id);
-          ("sessionId", session_id);
-          ("functionId", function_id);
-          ("provider", provider);
-          ("model", model);
-          ("operation", operation);
-          ("status", status);
-          ("finishReason", finish_reason);
-          ("text", text);
-           ("minDurationMs", Option.map string_of_float min_duration);
-          ("lookback", lookback);
-          ("cursor", cursor);
-          ("limit", Some (string_of_int limit));
-        ])
-    config
-
-let ai_call ~caps ~runtime span_id config =
-  get ~caps ~runtime ("/ai/calls/" ^ percent_encode span_id) config
-
-let ai_stats ~caps ~runtime group_by agg service trace_id session_id function_id provider model
-    operation status finish_reason text lookback min_duration limit config =
-  get ~caps ~runtime
-    ("/ai/stats"
-    ^ query
-        [
-          ("groupBy", Some group_by);
-          ("agg", Some agg);
-          ("service", service);
-          ("traceId", trace_id);
-          ("sessionId", session_id);
-          ("functionId", function_id);
-          ("provider", provider);
-          ("model", model);
-          ("operation", operation);
-          ("status", status);
-          ("finishReason", finish_reason);
-          ("text", text);
-           ("minDurationMs", Option.map string_of_float min_duration);
-          ("lookback", lookback);
-          ("limit", Some (string_of_int limit));
-        ])
-    config
 
 let metrics ~caps ~runtime service name lookback cursor limit config =
   get ~caps ~runtime
@@ -911,43 +862,6 @@ let status_t =
     & opt (some string) None
     & info [ "status" ] ~docv:"STATUS" ~doc:"Filter by span status.")
 
-let session_id_t =
-  Arg.(
-    value
-    & opt (some string) None
-    & info [ "session-id" ] ~docv:"SESSION" ~doc:"Filter by AI session id.")
-
-let function_id_t =
-  Arg.(
-    value
-    & opt (some string) None
-    & info [ "function-id" ] ~docv:"FUNCTION" ~doc:"Filter by AI function id.")
-
-let provider_t =
-  Arg.(
-    value
-    & opt (some string) None
-    & info [ "provider" ] ~docv:"PROVIDER" ~doc:"Filter by AI provider.")
-
-let model_t =
-  Arg.(
-    value
-    & opt (some string) None
-    & info [ "model" ] ~docv:"MODEL" ~doc:"Filter by AI model.")
-
-let text_t =
-  Arg.(
-    value
-    & opt (some string) None
-    & info [ "text" ] ~docv:"TEXT" ~doc:"Filter AI calls by text.")
-
-let finish_reason_t =
-  Arg.(
-    value
-    & opt (some string) None
-    & info [ "finish-reason" ] ~docv:"REASON"
-        ~doc:"Filter AI calls by finish reason substring.")
-
 let json_t =
   Arg.(
     value
@@ -1045,22 +959,6 @@ let later12 ~caps f t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 =
         delay ~caps (fun () -> f a b c d e g h i j k l m))
     $ t1 $ t2 $ t3 $ t4 $ t5 $ t6 $ t7 $ t8 $ t9 $ t10 $ t11 $ t12)
 
-let later15 ~caps f t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 =
-  Term.(
-    const
-      (fun a b c d e g h i j k l m n o p ->
-        delay ~caps (fun () -> f a b c d e g h i j k l m n o p))
-    $ t1 $ t2 $ t3 $ t4 $ t5 $ t6 $ t7 $ t8 $ t9 $ t10 $ t11 $ t12 $ t13 $ t14
-    $ t15)
-
-let later16 ~caps f t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 =
-  Term.(
-    const
-      (fun a b c d e g h i j k l m n o p q ->
-        delay ~caps (fun () -> f a b c d e g h i j k l m n o p q))
-    $ t1 $ t2 $ t3 $ t4 $ t5 $ t6 $ t7 $ t8 $ t9 $ t10 $ t11 $ t12 $ t13 $ t14
-    $ t15 $ t16)
-
 let later_unit1 ~caps f t1 = Term.(const (fun a -> delay ~caps (fun () -> f a; 0)) $ t1)
 
 (* ^inndoor-k4px: callbacks capture authority supplied by the Door argument. *)
@@ -1153,8 +1051,8 @@ let commands ~caps ~runtime =
 
   let search_traces_cmd =
     cmd "search-traces" "Search trace summaries by span filters."
-      (later11 ~caps:stderr_caps (search_traces ~caps:output_caps ~runtime) service_t operation_t status_t lookback_t cursor_t
-         attrs_t attr_contains_t min_duration_t text_t limit_t config_t)
+      (later10 ~caps:stderr_caps (search_traces ~caps:output_caps ~runtime) service_t operation_t status_t lookback_t cursor_t
+         attrs_t attr_contains_t min_duration_t limit_t config_t)
   in
 
   let logs_cmd =
@@ -1187,25 +1085,6 @@ let commands ~caps ~runtime =
     cmd "facets" "List trace or log facet values."
       (later7 ~caps:stderr_caps (facets ~caps:output_caps ~runtime) facet_type_t facet_field_t facet_key_t service_t lookback_t
          limit_t config_t)
-  in
-
-  let ai_calls_cmd =
-    cmd "ai-calls" "Search AI call spans."
-      (later15 ~caps:stderr_caps (ai_calls ~caps:output_caps ~runtime) service_t trace_id_filter_t session_id_t function_id_t
-         provider_t model_t operation_t status_t finish_reason_t text_t lookback_t
-         cursor_t min_duration_t limit_t config_t)
-  in
-
-  let ai_call_cmd =
-    cmd "ai-call" "Read one AI call by span id."
-      (later2 ~caps:stderr_caps (ai_call ~caps:output_caps ~runtime) span_id_t config_t)
-  in
-
-  let ai_stats_cmd =
-    cmd "ai-stats" "Aggregate AI call statistics."
-      (later16 ~caps:stderr_caps (ai_stats ~caps:output_caps ~runtime) group_by_t agg_t service_t trace_id_filter_t session_id_t
-         function_id_t provider_t model_t operation_t status_t finish_reason_t text_t
-         lookback_t min_duration_t limit_t config_t)
   in
 
   let metrics_cmd =
@@ -1269,9 +1148,6 @@ let commands ~caps ~runtime =
         trace_stats_cmd;
         log_stats_cmd;
         facets_cmd;
-        ai_calls_cmd;
-        ai_call_cmd;
-        ai_stats_cmd;
         metrics_cmd;
         stats_cmd;
         instructions_cmd;

@@ -45,25 +45,6 @@ type trace_search_filter = {
   limit : int;
 }
 
-type ai_call_filter = {
-  service : string option;
-  trace_id : string option;
-  operation : string option;
-  status : string option;
-  provider : string option;
-  model : string option;
-  session_id : string option;
-  function_id : string option;
-  finish_reason : string option;
-  text : string option;
-  attrs : (string * string) list;
-  window : Model.window;
-  cursor : Model.cursor_position option;
-  limit : int;
-}
-(** Every AI call filter, resolved by the caller. The store never parses a
-    query parameter (aic-yfcd). *)
-
 type log_search_filter = {
   service : string option;
   trace_id : string option;
@@ -275,10 +256,6 @@ val list_trace_spans :
   (Model.span_node page, error) result
 (** Depth-first tree order, the same one the trace detail returns (tree-uv04).
     The cursor carries the position in that order. *)
-val span_ai_kind : t -> string -> (string option, error) result
-(** The stored AI classification of a span: [call], [tool], [nested], [none],
-    or [None] when no such span exists (aic-t8tl). *)
-val list_span_children : t -> string -> (Model.span list, error) result
 val list_trace_logs :
   t ->
   window:Model.window ->
@@ -295,26 +272,15 @@ val list_span_logs :
   (Model.log_record page, error) result
 val list_logs :
   ?min_severity:int -> log_filter -> t -> (Model.log_record page, error) result
-val search_ai_calls :
-  ?attr_contains:(string * string) list -> ?min_duration_ms:float ->
-  ai_call_filter -> t ->
-  (Model.ai_call page, error) result
-(** AI calls only, over their own indexed table (aic-yfcd). *)
 val search_spans :
   ?attr_contains:(string * string) list -> ?min_duration_ms:float -> span_search_filter -> t -> (Model.span page, error) result
 val search_traces :
-  ?attr_contains:(string * string) list -> ?min_duration_ms:float -> ?text:string ->
+  ?attr_contains:(string * string) list -> ?min_duration_ms:float ->
   trace_search_filter -> t -> (Model.trace_summary page, error) result
 val search_logs :
   ?attr_contains:(string * string) list -> ?min_severity:int -> log_search_filter -> t -> (Model.log_record page, error) result
 val trace_stats :
   ?attr_contains:(string * string) list -> ?min_duration_ms:float -> trace_stats_filter -> t -> (Model.stat_item list, error) result
-val ai_stats :
-  ?attr_contains:(string * string) list -> ?min_duration_ms:float ->
-  group_by:string -> agg:string -> ai_call_filter -> t ->
-  (Model.stat_item list, error) result
-(** Exact SQL grouping and aggregation over AI calls; an unknown [group_by] is
-    an empty list, and the HTTP layer rejects it first (aic-qpv6, aic-e67r). *)
 val log_stats :
   ?attr_contains:(string * string) list -> ?min_severity:int -> log_stats_filter -> t -> (Model.stat_item list, error) result
 val facets : facet_filter -> t -> (Model.facet_item list, error) result

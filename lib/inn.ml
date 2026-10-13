@@ -1,4 +1,3 @@
-module Ai = Ai
 module Config = Config
 module Docs = Docs
 module Endpoint = Endpoint

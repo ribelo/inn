@@ -5,20 +5,18 @@
    Stories: win-nzur, win-e7k8, win-m4ld, win-jee9, win-xl30, win-fl8w,
    win-7xet, win-xi3q. *)
 
-type kind = Trace | Span | Log | Ai_call | Metric
+type kind = Trace | Span | Log | Metric
 
 let kind_to_string = function
   | Trace -> "trace"
   | Span -> "span"
   | Log -> "log"
-  | Ai_call -> "ai_call"
   | Metric -> "metric"
 
 let kind_of_string = function
   | "trace" -> Some Trace
   | "span" -> Some Span
   | "log" -> Some Log
-  | "ai_call" -> Some Ai_call
   | "metric" -> Some Metric
   | _ -> None
 
@@ -26,7 +24,6 @@ let kind_label = function
   | Trace -> "trace"
   | Span -> "span"
   | Log -> "log"
-  | Ai_call -> "AI call"
   | Metric -> "metric"
 
 let lookback_grammar =
