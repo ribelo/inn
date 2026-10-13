@@ -1,5 +1,5 @@
 ---
-status: ready-for-agent
+status: done
 category: enhancement
 ---
 
@@ -91,6 +91,9 @@ property of how Inn writes data, not a job that can stop:
   view combines the parts of all segments. The trace detail always computes
   its summary from the complete span tree. In the list, the warning count
   counts missing parents and multiple roots, not parent cycles.
+- **Body limit.** The HTTP server accepts request bodies up to 32 MiB, the
+  limit of the body extractor. Ox's default of 1 MiB reset the connections of
+  exporter batches with large attributes before Inn could cut them.
 - **Attributes.** The record keeps all attributes as JSON. The attribute index
   tables keep a row only when the string value is at most 256 bytes. Attribute
   filters and facets match indexed values only.

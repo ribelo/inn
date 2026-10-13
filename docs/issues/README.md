@@ -8,7 +8,7 @@ Each spec's frontmatter carries its status (completed = implemented and accepted
 | 1 | [ox-migration](ox-migration/01-build-on-latest-ox.md) | done (879fe3a, 7a04a97) |
 | 2 | [mcp-stdio](mcp-stdio/01-standard-stdio-transport.md) | done (dd2f3b9) |
 | 3 | [schema-versioning](schema-versioning/01-recreate-on-mismatch.md) | done (4faa31e) |
-| 4 | [retention](retention/01-per-signal-retention.md) | done (4faa31e) |
+| 4 | [retention](retention/01-per-signal-retention.md) | replaced by bounded-cache |
 | 5 | [otlp-ingest](otlp-ingest/01-otlp-json-conformance.md) | done (3a13813) |
 | 6 | [query-windows](query-windows/01-lookback-and-cursors.md) | done (da7ed14) |
 | 7 | [search-filters](search-filters/01-search-filters.md) | done (6154c60) |
@@ -23,7 +23,7 @@ Each spec's frontmatter carries its status (completed = implemented and accepted
 | 16 | [thread-door-capabilities](thread-door-capabilities/01-thread-door-capabilities.md) | done (uncommitted for review) |
 | 17 | [restart-daemon-exec](restart-daemon-exec/01-restart-daemon-exec.md) | wontfix (daemon removed, ^bcache-d0nd) |
 | 18 | [delayed-command-cancellation](delayed-command-cancellation/01-classify-delayed-command-cancellation.md) | ready-for-agent |
-| 19 | [bounded-cache](bounded-cache/01-bounded-cache.md) | in progress |
+| 19 | [bounded-cache](bounded-cache/01-bounded-cache.md) | done (02c28eb, 4fa18fc, 3cefe1f, 6922f27, 9a2f1a6) |
 
 Specs 3–11 all touch the store and server, so they are implemented one at a
 time, in this order.
