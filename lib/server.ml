@@ -5,6 +5,13 @@ module Serve = Ox_http.Service.Serve
 
 let max_body_bytes = 32 * 1024 * 1024
 
+(* An OTLP exporter batch of 512 spans with large attributes is several
+   megabytes before Inn cuts its values; Ox's default 1 MiB request limit would
+   reset those connections, so the server accepts what the body extractor
+   accepts. *)
+let server_config =
+  { S.Config.default with max_request_body_bytes = max_body_bytes }
+
 let text_headers =
   H.Header.unsafe_of_list [ ("content-type", "text/plain; charset=utf-8") ]
 
@@ -920,4 +927,5 @@ let run ~caps ~sw ~env config =
           with_shutdown_signals ~caps ~sw:serve_sw (fun stop ->
               Serve.h1 ~sw:serve_sw ~net ~clock ~addr ~stop
                 ~drain_timeout:(Ox.Duration.seconds 5)
+                ~config:server_config
                 (handler config store))))

@@ -181,6 +181,18 @@ try:
     status, _ = post(base_url + "/v1/traces", trace_payload)
     assert status == 200, "ingest answered %d" % status
 
+    # An exporter batch of several megabytes is accepted, not reset by a 1 MiB
+    # server limit, and its large value is cut and marked (bcache-t8nc).
+    large = json.loads(json.dumps(trace_payload))
+    large_span = large["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+    large_span["traceId"] = "a1" * 16
+    large_span["attributes"] = [{"key": "universe", "value": {"stringValue": "u" * 3_000_000}}]
+    status, _ = post(base_url + "/v1/traces", large)
+    assert status == 200, "a 3 MB export answered %d" % status
+    status, large_trace = get(base_url + "/traces/" + "a1" * 16)
+    stored = large_trace["spans"][0]["attributes"]
+    assert len(stored["universe"]) == 1024 and stored["inn.truncated"] is True, stored
+
     finish_inflight_across_sigterm(server, port)
     stop(server, base_url, signal_sent=True)
 
