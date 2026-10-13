@@ -123,8 +123,11 @@ val open_ :
   ?report:(string -> unit) ->
   Config.t ->
   (t, error) result
-(** Open the store, recreating a database whose schema version differs from
-    [schema_version]. [now_ms] is the ingestion clock (the wall clock by the
+(** Open the store: the [segment_count] segment files in [Config.data_dir].
+    A missing segment, or one whose schema version differs from
+    [schema_version], is created empty. The newest data fits in
+    [Config.max_db_size_mb]: when the active segment holds its share, the
+    oldest segment file is deleted and created empty (bcache-f1le). [now_ms] is the ingestion clock (the wall clock by the
     default) and [report] receives schema diagnostics (stderr by default).
     [now_ms] is stored for later use, not called while opening. ^innlint-b7km
 
@@ -220,16 +223,21 @@ val span_position : Model.span -> Model.cursor_position
 (** The keyset position of a span row: its start time and unique row id, for
     span search. *)
 
-val prune : ?now_ms:int -> t -> (Model.prune_report, error) result
-(** Delete expired telemetry and, when live data is over the size cap, the
-    oldest telemetry until it is under the cap. [now_ms] is the current
-    ingestion-clock time. *)
-
-val last_prune : t -> Model.prune_report option
-
 val ingest_traces : t -> Model.span list -> (int, error) result
+(** Store a batch of spans after [Ingest_limits.span], at most
+    [max_trace_spans_per_segment] spans of one trace per segment; returns the
+    number of spans kept. A failure is also counted in [storage]. *)
+
 val ingest_logs : t -> Model.log_record list -> (int, error) result
 val ingest_metrics : t -> Model.metric_point list -> (int, error) result
+
+val storage : t -> (Model.storage_stats, error) result
+(** The budget, the bytes in use, the segments with data, and the failed
+    ingest batches since the store opened (bcache-s7at). *)
+
+val segment_count : int
+val max_trace_spans_per_segment : int
+val max_indexed_value_bytes : int
 
 val list_services :
   ?window:Model.window -> ?include_metrics:bool -> t -> (string list, error) result

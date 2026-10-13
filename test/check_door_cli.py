@@ -34,7 +34,7 @@ with tempfile.TemporaryDirectory(prefix="inn-door-") as state:
         handle.write("not a directory")
     failed = run("server", "--state-dir", os.path.join(obstruction, "child"), code=2)
     assert failed.stdout == "", failed.stdout
-    assert "mkdir" in failed.stderr and "ENOTDIR" in failed.stderr, failed.stderr
+    assert "mkdir" in failed.stderr and "Not a directory" in failed.stderr, failed.stderr
 
     # ^innlint-b7km: hold an actual HTTP read, then cancel only after the
     # request arrives. No sleep or race with the owned signal monitor.

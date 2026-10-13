@@ -71,6 +71,7 @@ type trace_summary = {
   error_count : int;
   is_running : bool;
   warning_count : int;
+  dropped_span_count : int;
 }
 
 type span_node = {
@@ -89,23 +90,23 @@ type trace = {
   warnings : string list;
 }
 
-type prune_report = {
-  pruned_at_ms : int;
-  traces : int;
-  spans : int;
-  logs : int;
-  metric_points : int;
-  size_cap_triggered : bool;
+type segment_stats = {
+  slot : int;
+  sequence : int;
+  bytes : int;
+  started_at_ms : int;
+  active : bool;
 }
 
-type retention_stats = {
-  traces_ttl_hours : int;
-  logs_ttl_hours : int;
-  metrics_ttl_hours : int;
-  prune_interval_seconds : int;
-  max_db_size_mb : int;
-  live_bytes : int;
-  last_prune : prune_report option;
+type ingest_failure = { failed_at_ms : int; message : string }
+
+type storage_stats = {
+  max_bytes : int;
+  segment_bytes : int;
+  used_bytes : int;
+  segments : segment_stats list;
+  ingest_failures : int;
+  last_ingest_failure : ingest_failure option;
 }
 
 type stats = {
@@ -114,7 +115,7 @@ type stats = {
   metric_points : int;
   traces : int;
   services : int;
-  retention : retention_stats;
+  storage : storage_stats;
 }
 
 type stat_item = {
@@ -284,6 +285,7 @@ let trace_summary_to_json (summary : trace_summary) =
       ("errorCount", `Int summary.error_count);
       ("isRunning", `Bool summary.is_running);
       ("warningCount", `Int summary.warning_count);
+      ("droppedSpanCount", `Int summary.dropped_span_count);
     ]
 
 let trace_to_json (trace : trace) =
@@ -296,30 +298,43 @@ let trace_to_json (trace : trace) =
         `List (List.map (fun warning -> `String warning) trace.warnings) );
     ]
 
-let prune_report_to_json (report : prune_report) =
+let storage_stats_to_json (storage : storage_stats) =
+  let segment_to_json (segment : segment_stats) =
+    `Assoc
+      [
+        ("slot", `Int segment.slot);
+        ("sequence", `Int segment.sequence);
+        ("bytes", `Int segment.bytes);
+        ("startedAtMs", `Int segment.started_at_ms);
+        ("active", `Bool segment.active);
+      ]
+  in
+  let oldest =
+    List.fold_left
+      (fun oldest (segment : segment_stats) ->
+        match oldest with
+        | Some value when value <= segment.started_at_ms -> oldest
+        | _ -> Some segment.started_at_ms)
+      None storage.segments
+  in
   `Assoc
     [
-      ("prunedAtMs", `Int report.pruned_at_ms);
-      ("traces", `Int report.traces);
-      ("spans", `Int report.spans);
-      ("logs", `Int report.logs);
-      ("metricPoints", `Int report.metric_points);
-      ("sizeCapTriggered", `Bool report.size_cap_triggered);
-    ]
-
-let retention_stats_to_json (retention : retention_stats) =
-  `Assoc
-    [
-      ("tracesTtlHours", `Int retention.traces_ttl_hours);
-      ("logsTtlHours", `Int retention.logs_ttl_hours);
-      ("metricsTtlHours", `Int retention.metrics_ttl_hours);
-      ("pruneIntervalSeconds", `Int retention.prune_interval_seconds);
-      ("maxDbSizeMb", `Int retention.max_db_size_mb);
-      ("liveBytes", `Int retention.live_bytes);
-      ( "lastPrune",
-        match retention.last_prune with
+      ("maxBytes", `Int storage.max_bytes);
+      ("segmentBytes", `Int storage.segment_bytes);
+      ("usedBytes", `Int storage.used_bytes);
+      ( "oldestDataSinceMs",
+        match oldest with None -> `Null | Some value -> `Int value );
+      ("segments", `List (List.map segment_to_json storage.segments));
+      ("ingestFailures", `Int storage.ingest_failures);
+      ( "lastIngestFailure",
+        match storage.last_ingest_failure with
         | None -> `Null
-        | Some report -> prune_report_to_json report );
+        | Some failure ->
+            `Assoc
+              [
+                ("failedAtMs", `Int failure.failed_at_ms);
+                ("message", `String failure.message);
+              ] );
     ]
 
 let stats_to_json (stats : stats) =
@@ -330,7 +345,7 @@ let stats_to_json (stats : stats) =
       ("metricPoints", `Int stats.metric_points);
       ("traces", `Int stats.traces);
       ("services", `Int stats.services);
-      ("retention", retention_stats_to_json stats.retention);
+      ("storage", storage_stats_to_json stats.storage);
     ]
 
 let stat_item_to_json (item : stat_item) =

@@ -217,8 +217,8 @@ let mcp_tools =
         ("limit", mcp_int_property "Maximum number of metric points");
       ];
     mcp_tool "inn_stats"
-      "Fetch store row counts and the retention section, including the last \
-       prune report."
+      "Fetch store row counts and the storage section: budget, bytes in use, \
+       segments, and failed ingest batches."
       [ ("lookback", mcp_lookback_property) ];
     mcp_tool "inn_endpoints" "Fetch Inn endpoint inventory." [];
     mcp_tool "inn_instructions" "Fetch OTLP setup instructions." [];
@@ -293,7 +293,7 @@ let http_tool ~request ~base_url path =
 
 let tool_call ~request ~base_url name args =
   match name with
-  | "inn_status" -> http_tool ~request ~base_url "/health"
+  | "inn_status" -> http_tool ~request ~base_url "/status"
   | "inn_services" ->
       http_tool ~request ~base_url
         ("/services"

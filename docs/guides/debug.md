@@ -171,8 +171,11 @@ curl -s 'http://127.0.0.1:27687/stats'
 - `GET /facets?type=traces|logs&field=...&key=...` — `attribute_keys` lists known
   attribute keys, `attribute_values&key=<key>` lists one key's values with
   counts.
-- `/stats` reports live row counts and the retention section, including the
-  last prune report.
+- `/stats` reports row counts and the storage section; `/status` reports the
+  storage section alone: the budget, the bytes in use, the segments, the start
+  time of the oldest data, and failed ingest batches. Inn keeps only the newest
+  `INN_MAX_DB_SIZE_MB` of telemetry, so old runs disappear when newer data
+  fills the budget.
 
 Aggregates run in SQL over the whole selected window — they are exact, never a
 sample of a result page. p95 uses the exact nearest-rank percentile. Facets and

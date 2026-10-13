@@ -70,7 +70,6 @@ env = dict(os.environ)
 env.update(
     {
         "INN_STATE_DIR": state,
-        "INN_DB_PATH": os.path.join(state, "telemetry.sqlite"),
         "INN_HOST": "127.0.0.1",
         "INN_PORT": str(port),
         # The sandbox caps locked memory, so io_uring ring creation fails; the

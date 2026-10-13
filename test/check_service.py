@@ -1,7 +1,7 @@
 """svc-pehm: SIGTERM drains an in-flight request, exits 0 without hanging,
 and the database opens cleanly again with its data intact.
-svc-dh98: the startup log names the listen address, the database path, and the
-effective retention settings, so journalctl --user -u inn shows them.
+svc-dh98: the startup log names the listen address, the data directory, and the
+budget, so journalctl --user -u inn shows them.
 
 The check runs the real bin/main.exe server on a free port and a temporary
 state directory, ingests one trace, completes another across SIGTERM, requires
@@ -53,10 +53,6 @@ trace_payload = {
 }
 
 retention_env = {
-    "INN_TRACES_RETENTION_HOURS": "72",
-    "INN_LOGS_RETENTION_HOURS": "6",
-    "INN_METRICS_RETENTION_HOURS": "12",
-    "INN_PRUNE_INTERVAL_SECONDS": "45",
     "INN_MAX_DB_SIZE_MB": "2048",
 }
 
@@ -172,7 +168,7 @@ state_dir = os.path.join(root, "state")
 log_path = os.path.join(root, "server.log")
 port = free_port()
 base_url = "http://127.0.0.1:%d" % port
-db_path = os.path.join(state_dir, "telemetry.sqlite")
+data_dir = os.path.join(state_dir, "segments")
 
 try:
     server = start(state_dir, port, log_path)
@@ -192,12 +188,8 @@ try:
         log = handle.read()
     for fragment in (
         "inn server listening on http://127.0.0.1:%d" % port,
-        "traces_retention=72h",
-        "logs_retention=6h",
-        "metrics_retention=12h",
-        "prune_interval=45s",
         "max_db_size=2048MB",
-        "database=%s" % db_path,
+        "data=%s" % data_dir,
     ):
         assert fragment in log, "startup log is missing %r (svc-dh98):\n%s" % (
             fragment,

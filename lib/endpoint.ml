@@ -342,6 +342,7 @@ let trace_summary_properties =
     ("errorCount", schema_integer);
     ("isRunning", schema_boolean);
     ("warningCount", schema_integer);
+    ("droppedSpanCount", schema_integer);
   ]
 
 let stat_item_properties =
@@ -354,23 +355,27 @@ let stat_item_properties =
 let facet_item_properties =
   [ ("value", schema_string); ("count", schema_integer) ]
 
-let retention_properties =
+let storage_properties =
   [
-    ("tracesTtlHours", schema_integer);
-    ("logsTtlHours", schema_integer);
-    ("metricsTtlHours", schema_integer);
-    ("pruneIntervalSeconds", schema_integer);
-    ("maxDbSizeMb", schema_integer);
-    ("liveBytes", schema_integer);
-    ( "lastPrune",
+    ("maxBytes", schema_integer);
+    ("segmentBytes", schema_integer);
+    ("usedBytes", schema_integer);
+    ("oldestDataSinceMs", schema_nullable schema_integer);
+    ( "segments",
+      schema_array
+        (schema_object [
+           ("slot", schema_integer);
+           ("sequence", schema_integer);
+           ("bytes", schema_integer);
+           ("startedAtMs", schema_integer);
+           ("active", schema_boolean);
+         ]) );
+    ("ingestFailures", schema_integer);
+    ( "lastIngestFailure",
       schema_nullable
         (schema_object [
-           ("prunedAtMs", schema_integer);
-           ("traces", schema_integer);
-           ("spans", schema_integer);
-           ("logs", schema_integer);
-           ("metricPoints", schema_integer);
-           ("sizeCapTriggered", schema_boolean);
+           ("failedAtMs", schema_integer);
+           ("message", schema_string);
          ]) );
   ]
 
@@ -379,7 +384,7 @@ let health_properties =
     ("ok", schema_boolean);
     ("pid", schema_integer);
     ("stateDir", schema_string);
-    ("dbPath", schema_string);
+    ("dataDir", schema_string);
     ("baseUrl", schema_string);
     ("version", schema_string);
     ("startedAt", schema_string);
@@ -575,6 +580,17 @@ let all =
         json_body (schema_object ready_properties);
         json_body ~status:503 ~description:"The store did not answer; not ready" schema_error;
       ];
+    query_endpoint ~group:"discovery" "status" "/status" "Server and store state"
+      "The identity of /health plus the storage section: the budget, the \
+       bytes in use, the segments with data, the start time of the oldest \
+       data, and the failed ingest batches with the last error."
+      []
+      [
+        json_body
+          (schema_object
+             (health_properties @ [ ("storage", schema_object storage_properties) ]));
+        store_error_response;
+      ];
     query_endpoint ~group:"discovery" "instructions" "/instructions"
       "OTLP setup instructions"
       "Copy-paste exporter configuration, the query surface, and pointers to \
@@ -592,7 +608,7 @@ let all =
              ("exporterUrl", schema_string);
              ("logsExporterUrl", schema_string);
              ("metricsExporterUrl", schema_string);
-             ("databasePath", schema_string);
+             ("dataDir", schema_string);
              ( "aliasPolicy",
                schema_object [
                  ("prefix", schema_string);
@@ -769,9 +785,8 @@ let all =
         service;
       ]
       (query_responses (summary_schema "facets" facet_item_properties));
-    query_endpoint "stats" "/stats" "Store row counts and retention"
-      "Live row counts over the window plus the retention section, including \
-       the last prune report."
+    query_endpoint "stats" "/stats" "Store row counts and storage"
+      "Row counts over the window plus the storage section of GET /status."
       [ lookback ~default:List_policy.history_lookback () ]
       [
         json_body
@@ -781,7 +796,7 @@ let all =
              ("metricPoints", schema_integer);
              ("traces", schema_integer);
              ("services", schema_integer);
-             ("retention", schema_object retention_properties);
+             ("storage", schema_object storage_properties);
              ("meta", schema_object [ ("lookback", schema_string) ]);
            ]);
         invalid_query_response;

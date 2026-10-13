@@ -88,7 +88,7 @@ let health_fields config =
     ("ok", `Bool true);
     ("pid", `Int (Unix.getpid ()));
     ("stateDir", `String config.Config.state_dir);
-    ("dbPath", `String config.db_path);
+    ("dataDir", `String config.data_dir);
     ("baseUrl", `String config.base_url);
     ("version", `String Version.value);
     ("startedAt", `String (iso8601_of_ms (Atomic.get started_at_ms)));
@@ -118,6 +118,18 @@ let ready config store =
               ("the store did not answer: " ^ store_error_message error)
               [ ("ready", `Bool false); ("store", `String "error") ])
 
+(* GET /status: the identity and the store state without counting rows, so
+   it stays cheap at any size (bcache-s7at). *)
+let status config store =
+  match Store.storage store with
+  | Ok storage ->
+      json_response
+        (`Assoc
+          (health_fields config
+          @ [ ("storage", Model.storage_stats_to_json storage) ]))
+  | Error error ->
+      error_response 500 "store_error" (store_error_message error)
+
 (* The inventory and the OpenAPI document are rendered from the same
    declarations the router registers and the query parser validates against, so
    neither can drift from behavior (desc-de6o, desc-dmuw). *)
@@ -131,7 +143,7 @@ let endpoints config =
         ("exporterUrl", `String (config.base_url ^ "/v1/traces"));
         ("logsExporterUrl", `String (config.base_url ^ "/v1/logs"));
         ("metricsExporterUrl", `String (config.base_url ^ "/v1/metrics"));
-        ("databasePath", `String config.db_path);
+        ("dataDir", `String config.data_dir);
         ( "aliasPolicy",
           `Assoc
             [
@@ -203,8 +215,8 @@ Documentation:
 let root_text config =
   text_response
     (Printf.sprintf
-       "inn local telemetry server\n\nPOST /v1/traces\nPOST /v1/logs\nPOST /v1/metrics\nGET /health\nGET /healthz\nGET /ready\nGET /api/services\nGET /api/traces\nGET /api/traces/search\nGET /api/traces/stats\nGET /api/traces/<trace-id>\nGET /api/traces/<trace-id>/spans\nGET /api/traces/<trace-id>/logs\nGET /api/spans/search\nGET /api/spans/<span-id>\nGET /api/spans/<span-id>/logs\nGET /api/logs\nGET /api/logs/search\nGET /api/logs/stats\nGET /api/metrics\nGET /api/facets?type=logs&field=severity\nGET /api/stats\nGET /docs\nGET /docs/<name>\nGET /instructions\nGET /endpoints\nGET /openapi.json\n\nstate: %s\ndatabase: %s\n"
-       config.Config.state_dir config.db_path)
+       "inn local telemetry server\n\nPOST /v1/traces\nPOST /v1/logs\nPOST /v1/metrics\nGET /health\nGET /healthz\nGET /ready\nGET /status\nGET /api/services\nGET /api/traces\nGET /api/traces/search\nGET /api/traces/stats\nGET /api/traces/<trace-id>\nGET /api/traces/<trace-id>/spans\nGET /api/traces/<trace-id>/logs\nGET /api/spans/search\nGET /api/spans/<span-id>\nGET /api/spans/<span-id>/logs\nGET /api/logs\nGET /api/logs/search\nGET /api/logs/stats\nGET /api/metrics\nGET /api/facets?type=logs&field=severity\nGET /api/stats\nGET /docs\nGET /docs/<name>\nGET /instructions\nGET /endpoints\nGET /openapi.json\n\nstate: %s\ndata: %s\n"
+       config.Config.state_dir config.data_dir)
 
 let store_json result encode =
   match result with
@@ -737,6 +749,7 @@ let route_for config store (endpoint : Endpoint.t) =
   | "root" -> fun _req -> Ok (root_text config)
   | "health" | "healthz" -> fun _req -> Ok (health config)
   | "ready" -> fun _req -> ready config store
+  | "status" -> fun _req -> Ok (status config store)
   | "instructions" -> fun _req -> Ok (instructions config)
   | "endpoints" -> fun _req -> Ok (endpoints config)
   | "openapi" -> fun _req -> Ok (openapi config)
@@ -828,48 +841,8 @@ let check_bind_available ~caps config =
       Unix.bind fd (unix_addr config.host config.port);
       Unix.listen fd 1)
 
-let prune_interval config =
-  float_of_int config.Config.prune_interval_seconds
-
-let report_prune ~caps (report : Model.prune_report) =
-  let deleted =
-    report.traces + report.spans + report.logs + report.metric_points
-  in
-  if deleted > 0 then
-    Ox_caps.Cap_stdlib.prerr_endline ~caps
-      (Printf.sprintf
-         "inn pruner: deleted %d traces, %d spans, %d logs, and %d metric points%s"
-         report.traces report.spans report.logs report.metric_points
-         (if report.size_cap_triggered then " (size cap)" else ""))
-
-let report_prune_failure ~caps error =
-  Ox_caps.Cap_stdlib.prerr_endline ~caps
-    (Format.asprintf "inn pruner: %a" Store.pp_error error)
-
-(* One prune pass at startup, then one pass per interval. The pruner never
-   fails the server: a failed pass is reported and retried on the next interval
-   (ret-sj15, ret-sbgj). *)
-let pruner_loop ~caps ~clock ~config store =
-  let rec loop () =
-    (match Store.prune store with
-    | Ok report -> report_prune ~caps report
-    | Error error -> report_prune_failure ~caps error);
-    Eio.Time.sleep clock (prune_interval config);
-    loop ()
-  in
-  loop ()
-
-let start_pruner ~caps ~sw ~clock ~config store =
-  Eio.Fiber.fork_daemon ~sw (fun () ->
-      (try pruner_loop ~caps ~clock ~config store with
-      | Eio.Cancel.Cancelled _ as ex -> raise ex
-      | ex ->
-          Ox_caps.Cap_stdlib.prerr_endline ~caps
-            (Printf.sprintf "inn pruner stopped: %s" (Printexc.to_string ex)));
-      `Stop_daemon)
-
-(* The serving switch has cancelled and awaited the pruner before the store
-   closes on this still-live outer switch. *)
+(* The serving switch has finished before the store closes on this
+   still-live outer switch. *)
 let close_store ~caps store =
   match Store.close store with
   | Ok () -> ()
@@ -878,24 +851,20 @@ let close_store ~caps store =
         (Format.asprintf "inn: closing the store failed: %a" Store.pp_error error)
 
 (* Startup lines record the effective configuration, so
-   [journalctl --user -u inn] shows the listen address, the database path, and
-   the retention settings the running process actually uses (svc-dh98). *)
+   [journalctl --user -u inn] shows the listen address, the data directory,
+   and the budget the running process actually uses (svc-dh98). *)
 let log_startup ~caps config =
   Ox_caps.Cap_stdlib.prerr_endline ~caps
     (Printf.sprintf "inn server listening on http://%s:%d" config.Config.host
        config.port);
   Ox_caps.Cap_stdlib.prerr_endline ~caps
     (Printf.sprintf
-       "inn server configuration: database=%s traces_retention=%dh \
-        logs_retention=%dh metrics_retention=%dh prune_interval=%ds \
-        max_db_size=%dMB"
-       config.db_path config.traces_retention_hours config.logs_retention_hours
-       config.metrics_retention_hours config.prune_interval_seconds
-       config.max_db_size_mb)
+       "inn server configuration: data=%s max_db_size=%dMB segments=%d"
+       config.data_dir config.max_db_size_mb Store.segment_count)
 
 (* svc-pehm: Both SIGTERM and SIGINT stop accepts, then Serve.h1 drains
-   in-flight requests for five seconds. The serving switch awaits the pruner
-   before the outer finaliser closes the store, so systemd sees a clean exit.
+   in-flight requests for five seconds, and the outer finaliser closes the
+   store, so systemd sees a clean exit.
    Keep Inn's /ready JSON contract instead of introducing Door-owned CLI/config. *)
 let with_shutdown_signals ~caps ~sw f =
   let stop, resolver = Eio.Promise.create () in
@@ -941,10 +910,9 @@ let run ~caps ~sw ~env config =
   Fun.protect
     ~finally:(fun () -> close_store ~caps store)
     (fun () ->
-      (* Serve.h1 returns after draining. Leaving this switch cancels and
-         awaits the pruner before the store closes on the outer switch. *)
+      (* Serve.h1 returns after draining; the store closes on the outer
+         switch. *)
       Eio.Switch.run (fun serve_sw ->
-          start_pruner ~caps ~sw:serve_sw ~clock ~config store;
           log_startup ~caps config;
           let addr =
             Serve.tcp_addr ~host:config.Config.host ~port:config.port

@@ -1,6 +1,7 @@
 module Config = Config
 module Docs = Docs
 module Endpoint = Endpoint
+module Ingest_limits = Ingest_limits
 module List_policy = List_policy
 module Mcp = Mcp
 module Model = Model

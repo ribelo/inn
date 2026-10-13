@@ -1,8 +1,9 @@
 # inn
 
 `inn` is a local OpenTelemetry collector and query service written in OxCaml
-on Ox. It stores traces, logs, and metrics in one user-level SQLite database
-and exposes cwd-independent HTTP and CLI query surfaces.
+on Ox. It keeps the newest traces, logs, and metrics of the local apps in a
+fixed amount of disk, and exposes cwd-independent HTTP and CLI query surfaces.
+It is a cache for debugging the run you just did, not an archive.
 
 ## State
 
@@ -10,43 +11,65 @@ Default state:
 
 ```text
 ${XDG_STATE_HOME:-~/.local/state}/inn
-${XDG_STATE_HOME:-~/.local/state}/inn/telemetry.sqlite
+${XDG_STATE_HOME:-~/.local/state}/inn/segments/segment-0.sqlite … segment-7.sqlite
 ```
 
 Environment overrides:
 
 - `INN_STATE_DIR`
-- `INN_DB_PATH`
 - `INN_HOST`
 - `INN_PORT`
 - `INN_BASE_URL`
-- `INN_TRACES_RETENTION_HOURS` (default 48)
-- `INN_LOGS_RETENTION_HOURS` (default 24)
-- `INN_METRICS_RETENTION_HOURS` (default 48)
-- `INN_PRUNE_INTERVAL_SECONDS` (default 300)
-- `INN_MAX_DB_SIZE_MB` (default 1024)
+- `INN_MAX_DB_SIZE_MB` (default 1024): the whole store budget
 
-The caller's current working directory is never used to select the database
-or the query target.
+The caller's current working directory is never used to select the store or
+the query target.
 
-Each signal has its own time-to-live, measured from the time Inn received the
-data, not from the client's timestamp. A background pruner runs once at server
-startup and then every `INN_PRUNE_INTERVAL_SECONDS`, independent of ingest, and
-deletes expired rows in bounded batches. Ingest never runs pruning, so ingest
-latency stays stable.
+### A fixed budget, kept by deleting files
 
-`INN_MAX_DB_SIZE_MB` caps live data, not file size: when the pages in use exceed
-the cap, the pruner deletes the oldest telemetry, signal by signal, only until
-live data is under the cap, and then returns free pages to the filesystem with
-an incremental vacuum. The old single `INN_RETENTION_HOURS` setting is
-rejected at startup with a message naming the per-signal settings.
+The store is a ring of eight SQLite segment files. All writes go to the active
+segment. When the active segment holds one eighth of `INN_MAX_DB_SIZE_MB`, the
+next segment in the ring is deleted, created empty, and becomes active. So the
+oldest eighth of the data goes in one file deletion, the newest data is always
+accepted, and the store stays near its budget. There is no pruner, no
+time-to-live, and no vacuum: nothing runs in the background that can stop.
+`INN_DB_PATH`, `INN_RETENTION_HOURS`, `INN_TRACES_RETENTION_HOURS`,
+`INN_LOGS_RETENTION_HOURS`, `INN_METRICS_RETENTION_HOURS`, and
+`INN_PRUNE_INTERVAL_SECONDS` are refused at startup with a message, so an old
+setting is never silently ignored.
 
-Inn stores an integer schema version in the database. At startup, a database
-whose version differs from the one Inn expects, or a file that is not an Inn
-database at all, is never silently reused: a mismatched Inn database is deleted
-and recreated with a warning, and a foreign file is left untouched and reported
-as an error. Telemetry in a replaced database is lost, which is acceptable for
-a short-lived debugging cache.
+One reader connection attaches all eight segments and queries them through
+temporary views with the table names the queries use. A trace whose spans fall
+in two segments is combined: its summary adds the parts, and its detail
+assembles one tree. In the trace list, a span whose parent is in another
+segment counts as a missing parent in `warningCount`; the trace detail is
+exact.
+
+### Ingest limits
+
+Inn cuts oversized data when it arrives, so one program cannot fill the store:
+
+- A string attribute value longer than 1 KB is cut to 1 KB; a list or object
+  attribute whose JSON is longer becomes that cut JSON text.
+- A log body or a span status message longer than 8 KB is cut to 8 KB.
+- A record with any cut value carries the attribute `inn.truncated = true`.
+- At most 5,000 spans of one trace go into one segment. Later spans of that
+  trace are dropped, and the trace summary counts them in `droppedSpanCount`.
+
+Every attribute is stored once, as JSON in its record. The attribute index
+that `attr.<key>` and `attrContains.<key>` filters, attribute facets, and
+attribute statistics use holds only values up to 256 bytes.
+
+A trace summary is updated from the spans of the trace in the active segment,
+never by reading and decoding the whole trace, so the memory of a write depends
+on the batch, not on the length of the trace.
+
+### Schema versions
+
+Each segment stores an integer schema version. At startup, a segment whose
+version differs from the one Inn expects, or a file in its place that Inn
+cannot read, is deleted and created empty with a warning. Telemetry in a
+replaced segment is lost, which is acceptable for a debugging cache.
 
 ## Build
 
@@ -99,13 +122,20 @@ systemctl --user restart inn
 inn status
 ```
 
-`inn server` logs its listen address, its database path, and its retention
-settings to stderr at startup, so `journalctl --user -u inn` shows the
-configuration the running process actually uses. On SIGTERM (and SIGINT),
-it stops accepting connections, closes idle keep-alives, and gives in-flight
-requests up to five seconds to finish before cancelling any that remain. It
-then cancels and awaits the pruner, closes the store, and exits 0, so a restart
-never leaves a hung process or an unclean WAL behind. Inn owns `/ready` (and
+`inn server` logs its listen address, its data directory, and its budget to
+stderr at startup, so `journalctl --user -u inn` shows the configuration the
+running process actually uses. On SIGTERM (and SIGINT), it stops accepting
+connections, closes idle keep-alives, and gives in-flight requests up to five
+seconds to finish before cancelling any that remain. It then closes the store
+and exits 0, so a restart never leaves a hung process or an unclean WAL behind.
+A server that cannot open its store, or whose serving loop fails, exits with a
+non-zero status. The service restarts Inn after every exit
+(`Restart=always`), including the SIGTERM that earlyoom sends.
+
+`inn status` (`GET /status`) shows the identity of `/health` and the storage
+section: the budget, the bytes in use, the segments with data, the start time
+of the oldest data, and the count of failed ingest batches since the start with
+the last error. It counts no rows, so it stays fast at any size. Inn owns `/ready` (and
 `/api/ready`) rather than Ox’s plain-text readiness wrapper: it retains the
 JSON identity and store check, and returns `503` when draining.
 
@@ -386,9 +416,8 @@ trace/span/log search, trace/log stats, store stats, facets, metrics, endpoint
 inventory, instructions, OpenAPI, and the guides
 (`inn_docs_index`, and `inn_get_doc` with a `name` argument).
 
-`inn_stats` returns the store row counts and the retention section, including
-the last prune report, so the pruner is observable without reading server
-logs.
+`inn_status` returns `GET /status` and `inn_stats` returns the row counts
+with the same storage section.
 
 List and search tools take `lookback` and `cursor`. `inn_stats`,
 `inn_services`, `inn_trace_stats`, `inn_log_stats`, and `inn_facets` take
@@ -397,10 +426,10 @@ List and search tools take `lookback` and `cursor`. `inn_stats`,
 ## Ox SQL
 
 The store uses Ox SQL typed builders for schema, writes, reads, and
-transactions. Raw SQL is not used in the application storage path. The one
-exception is SQLite pragmas, which have no typed API: `page_count`,
-`freelist_count`, `page_size`, `auto_vacuum`, and `incremental_vacuum` all run
-through one store helper that uses `Ox_sql.Pool.Raw`, the escape hatch
-`Ox_sql.mli` documents for pragmas.
+transactions. Raw SQL is used only where Ox SQL has no typed API, through
+`Ox_sql.Pool.Raw`, the escape hatch `Ox_sql.mli` documents: the `page_count`
+and `page_size` pragmas, `PRAGMA database_list`, `ATTACH` and `DETACH` with
+the path and the schema name bound as values, and one literal script that
+creates the reader's temporary views.
 Known Ox SQL API gaps found while building Inn are recorded in
 [.spec/OX_SQL_DOGFOODING.md](.spec/OX_SQL_DOGFOODING.md).

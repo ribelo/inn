@@ -34,22 +34,14 @@ let env_with_overrides ~caps overrides key =
   | Some (Some value) -> Some value
   | _ -> getenv ~caps key
 
-let config ~caps:(caps : < Cap.env; .. >) state_dir db_path host port base_url retention_hours
-    traces_retention_hours logs_retention_hours metrics_retention_hours
-    prune_interval_seconds max_db_size_mb =
+let config ~caps:(caps : < Cap.env; .. >) state_dir host port base_url max_db_size_mb =
   let int_override = Option.map string_of_int in
   let overrides =
     [
       ("INN_STATE_DIR", state_dir);
-      ("INN_DB_PATH", db_path);
       ("INN_HOST", host);
       ("INN_PORT", int_override port);
       ("INN_BASE_URL", base_url);
-      ("INN_RETENTION_HOURS", int_override retention_hours);
-      ("INN_TRACES_RETENTION_HOURS", int_override traces_retention_hours);
-      ("INN_LOGS_RETENTION_HOURS", int_override logs_retention_hours);
-      ("INN_METRICS_RETENTION_HOURS", int_override metrics_retention_hours);
-      ("INN_PRUNE_INTERVAL_SECONDS", int_override prune_interval_seconds);
       ("INN_MAX_DB_SIZE_MB", int_override max_db_size_mb);
     ]
   in
@@ -63,12 +55,6 @@ let state_dir_t =
     & opt (some string) None
     & info [ "state-dir" ] ~docv:"DIR"
         ~doc:"User-level Inn state directory.")
-
-let db_path_t =
-  Arg.(
-    value
-    & opt (some string) None
-    & info [ "db" ] ~docv:"PATH" ~doc:"Inn SQLite database path.")
 
 let host_t =
   Arg.(
@@ -88,53 +74,17 @@ let base_url_t =
     & opt (some string) None
     & info [ "base-url" ] ~docv:"URL" ~doc:"Inn server base URL for queries.")
 
-let retention_hours_t =
-  Arg.(
-    value
-    & opt (some int) None
-    & info [ "retention-hours" ] ~docv:"HOURS"
-        ~doc:"Deprecated: rejected at startup; use the per-signal retention flags.")
-
-let traces_retention_hours_t =
-  Arg.(
-    value
-    & opt (some int) None
-    & info [ "traces-retention-hours" ] ~docv:"HOURS"
-        ~doc:"Trace time-to-live in hours (default 48).")
-
-let logs_retention_hours_t =
-  Arg.(
-    value
-    & opt (some int) None
-    & info [ "logs-retention-hours" ] ~docv:"HOURS"
-        ~doc:"Log time-to-live in hours (default 24).")
-
-let metrics_retention_hours_t =
-  Arg.(
-    value
-    & opt (some int) None
-    & info [ "metrics-retention-hours" ] ~docv:"HOURS"
-        ~doc:"Metric point time-to-live in hours (default 48).")
-
-let prune_interval_seconds_t =
-  Arg.(
-    value
-    & opt (some int) None
-    & info [ "prune-interval-seconds" ] ~docv:"SECONDS"
-        ~doc:"Seconds between background prune passes (default 300).")
-
 let max_db_size_mb_t =
   Arg.(
     value
     & opt (some int) None
     & info [ "max-db-size-mb" ] ~docv:"MB"
-        ~doc:"Target maximum live database size.")
+        ~doc:"Store budget in megabytes (default 1024). Inn keeps the newest telemetry that fits.")
 
 let config_t ~caps =
   Term.(
-    const (config ~caps) $ state_dir_t $ db_path_t $ host_t $ port_t $ base_url_t
-    $ retention_hours_t $ traces_retention_hours_t $ logs_retention_hours_t
-    $ metrics_retention_hours_t $ prune_interval_seconds_t $ max_db_size_mb_t)
+    const (config ~caps) $ state_dir_t $ host_t $ port_t $ base_url_t
+    $ max_db_size_mb_t)
 
 let trim_trailing_slash url =
   let rec loop len =
@@ -275,7 +225,7 @@ let mcp ~caps ~runtime config =
 let get ~caps ~runtime path config = run_http ~caps ~runtime config "GET" path
 
 let health ~caps ~runtime config = get ~caps ~runtime "/health" config
-let status ~caps ~runtime config = get ~caps ~runtime "/health" config
+let status ~caps ~runtime config = get ~caps ~runtime "/status" config
 let services ~caps ~runtime lookback config =
   get ~caps ~runtime ("/services" ^ query [ ("lookback", lookback) ]) config
 let stats ~caps ~runtime lookback config =

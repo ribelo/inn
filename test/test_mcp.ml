@@ -127,7 +127,7 @@ let test_window_arguments_reach_http () =
   (* win-2olw and ret-eeb1: the tool arguments become query parameters. *)
   let paths = ref [] in
   let stats_body =
-    {|{"spans":1,"logs":2,"retention":{"tracesTtlHours":48,"lastPrune":null}}|}
+    {|{"spans":1,"logs":2,"storage":{"maxBytes":1073741824,"segments":[]}}|}
   in
   let request path =
     paths := path :: !paths;
@@ -158,8 +158,8 @@ let test_window_arguments_reach_http () =
     | Error message -> Alcotest.fail message
   in
   Alcotest.(check bool)
-    "inn_stats returns the retention section (ret-eeb1)" true
-    (contains stats_text "retention");
+    "inn_stats returns the storage section (bcache-s7at)" true
+    (contains stats_text "storage");
   call "inn_search_traces"
     (`Assoc [ ("lookback", `String "all"); ("cursor", `String "xyz");
       ("minDurationMs", `Float 5.);

@@ -7,12 +7,38 @@ type error =
   | `Invalid_store of string
   ]
 
+(* The store is a ring of [segment_count] SQLite files (bcache-f1le). One
+   connection writes to the active segment. When the active segment reaches
+   its share of the budget, the next file in the ring is deleted, created
+   empty, and becomes active: the oldest data goes by deleting one file. One
+   reader connection attaches every segment and defines temporary views with
+   the table names the queries use, so the queries do not know about
+   segments. *)
+type segment = {
+  slot : int;
+  path : string;
+  mutable sequence : int;
+  mutable started_at_ms : int;
+  mutable bytes : int;
+}
+
 type t = {
   config : Config.t;
-  pool : Q.Pool.t;
   now_ms : unit -> int;
   wall_now : unit -> int;
-  mutable last_prune : Model.prune_report option;
+  segments : segment array;
+  mutable active : int;
+  mutable writer : Q.Pool.t;
+  reader : Q.Pool.t;
+  mutable generation : int;
+  mutable reader_generation : int;
+  write_lock : Eio.Mutex.t;
+  reader_lock : Eio.Mutex.t;
+  open_writer : string -> (Q.Pool.t, error) result;
+  create_segment : segment -> sequence:int -> (unit, error) result;
+  report : string -> unit;
+  mutable ingest_failures : int;
+  mutable last_ingest_failure : Model.ingest_failure option;
 }
 
 type ingest_counts = {
@@ -101,13 +127,6 @@ type facet_filter = {
   limit : int;
 }
 
-type trace_stat_bucket = {
-  mutable stat_count : int;
-  mutable total_duration_ms : float;
-  mutable durations_ms : float list;
-  mutable error_traces : int;
-}
-
 type metric_filter = {
   service : string option;
   name : string option;
@@ -117,12 +136,24 @@ type metric_filter = {
 }
 
 (* Bump this constant, and the fingerprint recorded in the schema test, with
-   every change to the statements in [schemas]. [open_] recreates any database
+   every change to the statements in [schemas]. [open_] recreates any segment
    whose stored version differs, so a schema change without a bump would be
-   silently skipped on an existing database (schm-hnis). *)
-let schema_version = 6
+   silently skipped on an existing segment (schm-hnis). *)
+let schema_version = 7
 
 let schema_version_text = string_of_int schema_version
+
+(* Eight segments keep the attached databases under SQLite's default limit of
+   ten, and keep the share of the budget lost at one rotation at one eighth. *)
+let segment_count = 8
+
+(* At most this many spans of one trace go into one segment; later spans of
+   that trace are counted as dropped in its trace part (bcache-s5kc). *)
+let max_trace_spans_per_segment = 5_000
+
+(* Only attribute values up to this length go into the attribute index tables.
+   The record keeps every attribute in its JSON column (bcache-a1x1). *)
+let max_indexed_value_bytes = 256
 
 module Meta = struct
   module T = Q.Table.Make (struct
@@ -169,7 +200,6 @@ module Span_attributes = struct
 
   include T
 
-  let id = column "id" Q.text
   let owner_id = column "owner_id" Q.text
   let key = column "key" Q.text
   let value = column "value" Q.text
@@ -205,12 +235,37 @@ module Log_attributes = struct
 
   include T
 
-  let id = column "id" Q.text
   let owner_id = column "owner_id" Q.text
   let key = column "key" Q.text
   let value = column "value" Q.text
 end
 
+(* One row per trace and segment, for the spans of that trace in that
+   segment. The reader's [trace_summaries] view combines the parts of every
+   segment. *)
+module Trace_parts = struct
+  module T = Q.Table.Make (struct
+    let name = "trace_parts"
+  end)
+
+  include T
+
+  let trace_id = column "trace_id" Q.text
+  let service_name = column "service_name" Q.text
+  let root_operation_name = column "root_operation_name" Q.text
+  let has_root = column "has_root" Q.bool
+  let started_at_ns = column "started_at_ns" Q.int
+  let ended_at_ns = column "ended_at_ns" Q.int
+  let span_count = column "span_count" Q.int
+  let error_count = column "error_count" Q.int
+  let running_count = column "running_count" Q.int
+  let root_count = column "root_count" Q.int
+  let missing_parent_count = column "missing_parent_count" Q.int
+  let dropped_span_count = column "dropped_span_count" Q.int
+  let updated_at_ms = column "updated_at_ms" Q.int
+end
+
+(* The reader's view over [trace_parts] in every segment. *)
 module Trace_summaries = struct
   module T = Q.Table.Make (struct
     let name = "trace_summaries"
@@ -228,6 +283,7 @@ module Trace_summaries = struct
   let error_count = column "error_count" Q.int
   let is_running = column "is_running" Q.bool
   let warning_count = column "warning_count" Q.int
+  let dropped_span_count = column "dropped_span_count" Q.int
   let updated_at_ms = column "updated_at_ms" Q.int
 end
 
@@ -272,23 +328,9 @@ module Metric_attributes = struct
 
   include T
 
-  let id = column "id" Q.text
   let owner_id = column "owner_id" Q.text
   let key = column "key" Q.text
   let value = column "value" Q.text
-end
-
-(* SQLite keeps its schema in [sqlite_master]; the typed builders can read it
-   like any other table, which keeps the schema-version check free of raw SQL. *)
-module Sqlite_master = struct
-  module T = Q.Table.Make (struct
-    let name = "sqlite_master"
-  end)
-
-  include T
-
-  let type_ = column "type" Q.text
-  let name = column "name" Q.text
 end
 
 let pp_error ppf = function
@@ -296,6 +338,8 @@ let pp_error ppf = function
   | `Pool_shutdown -> Format.pp_print_string ppf "pool shutdown"
   | `Timeout -> Format.pp_print_string ppf "timeout"
   | `Invalid_store message -> Format.fprintf ppf "invalid store: %s" message
+
+let error_message error = Format.asprintf "%a" pp_error error
 
 let widen_pool_error (error : Q.Pool.error) : error = (error :> error)
 
@@ -315,7 +359,6 @@ let fresh_id wall_now prefix =
   Printf.sprintf "%s-%d-%d-%d" prefix (Unix.getpid ()) (wall_now ()) seq
 
 let span_row_id (span : Model.span) = span.trace_id ^ ":" ^ span.span_id
-let attr_row_id owner_id index key = owner_id ^ ":" ^ string_of_int index ^ ":" ^ key
 
 let event_to_json (event : Model.span_event) =
   `Assoc
@@ -381,17 +424,10 @@ let events_of_json text =
   | _ -> []
   | exception Yojson.Json_error _ -> []
 
-let q_schema_pool runner schema =
-  Q.Pool.Typed.run_schema runner (Q.Ox_schema.compile schema)
-
 let q_exec_pool runner query = Q.Pool.Typed.execute_compiled runner query
 
 let q_select_pool runner query =
   Q.Pool.Typed.select runner (Q.Select.compile query)
-
-let q_schema runner schema =
-  Q.Pool.Typed.run_schema runner (Q.Ox_schema.compile schema)
-  |> Result.map_error widen_pool_error
 
 let q_exec runner query =
   Q.Pool.Typed.execute_compiled runner query |> Result.map_error widen_pool_error
@@ -408,14 +444,6 @@ let rec result_iter list f =
       let* () = f item in
       result_iter rest f
 
-let rec result_fold list init f =
-  let open Result.Syntax in
-  match list with
-  | [] -> Ok init
-  | item :: rest ->
-      let* init = f init item in
-      result_fold rest init f
-
 let one_or_none operation rows =
   match rows with
   | [] -> Ok None
@@ -428,6 +456,7 @@ let scalar operation rows =
   | [] -> Error (`Invalid_store (operation ^ " returned no rows"))
   | _ -> Error (`Invalid_store (operation ^ " returned more than one row"))
 
+(* The schema of one segment. *)
 let schemas =
   let open Q.Ox_schema in
   [
@@ -454,23 +483,16 @@ let schemas =
         column ~not_null:true Spans.links_json;
         column ~not_null:true Spans.ingested_at_ms;
       ];
-    create_index ~if_not_exists:true ~name:"idx_spans_service" Spans.table
-      [ Q.Column.any Spans.service_name ];
     create_index ~if_not_exists:true ~name:"idx_spans_start_time" Spans.table
       [ Q.Column.any Spans.start_time_ns ];
-    create_index ~if_not_exists:true ~name:"idx_spans_trace" Spans.table
-      [ Q.Column.any Spans.trace_id ];
-    create_index ~if_not_exists:true ~name:"idx_spans_span_id" Spans.table
-      [ Q.Column.any Spans.span_id ];
-    create_index ~if_not_exists:true ~name:"idx_spans_status" Spans.table
-      [ Q.Column.any Spans.status ];
     create_index ~if_not_exists:true ~name:"idx_spans_service_start" Spans.table
       [ Q.Column.any Spans.service_name; Q.Column.any Spans.start_time_ns ];
     create_index ~if_not_exists:true ~name:"idx_spans_trace_parent" Spans.table
       [ Q.Column.any Spans.trace_id; Q.Column.any Spans.parent_span_id ];
+    create_index ~if_not_exists:true ~name:"idx_spans_span_id" Spans.table
+      [ Q.Column.any Spans.span_id ];
     create_table ~if_not_exists:true Span_attributes.table
       [
-        column ~primary_key:true Span_attributes.id;
         column ~not_null:true Span_attributes.owner_id;
         column ~not_null:true Span_attributes.key;
         column ~not_null:true Span_attributes.value;
@@ -497,21 +519,16 @@ let schemas =
         column ~not_null:true Logs.resource_json;
         column ~not_null:true Logs.ingested_at_ms;
       ];
-    create_index ~if_not_exists:true ~name:"idx_logs_service" Logs.table
-      [ Q.Column.any Logs.service_name ];
+    create_index ~if_not_exists:true ~name:"idx_logs_service_timestamp" Logs.table
+      [ Q.Column.any Logs.service_name; Q.Column.any Logs.timestamp_ns ];
     create_index ~if_not_exists:true ~name:"idx_logs_timestamp" Logs.table
       [ Q.Column.any Logs.timestamp_ns ];
     create_index ~if_not_exists:true ~name:"idx_logs_trace" Logs.table
       [ Q.Column.any Logs.trace_id ];
     create_index ~if_not_exists:true ~name:"idx_logs_span" Logs.table
       [ Q.Column.any Logs.span_id ];
-    create_index ~if_not_exists:true ~name:"idx_logs_severity" Logs.table
-      [ Q.Column.any Logs.severity_normalized ];
-    create_index ~if_not_exists:true ~name:"idx_logs_ingested" Logs.table
-      [ Q.Column.any Logs.ingested_at_ms ];
     create_table ~if_not_exists:true Log_attributes.table
       [
-        column ~primary_key:true Log_attributes.id;
         column ~not_null:true Log_attributes.owner_id;
         column ~not_null:true Log_attributes.key;
         column ~not_null:true Log_attributes.value;
@@ -521,26 +538,22 @@ let schemas =
       [ Q.Column.any Log_attributes.key; Q.Column.any Log_attributes.value ];
     create_index ~if_not_exists:true ~name:"idx_log_attributes_owner"
       Log_attributes.table [ Q.Column.any Log_attributes.owner_id ];
-    create_table ~if_not_exists:true Trace_summaries.table
+    create_table ~if_not_exists:true Trace_parts.table
       [
-        column ~primary_key:true Trace_summaries.trace_id;
-        column ~not_null:true Trace_summaries.service_name;
-        column ~not_null:true Trace_summaries.root_operation_name;
-        column ~not_null:true Trace_summaries.started_at_ns;
-        column ~not_null:true Trace_summaries.ended_at_ns;
-        column ~not_null:true Trace_summaries.duration_ms;
-        column ~not_null:true Trace_summaries.span_count;
-        column ~not_null:true Trace_summaries.error_count;
-        column ~not_null:true Trace_summaries.is_running;
-        column ~not_null:true Trace_summaries.warning_count;
-        column ~not_null:true Trace_summaries.updated_at_ms;
+        column ~primary_key:true Trace_parts.trace_id;
+        column ~not_null:true Trace_parts.service_name;
+        column ~not_null:true Trace_parts.root_operation_name;
+        column ~not_null:true Trace_parts.has_root;
+        column ~not_null:true Trace_parts.started_at_ns;
+        column ~not_null:true Trace_parts.ended_at_ns;
+        column ~not_null:true Trace_parts.span_count;
+        column ~not_null:true Trace_parts.error_count;
+        column ~not_null:true Trace_parts.running_count;
+        column ~not_null:true Trace_parts.root_count;
+        column ~not_null:true Trace_parts.missing_parent_count;
+        column ~not_null:true Trace_parts.dropped_span_count;
+        column ~not_null:true Trace_parts.updated_at_ms;
       ];
-    create_index ~if_not_exists:true ~name:"idx_trace_summaries_service"
-      Trace_summaries.table [ Q.Column.any Trace_summaries.service_name ];
-    create_index ~if_not_exists:true ~name:"idx_trace_summaries_started"
-      Trace_summaries.table [ Q.Column.any Trace_summaries.started_at_ns ];
-    create_index ~if_not_exists:true ~name:"idx_trace_summaries_updated"
-      Trace_summaries.table [ Q.Column.any Trace_summaries.updated_at_ms ];
     create_table ~if_not_exists:true Trace_services.table
       [ column ~not_null:true Trace_services.trace_id;
         column ~not_null:true Trace_services.service_name ];
@@ -549,9 +562,6 @@ let schemas =
       [ Q.Column.any Trace_services.trace_id; Q.Column.any Trace_services.service_name ];
     create_index ~if_not_exists:true ~name:"idx_trace_services_service"
       Trace_services.table [ Q.Column.any Trace_services.service_name ];
-    create_index ~if_not_exists:true ~name:"idx_trace_summaries_service_start"
-      Trace_summaries.table
-      [ Q.Column.any Trace_summaries.service_name; Q.Column.any Trace_summaries.started_at_ns ];
     create_table ~if_not_exists:true Metric_points.table
       [
         column ~primary_key:true Metric_points.id;
@@ -575,11 +585,8 @@ let schemas =
       Metric_points.table [ Q.Column.any Metric_points.timestamp_ns ];
     create_index ~if_not_exists:true ~name:"idx_metric_points_name"
       Metric_points.table [ Q.Column.any Metric_points.name ];
-    create_index ~if_not_exists:true ~name:"idx_metric_points_ingested"
-      Metric_points.table [ Q.Column.any Metric_points.ingested_at_ms ];
     create_table ~if_not_exists:true Metric_attributes.table
       [
-        column ~primary_key:true Metric_attributes.id;
         column ~not_null:true Metric_attributes.owner_id;
         column ~not_null:true Metric_attributes.key;
         column ~not_null:true Metric_attributes.value;
@@ -603,19 +610,13 @@ let schema_statements =
 let schema_fingerprint =
   Digest.to_hex (Digest.string (String.concat "\n" schema_statements))
 
-let init_schema runner =
-  let open Result.Syntax in
-  let* () = result_iter schemas (q_schema_pool runner) in
-  let query =
-    Q.Insert.(
-      into Meta.table
-      |> value Meta.key "schema_version"
-      |> value Meta.value schema_version_text
-      |> on_conflict_update [ Q.Column.any Meta.key ] ~set:[ Q.Column.any Meta.value ]
-      |> compile)
-  in
-  let* _ = q_exec_pool runner query in
-  Ok ()
+let meta_upsert key text =
+  Q.Insert.(
+    into Meta.table
+    |> value Meta.key key
+    |> value Meta.value text
+    |> on_conflict_update [ Q.Column.any Meta.key ] ~set:[ Q.Column.any Meta.value ]
+    |> compile)
 
 let sqlite_config path =
   {
@@ -628,16 +629,26 @@ let sqlite_config path =
     cache_size = Some (-20_000);
   }
 
-(* Ox SQL has no typed pragma API. Ox_sql.mli documents [Pool.Raw] as the
-   escape hatch for "migrations, pragmas, diagnostics, and backend-specific
-   SQL", so every pragma Inn runs goes through these two helpers, and no other
-   raw SQL exists in the store. *)
-let sqlite_pragma_int runner pragma =
-  let open Result.Syntax in
-  let* rows =
-    Q.Pool.Raw.query runner ("PRAGMA " ^ pragma) []
-    |> Result.map_error widen_pool_error
-  in
+(* The reader's own database is an empty in-memory database; everything it
+   reads comes from the attached segments. *)
+let reader_config =
+  {
+    Sqlite.path = ":memory:";
+    mode = Read_write_create;
+    busy_timeout_ms = Some 5000;
+    foreign_keys = false;
+    journal_mode = None;
+    synchronous = None;
+    cache_size = Some (-20_000);
+  }
+
+let pool_timeout = Ox.Duration.seconds 30
+
+(* Ox SQL has no typed pragma, attach, or view API. Ox_sql.mli documents
+   [Pool.Raw] as the escape hatch for "migrations, pragmas, diagnostics, and
+   backend-specific SQL". Every raw statement below is a literal; schema names
+   and paths are bound as values. *)
+let first_int operation rows =
   let column_value row =
     match Q.Row.fields row with
     | name :: _ -> Q.Row.int name row
@@ -645,195 +656,375 @@ let sqlite_pragma_int runner pragma =
   in
   match List.filter_map column_value rows with
   | value :: _ -> Ok value
-  | [] ->
-      Error
-        (`Invalid_store
-          (Printf.sprintf "PRAGMA %s did not return an integer value" pragma))
+  | [] -> Error (`Invalid_store (operation ^ " did not return an integer value"))
 
-let sqlite_pragma runner pragma =
+let database_bytes runner =
   let open Result.Syntax in
-  (* [PRAGMA incremental_vacuum] steps once per freed page, so the pragma is
-     folded rather than executed; [Raw.execute] rejects a row-returning
-     statement. *)
-  let* () =
-    Q.Pool.Raw.fold runner ("PRAGMA " ^ pragma) [] ~init:()
-      ~f:(fun () _ -> ())
-    |> Result.map_error widen_pool_error
+  let* pages =
+    Q.Pool.Raw.query runner "PRAGMA page_count" [] |> Result.map_error widen_pool_error
   in
-  Ok ()
+  let* page_count = first_int "PRAGMA page_count" pages in
+  let* sizes =
+    Q.Pool.Raw.query runner "PRAGMA page_size" [] |> Result.map_error widen_pool_error
+  in
+  let* page_size = first_int "PRAGMA page_size" sizes in
+  Ok (page_count * page_size)
 
-(* Live data is the pages in use, not the file size: SQLite never shrinks the
-   file on delete alone, so the file size is a poor size-cap input (ret-zjzs). *)
-let live_bytes runner =
+let slot_names = [| "s0"; "s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7" |]
+
+(* The views of the reader connection. They name the eight slots s0..s7, so
+   every slot is always attached, and an empty segment answers with no rows. *)
+let reader_views_sql = {sql|CREATE TEMP VIEW IF NOT EXISTS spans AS
+  SELECT * FROM s0.spans UNION ALL
+  SELECT * FROM s1.spans UNION ALL
+  SELECT * FROM s2.spans UNION ALL
+  SELECT * FROM s3.spans UNION ALL
+  SELECT * FROM s4.spans UNION ALL
+  SELECT * FROM s5.spans UNION ALL
+  SELECT * FROM s6.spans UNION ALL
+  SELECT * FROM s7.spans;
+CREATE TEMP VIEW IF NOT EXISTS span_attributes AS
+  SELECT * FROM s0.span_attributes UNION ALL
+  SELECT * FROM s1.span_attributes UNION ALL
+  SELECT * FROM s2.span_attributes UNION ALL
+  SELECT * FROM s3.span_attributes UNION ALL
+  SELECT * FROM s4.span_attributes UNION ALL
+  SELECT * FROM s5.span_attributes UNION ALL
+  SELECT * FROM s6.span_attributes UNION ALL
+  SELECT * FROM s7.span_attributes;
+CREATE TEMP VIEW IF NOT EXISTS logs AS
+  SELECT * FROM s0.logs UNION ALL
+  SELECT * FROM s1.logs UNION ALL
+  SELECT * FROM s2.logs UNION ALL
+  SELECT * FROM s3.logs UNION ALL
+  SELECT * FROM s4.logs UNION ALL
+  SELECT * FROM s5.logs UNION ALL
+  SELECT * FROM s6.logs UNION ALL
+  SELECT * FROM s7.logs;
+CREATE TEMP VIEW IF NOT EXISTS log_attributes AS
+  SELECT * FROM s0.log_attributes UNION ALL
+  SELECT * FROM s1.log_attributes UNION ALL
+  SELECT * FROM s2.log_attributes UNION ALL
+  SELECT * FROM s3.log_attributes UNION ALL
+  SELECT * FROM s4.log_attributes UNION ALL
+  SELECT * FROM s5.log_attributes UNION ALL
+  SELECT * FROM s6.log_attributes UNION ALL
+  SELECT * FROM s7.log_attributes;
+CREATE TEMP VIEW IF NOT EXISTS metric_points AS
+  SELECT * FROM s0.metric_points UNION ALL
+  SELECT * FROM s1.metric_points UNION ALL
+  SELECT * FROM s2.metric_points UNION ALL
+  SELECT * FROM s3.metric_points UNION ALL
+  SELECT * FROM s4.metric_points UNION ALL
+  SELECT * FROM s5.metric_points UNION ALL
+  SELECT * FROM s6.metric_points UNION ALL
+  SELECT * FROM s7.metric_points;
+CREATE TEMP VIEW IF NOT EXISTS metric_attributes AS
+  SELECT * FROM s0.metric_attributes UNION ALL
+  SELECT * FROM s1.metric_attributes UNION ALL
+  SELECT * FROM s2.metric_attributes UNION ALL
+  SELECT * FROM s3.metric_attributes UNION ALL
+  SELECT * FROM s4.metric_attributes UNION ALL
+  SELECT * FROM s5.metric_attributes UNION ALL
+  SELECT * FROM s6.metric_attributes UNION ALL
+  SELECT * FROM s7.metric_attributes;
+CREATE TEMP VIEW IF NOT EXISTS trace_services AS
+  SELECT * FROM s0.trace_services UNION ALL
+  SELECT * FROM s1.trace_services UNION ALL
+  SELECT * FROM s2.trace_services UNION ALL
+  SELECT * FROM s3.trace_services UNION ALL
+  SELECT * FROM s4.trace_services UNION ALL
+  SELECT * FROM s5.trace_services UNION ALL
+  SELECT * FROM s6.trace_services UNION ALL
+  SELECT * FROM s7.trace_services;
+CREATE TEMP VIEW IF NOT EXISTS inn_meta AS SELECT * FROM s0.inn_meta;
+CREATE TEMP VIEW IF NOT EXISTS trace_summaries AS
+WITH parts AS (
+  SELECT * FROM s0.trace_parts UNION ALL
+  SELECT * FROM s1.trace_parts UNION ALL
+  SELECT * FROM s2.trace_parts UNION ALL
+  SELECT * FROM s3.trace_parts UNION ALL
+  SELECT * FROM s4.trace_parts UNION ALL
+  SELECT * FROM s5.trace_parts UNION ALL
+  SELECT * FROM s6.trace_parts UNION ALL
+  SELECT * FROM s7.trace_parts
+),
+roots AS (
+  SELECT trace_id, service_name, root_operation_name,
+    ROW_NUMBER() OVER (
+      PARTITION BY trace_id ORDER BY has_root DESC, started_at_ns ASC
+    ) AS root_rank
+  FROM parts
+)
+SELECT
+  parts.trace_id AS trace_id,
+  roots.service_name AS service_name,
+  roots.root_operation_name AS root_operation_name,
+  MIN(parts.started_at_ns) AS started_at_ns,
+  MAX(parts.ended_at_ns) AS ended_at_ns,
+  (MAX(parts.ended_at_ns) - MIN(parts.started_at_ns)) / 1000000.0 AS duration_ms,
+  SUM(parts.span_count) AS span_count,
+  SUM(parts.error_count) AS error_count,
+  MAX(parts.running_count) > 0 AS is_running,
+  SUM(parts.missing_parent_count)
+    + (CASE WHEN SUM(parts.root_count) + SUM(parts.missing_parent_count) > 1
+       THEN 1 ELSE 0 END) AS warning_count,
+  SUM(parts.dropped_span_count) AS dropped_span_count,
+  MAX(parts.updated_at_ms) AS updated_at_ms
+FROM parts
+JOIN roots ON roots.trace_id = parts.trace_id AND roots.root_rank = 1
+GROUP BY parts.trace_id;|sql}
+
+let attach_segments runner segments =
   let open Result.Syntax in
-  let* page_count = sqlite_pragma_int runner "page_count" in
-  let* freelist_count = sqlite_pragma_int runner "freelist_count" in
-  let* page_size = sqlite_pragma_int runner "page_size" in
-  Ok ((page_count - freelist_count) * page_size)
+  let raw_error result = Result.map_error widen_pool_error result in
+  let* attached =
+    Q.Pool.Raw.query runner "PRAGMA database_list" [] |> raw_error
+  in
+  let attached_names =
+    List.filter_map (fun row -> Q.Row.string "name" row) attached
+  in
+  let* () =
+    result_iter
+      (List.filter (fun name -> Array.mem name slot_names) attached_names)
+      (fun name ->
+        let* _ =
+          Q.Pool.Raw.execute runner "DETACH DATABASE ?" [ Q.Value.string name ]
+          |> raw_error
+        in
+        Ok ())
+  in
+  let* () =
+    result_iter (Array.to_list segments) (fun segment ->
+        let* _ =
+          Q.Pool.Raw.execute runner "ATTACH DATABASE ? AS ?"
+            [ Q.Value.string segment.path; Q.Value.string slot_names.(segment.slot) ]
+          |> raw_error
+        in
+        Ok ())
+  in
+  Q.Pool.Raw.execute_script runner reader_views_sql |> raw_error
 
-(* Schema state of the file at the configured database path. The check reads
-   the file before any schema statement runs, so a database that is not Inn's
-   is never modified or deleted (schm-xkk2). *)
-type database_state =
-  | Database_absent
-  | Database_fresh
-  | Database_current
-  | Database_stale of string
-  | Database_foreign
+(* Before a read, the reader attaches the current files when a rotation
+   changed them; a failed read makes the next one attach again, so a reader
+   connection that the pool replaced gets its attachments back. *)
+let ensure_reader t =
+  if t.reader_generation = t.generation then Ok ()
+  else
+    Eio.Mutex.use_rw ~protect:true t.reader_lock (fun () ->
+        if t.reader_generation = t.generation then Ok ()
+        else
+          let generation = t.generation in
+          match attach_segments t.reader t.segments with
+          | Ok () ->
+              t.reader_generation <- generation;
+              Ok ()
+          | Error _ as error -> error)
 
-(* Inspecting and preparing a file uses a local, non-WAL connection: [PRAGMA
-   journal_mode = WAL] writes the database header, which would both touch a
-   foreign file and lock in the default [auto_vacuum] before Inn can set it.
-   The remaining settings are per-connection and do not modify the file. *)
-let local_sqlite_config ?(mode = Sqlite.Read_write) path =
-  { (sqlite_config path) with mode; journal_mode = None }
+let read t f =
+  match ensure_reader t with
+  | Error _ as error -> error
+  | Ok () -> (
+      match f t.reader with
+      | Ok _ as ok -> ok
+      | Error _ as error ->
+          t.reader_generation <- -1;
+          error)
 
-let with_local_pool ~caps ?mode path f =
+let segment_bytes config =
+  config.Config.max_db_size_mb * 1024 * 1024 / segment_count
+
+let segment_path config slot =
+  Filename.concat config.Config.data_dir (Printf.sprintf "segment-%d.sqlite" slot)
+
+let remove_if_exists ~caps path =
+  if Sys.file_exists path then Ox_caps.Cap_sys.remove ~caps path
+
+let remove_segment_files ~caps path =
+  try
+    List.iter (remove_if_exists ~caps) [ path; path ^ "-wal"; path ^ "-shm" ];
+    Ok ()
+  with Sys_error message -> Error (`Invalid_store message)
+
+let default_report ~caps line =
+  Ox_caps.Cap_stdlib.prerr_endline ~caps ("inn: " ^ line)
+
+type segment_state =
+  | Segment_absent
+  | Segment_current of { sequence : int; started_at_ms : int; bytes : int }
+  | Segment_unusable of string
+
+let meta_value pool key =
+  let open Result.Syntax in
+  let* rows =
+    q_select pool
+      Q.Select.(
+        from Meta.table Q.Projection.(one Meta.value)
+        |> where Q.Expr.(eq Meta.key key)
+        |> limit 1)
+  in
+  Ok (match rows with value :: _ -> Some value | [] -> None)
+
+let with_segment_pool ~caps path f =
   Eio.Switch.run (fun sw ->
       let open Result.Syntax in
       let* pool =
-        Q.Pool.create ~caps ~sw ~default_timeout:(Ox.Duration.seconds 5) ~max_size:1
-          (local_sqlite_config ?mode path)
+        Q.Pool.create ~caps ~sw ~default_timeout:pool_timeout ~max_size:1
+          (sqlite_config path)
         |> Result.map_error widen_pool_error
       in
       let result = f pool in
       let closed = Q.Pool.shutdown pool |> Result.map_error widen_pool_error in
       match result with Error _ -> result | Ok value -> Result.map (fun () -> value) closed)
 
-let sqlite_magic = "SQLite format 3\000"
-
-(* A zero-length file is a valid empty SQLite database; anything else must
-   carry the SQLite header. Refusing a file that is not SQLite before opening a
-   connection keeps a misconfigured path from being touched at all
-   (schm-xkk2). *)
-let file_is_sqlite ~caps path =
-  let channel = Ox_caps.Cap_stdlib.open_in_bin ~caps path in
-  Fun.protect
-    ~finally:(fun () -> close_in channel)
-    (fun () ->
-      let length = in_channel_length channel in
-      if length = 0 then true
-      else if length < String.length sqlite_magic then false
-      else String.equal (really_input_string channel 16) sqlite_magic)
-
-let read_database_state ~caps path =
-  if not (Sys.file_exists path) then Ok Database_absent
-  else if not (file_is_sqlite ~caps path) then
-    Error
-      (`Invalid_store
-        (Printf.sprintf "refusing to open %s: it is not an SQLite database" path))
+let read_segment_state ~caps path =
+  if not (Sys.file_exists path) then Segment_absent
   else
-    let open Result.Syntax in
-    let result =
-      with_local_pool ~caps path (fun pool ->
+    let state =
+      with_segment_pool ~caps path (fun pool ->
           let open Result.Syntax in
-          let* tables =
-            q_select pool
-              Q.Select.(
-                from Sqlite_master.table Q.Projection.(one Sqlite_master.name)
-                |> where Q.Expr.(eq Sqlite_master.type_ "table"))
-          in
-          let tables =
-            List.filter
-              (fun name -> not (String.starts_with ~prefix:"sqlite_" name))
-              tables
-          in
-          if not (List.mem "inn_meta" tables) then
-            Ok
-              (if tables = [] then Database_fresh else Database_foreign)
-          else
-            let* versions =
-              q_select pool
-                Q.Select.(
-                  from Meta.table Q.Projection.(one Meta.value)
-                  |> where Q.Expr.(eq Meta.key "schema_version")
-                  |> limit 1)
-            in
-            match versions with
-            | [ stored ] when String.equal stored schema_version_text ->
-                Ok Database_current
-            | [ stored ] -> Ok (Database_stale stored)
-            | [] -> Ok (Database_stale "none")
-            | _ ->
-                Error
-                  (`Invalid_store
-                    "inn_meta holds more than one schema_version row"))
+          let* version = meta_value pool "schema_version" in
+          let* sequence = meta_value pool "sequence" in
+          let* started_at = meta_value pool "started_at_ms" in
+          let* bytes = database_bytes pool in
+          match
+            ( version,
+              Option.bind sequence int_of_string_opt,
+              Option.bind started_at int_of_string_opt )
+          with
+          | Some version, Some sequence, Some started_at_ms
+            when String.equal version schema_version_text ->
+              Ok (Segment_current { sequence; started_at_ms; bytes })
+          | Some version, _, _ when not (String.equal version schema_version_text) ->
+              Ok
+                (Segment_unusable
+                   (Printf.sprintf "schema version %s does not match version %d"
+                      version schema_version))
+          | _ -> Ok (Segment_unusable "its inn_meta rows are missing"))
     in
-    match result with
-    | Ok state -> Ok state
-    | Error error ->
-        Error
-          (`Invalid_store
-            (Printf.sprintf "cannot read %s as an SQLite database: %s" path
-               (Format.asprintf "%a" pp_error error)))
+    match state with
+    | Ok state -> state
+    | Error error -> Segment_unusable (error_message error)
 
-let remove_if_exists ~caps path =
-  if Sys.file_exists path then
-    try Ox_caps.Cap_sys.remove ~caps path with Sys_error _ -> ()
-
-let remove_database_files ~caps path =
-  List.iter (remove_if_exists ~caps) [ path; path ^ "-wal"; path ^ "-shm" ]
-
-let default_report ~caps line =
-  Ox_caps.Cap_stdlib.prerr_endline ~caps ("inn: " ^ line)
+let create_segment_file ~caps ~now segment ~sequence =
+  let open Result.Syntax in
+  let* () = remove_segment_files ~caps segment.path in
+  let started_at_ms = now () in
+  let* bytes =
+    with_segment_pool ~caps segment.path (fun pool ->
+        let* () =
+          result_iter schemas (fun schema ->
+              Q.Pool.Typed.run_schema pool (Q.Ox_schema.compile schema)
+              |> Result.map_error widen_pool_error)
+        in
+        let* _ = q_exec pool (meta_upsert "schema_version" schema_version_text) in
+        let* _ = q_exec pool (meta_upsert "sequence" (string_of_int sequence)) in
+        let* _ =
+          q_exec pool (meta_upsert "started_at_ms" (string_of_int started_at_ms))
+        in
+        database_bytes pool)
+  in
+  segment.sequence <- sequence;
+  segment.started_at_ms <- started_at_ms;
+  segment.bytes <- bytes;
+  Ok ()
 
 let open_ ~caps ~sw ?(now_ms = wall_now_ms ~caps) ?(report = default_report ~caps) config =
   let wall_now = wall_now_ms ~caps in
   let open Result.Syntax in
-  let path = config.Config.db_path in
-  mkdir_p ~caps (Filename.dirname path);
-  let* state = read_database_state ~caps path in
   let* () =
-    match state with
-    | Database_current -> Ok ()
-    | Database_foreign ->
-        Error
-          (`Invalid_store
-            (Printf.sprintf
-               "refusing to recreate %s: it has tables but no inn_meta table, so it is not an Inn database"
-               path))
-    | Database_stale stored ->
-        report
-          (Printf.sprintf
-             "schema version %s at %s does not match version %d; deleting the old database and creating a fresh one"
-             stored path schema_version);
-        remove_database_files ~caps path;
-        Ok ()
-    | Database_absent | Database_fresh ->
-        remove_database_files ~caps path;
-        Ok ()
+    try
+      mkdir_p ~caps config.Config.data_dir;
+      Ok ()
+    with Unix.Unix_error (error, operation, path) ->
+      Error
+        (`Invalid_store
+          (Printf.sprintf "%s %s: %s" operation path (Unix.error_message error)))
+  in
+  let create_segment segment ~sequence =
+    create_segment_file ~caps ~now:wall_now segment ~sequence
+  in
+  let segments =
+    Array.init segment_count (fun slot ->
+        { slot; path = segment_path config slot; sequence = 0; started_at_ms = 0; bytes = 0 })
+  in
+  (* Every slot file exists and has the current schema; a file that does not
+     is deleted and created empty (bcache-f1le). *)
+  let* () =
+    result_iter (Array.to_list segments) (fun segment ->
+        match read_segment_state ~caps segment.path with
+        | Segment_current { sequence; started_at_ms; bytes } ->
+            segment.sequence <- sequence;
+            segment.started_at_ms <- started_at_ms;
+            segment.bytes <- bytes;
+            Ok ()
+        | Segment_absent -> create_segment segment ~sequence:0
+        | Segment_unusable reason ->
+            report
+              (Printf.sprintf "segment %s is unusable (%s); deleting it and creating an empty one"
+                 segment.path reason);
+            create_segment segment ~sequence:0)
+  in
+  let active =
+    Array.fold_left
+      (fun best segment ->
+        if segment.sequence > segments.(best).sequence then segment.slot else best)
+      0 segments
   in
   let* () =
-    (* [auto_vacuum] must be set while the database is still empty, and before
-       any other connection switches it to WAL, or SQLite ignores it. *)
-    match state with
-    | Database_current -> Ok ()
-    | _ ->
-        with_local_pool ~caps ~mode:Sqlite.Read_write_create path (fun pool ->
-            sqlite_pragma pool "auto_vacuum = INCREMENTAL")
+    if segments.(active).sequence = 0 then create_segment segments.(active) ~sequence:1
+    else Ok ()
   in
-  let* pool =
-    Q.Pool.create ~caps ~sw ~default_timeout:(Ox.Duration.seconds 5) ~max_size:4
-      (sqlite_config path)
+  let open_writer path =
+    Q.Pool.create ~caps ~sw ~default_timeout:pool_timeout ~max_size:1 (sqlite_config path)
     |> Result.map_error widen_pool_error
   in
-  let* () = init_schema pool |> Result.map_error widen_pool_error in
-  Ok { config; pool; now_ms; wall_now; last_prune = None }
+  let* writer = open_writer segments.(active).path in
+  let* reader =
+    Q.Pool.create ~caps ~sw ~default_timeout:pool_timeout ~max_size:1 reader_config
+    |> Result.map_error widen_pool_error
+  in
+  let t =
+    {
+      config;
+      now_ms;
+      wall_now;
+      segments;
+      active;
+      writer;
+      reader;
+      generation = 0;
+      reader_generation = -1;
+      write_lock = Eio.Mutex.create ();
+      reader_lock = Eio.Mutex.create ();
+      open_writer;
+      create_segment;
+      report;
+      ingest_failures = 0;
+      last_ingest_failure = None;
+    }
+  in
+  let* () = ensure_reader t in
+  Ok t
 
-let close t = Q.Pool.shutdown t.pool |> Result.map_error widen_pool_error
+let close t =
+  let writer = Q.Pool.shutdown t.writer |> Result.map_error widen_pool_error in
+  let reader = Q.Pool.shutdown t.reader |> Result.map_error widen_pool_error in
+  match writer with Error _ -> writer | Ok () -> reader
 
 (* The query window is resolved against this clock, so handler tests can drive
    both ingestion and lookback with the same injected time. *)
 let now_ms t = t.now_ms ()
 
-(* A cheap liveness read for GET /ready: one row of the tiny metadata table
-   proves the pool still answers without scanning any telemetry table. *)
+(* A cheap liveness read for GET /ready: one row of the metadata view proves
+   the reader still answers without scanning any telemetry table. *)
 let ping t =
-  q_select t.pool
-    Q.Select.(
-      from Meta.table Q.Projection.(one Meta.value)
-      |> where Q.Expr.(eq Meta.key "schema_version")
-      |> limit 1)
+  read t (fun runner ->
+      q_select runner
+        Q.Select.(
+          from Meta.table Q.Projection.(one Meta.value)
+          |> where Q.Expr.(eq Meta.key "schema_version")
+          |> limit 1))
   |> Result.map (fun _ -> ())
 
 let with_db ~caps ~sw ?now_ms ?report config f =
@@ -842,6 +1033,52 @@ let with_db ~caps ~sw ?now_ms ?report config f =
   let result = f store in
   let closed = close store in
   match result with Error _ -> result | Ok value -> Result.map (fun () -> value) closed
+
+(* Writes ------------------------------------------------------------------ *)
+
+let note_failure t message =
+  t.ingest_failures <- t.ingest_failures + 1;
+  t.last_ingest_failure <- Some { Model.failed_at_ms = t.wall_now (); message }
+
+(* After a write, the active segment is measured; when it holds its share of
+   the budget, the next slot becomes active and its old data is deleted
+   with its file (bcache-r1ng, bcache-f1le). *)
+let rotate t =
+  let open Result.Syntax in
+  let next = (t.active + 1) mod segment_count in
+  let segment = t.segments.(next) in
+  let sequence = t.segments.(t.active).sequence + 1 in
+  let* () = t.create_segment segment ~sequence in
+  let* writer = t.open_writer segment.path in
+  let previous = t.writer in
+  t.writer <- writer;
+  t.active <- next;
+  t.generation <- t.generation + 1;
+  Q.Pool.shutdown previous |> Result.map_error widen_pool_error
+
+let after_write t =
+  let open Result.Syntax in
+  let* bytes = database_bytes t.writer in
+  let active = t.segments.(t.active) in
+  active.bytes <- bytes;
+  if bytes >= segment_bytes t.config then rotate t else Ok ()
+
+(* Every write holds the write lock, so a rotation never runs inside another
+   write. A failed write is returned to the exporter and counted; a failed
+   rotation is counted and retried after the next write (bcache-s7at). *)
+let write t f =
+  Eio.Mutex.use_rw ~protect:true t.write_lock (fun () ->
+      let result = f t.writer in
+      (match result with
+      | Error error -> note_failure t (error_message error)
+      | Ok _ -> (
+          match after_write t with
+          | Ok () -> ()
+          | Error error ->
+              let message = "segment rotation failed: " ^ error_message error in
+              t.report message;
+              note_failure t message));
+      result)
 
 let span_projection =
   Q.Projection.(
@@ -973,7 +1210,7 @@ let trace_summary_projection =
                duration_ms,
                span_count,
                error_count ),
-             (is_running, warning_count) ) ->
+             (is_running, warning_count, dropped_span_count) ) ->
         {
           Model.trace_id;
           service_name;
@@ -985,6 +1222,7 @@ let trace_summary_projection =
           error_count;
           is_running;
           warning_count;
+          dropped_span_count;
         })
       (t2
          (t8 (one Trace_summaries.trace_id) (one Trace_summaries.service_name)
@@ -992,8 +1230,9 @@ let trace_summary_projection =
             (one Trace_summaries.started_at_ns) (one Trace_summaries.ended_at_ns)
             (one Trace_summaries.duration_ms) (one Trace_summaries.span_count)
             (one Trace_summaries.error_count))
-         (t2 (one Trace_summaries.is_running)
-            (one Trace_summaries.warning_count))))
+         (t3 (one Trace_summaries.is_running)
+            (one Trace_summaries.warning_count)
+            (one Trace_summaries.dropped_span_count))))
 
 let span_query trace_id =
     Q.Select.(
@@ -1218,526 +1457,406 @@ let parent_span_ids_for_operation runner ?service operation =
       from Spans.table Q.Projection.(one Spans.span_id)
       |> where predicate)
 
-let insert_span_attrs runner owner_id attrs =
-  let open Result.Syntax in
-  let delete =
-    Q.Delete.(
-      from Span_attributes.table
-      |> where Q.Expr.(eq Span_attributes.owner_id owner_id)
-      |> compile)
-  in
-  let* _ = q_exec_pool runner delete in
-  let insert index (key, attr_value) =
-    Q.Insert.(
-      into Span_attributes.table
-      |> value Span_attributes.id (attr_row_id owner_id index key)
-      |> value Span_attributes.owner_id owner_id
-      |> value Span_attributes.key key
-      |> value Span_attributes.value (Model.attr_string_value attr_value)
-      |> compile)
-  in
-  let* _ =
-    result_fold attrs 0 (fun index attr ->
-        let* _ = q_exec_pool runner (insert index attr) in
-        Ok (index + 1))
-  in
-  Ok ()
+let short_attr_values attrs =
+  List.filter_map
+    (fun (key, attr_value) ->
+      let text = Model.attr_string_value attr_value in
+      if String.length text <= max_indexed_value_bytes then Some (key, text) else None)
+    attrs
 
-let insert_log_attrs runner owner_id attrs =
-  let open Result.Syntax in
-  let insert index (key, attr_value) =
-    Q.Insert.(
-      into Log_attributes.table
-      |> value Log_attributes.id (attr_row_id owner_id index key)
-      |> value Log_attributes.owner_id owner_id
-      |> value Log_attributes.key key
-      |> value Log_attributes.value (Model.attr_string_value attr_value)
-      |> compile)
-  in
-  let* _ =
-    result_fold attrs 0 (fun index attr ->
-        let* _ = q_exec_pool runner (insert index attr) in
-        Ok (index + 1))
-  in
-  Ok ()
+(* Ingest builds every statement with the pure functions below and runs them
+   inside one transaction callback that touches only its own runner, through
+   local closures and loops, so the transaction-runner gate can follow every
+   statement to the callback's runner. *)
 
-let insert_metric_attrs runner owner_id attrs =
-  let open Result.Syntax in
-  let insert index (key, attr_value) =
-    Q.Insert.(
-      into Metric_attributes.table
-      |> value Metric_attributes.id (attr_row_id owner_id index key)
-      |> value Metric_attributes.owner_id owner_id
-      |> value Metric_attributes.key key
-      |> value Metric_attributes.value (Model.attr_string_value attr_value)
-      |> compile)
-  in
-  let* _ =
-    result_fold attrs 0 (fun index attr ->
-        let* _ = q_exec_pool runner (insert index attr) in
-        Ok (index + 1))
-  in
-  Ok ()
+let span_attrs_delete owner_id =
+  Q.Delete.(
+    from Span_attributes.table
+    |> where Q.Expr.(eq Span_attributes.owner_id owner_id)
+    |> compile)
 
-(* One trace refresh owns every derived row of a trace: the trace summary
-   (tree order, running state, warnings) and the participating services. *)
-let refresh_trace ~now_ms runner trace_id =
-  let open Result.Syntax in
-  let* spans = select_spans_for_trace_pool runner trace_id in
-  match spans with
-  | [] -> Ok ()
-  | spans ->
-      let tree = Trace_tree.assemble spans in
-      let insert =
-        Q.Insert.(
-          into Trace_summaries.table
-          |> value Trace_summaries.trace_id trace_id
-          |> value Trace_summaries.service_name tree.root_service_name
-          |> value Trace_summaries.root_operation_name tree.root_operation_name
-          |> value Trace_summaries.started_at_ns tree.started_at_ns
-          |> value Trace_summaries.ended_at_ns tree.ended_at_ns
-          |> value Trace_summaries.duration_ms tree.duration_ms
-          |> value Trace_summaries.span_count tree.span_count
-          |> value Trace_summaries.error_count tree.error_count
-          |> value Trace_summaries.is_running tree.is_running
-          |> value Trace_summaries.warning_count (List.length tree.warnings)
-          |> value Trace_summaries.updated_at_ms now_ms
-          |> on_conflict_update [ Q.Column.any Trace_summaries.trace_id ]
-               ~set:[ Q.Column.any Trace_summaries.service_name;
-                      Q.Column.any Trace_summaries.root_operation_name;
-                      Q.Column.any Trace_summaries.started_at_ns;
-                      Q.Column.any Trace_summaries.ended_at_ns;
-                      Q.Column.any Trace_summaries.duration_ms;
-                      Q.Column.any Trace_summaries.span_count;
-                      Q.Column.any Trace_summaries.error_count;
-                      Q.Column.any Trace_summaries.is_running;
-                      Q.Column.any Trace_summaries.warning_count;
-                      Q.Column.any Trace_summaries.updated_at_ms ]
-          |> compile)
-      in
-      let* _ = q_exec_pool runner insert in
-      let* _ = q_exec_pool runner Q.Delete.(
-        from Trace_services.table
-        |> where Q.Expr.(eq Trace_services.trace_id trace_id)
-        |> compile) in
-      let services = List.sort_uniq String.compare
-        (List.map (fun (span : Model.span) -> span.service_name) spans) in
-      result_iter services (fun service_name ->
-        let* _ = q_exec_pool runner Q.Insert.(
-          into Trace_services.table
-          |> value Trace_services.trace_id trace_id
-          |> value Trace_services.service_name service_name
-          |> compile) in
-        Ok ())
+let span_attr_insert owner_id (key, text) =
+  Q.Insert.(
+    into Span_attributes.table
+    |> value Span_attributes.owner_id owner_id
+    |> value Span_attributes.key key
+    |> value Span_attributes.value text
+    |> compile)
 
-(* Retention deletes owner rows in bounded batches. Every batch is a
-   subquery delete limited to [prune_batch_size] rows, so no statement ever
-   binds a list that grows with the backlog (ret-xbij), and attribute rows are
-   removed through the same bounded subquery, so no deleted span, log, or
-   metric point leaves an orphaned index row (ret-hy7e). *)
+let log_attr_insert owner_id (key, text) =
+  Q.Insert.(
+    into Log_attributes.table
+    |> value Log_attributes.owner_id owner_id
+    |> value Log_attributes.key key
+    |> value Log_attributes.value text
+    |> compile)
 
-let prune_batch_size = 1000
-let size_pressure_batch_size = 100
+let metric_attr_insert owner_id (key, text) =
+  Q.Insert.(
+    into Metric_attributes.table
+    |> value Metric_attributes.owner_id owner_id
+    |> value Metric_attributes.key key
+    |> value Metric_attributes.value text
+    |> compile)
 
-type prune_counts = {
-  traces : int;
-  spans : int;
-  logs : int;
-  metric_points : int;
+(* The part of one trace in the active segment, computed from a light
+   projection of its spans there: ids, parent, names, times, and status. The
+   span cap bounds that projection, so the memory of a write depends on the
+   batch, not on the length of the trace (bcache-m3m0). *)
+type part_span = {
+  part_span_id : string;
+  part_parent : string option;
+  part_service : string;
+  part_operation : string;
+  part_start : int;
+  part_end : int;
+  part_status : string;
 }
 
-let zero_prune_counts = { traces = 0; spans = 0; logs = 0; metric_points = 0 }
+let part_span_projection =
+  Q.Projection.(
+    map
+      (fun ((part_span_id, part_parent, part_service, part_operation),
+            (part_start, part_end, part_status)) ->
+        { part_span_id; part_parent; part_service; part_operation; part_start;
+          part_end; part_status })
+      (t2
+         (t4 (one Spans.span_id) (one Spans.parent_span_id)
+            (one Spans.service_name) (one Spans.operation_name))
+         (t3 (one Spans.start_time_ns) (one Spans.end_time_ns) (one Spans.status))))
 
-let expired_log_ids_select ~batch cutoff =
+let part_spans_select trace_id =
   Q.Select.(
-    from Logs.table Q.Projection.(one Logs.id)
-    |> where Q.Expr.(lt Logs.ingested_at_ms cutoff)
-    |> order_by Logs.ingested_at_ms
-    |> limit batch
+    from Spans.table part_span_projection
+    |> where Q.Expr.(eq Spans.trace_id trace_id)
     |> compile)
 
-let oldest_log_ids_select ~batch =
+let stored_part_select trace_id =
   Q.Select.(
-    from Logs.table Q.Projection.(one Logs.id)
-    |> order_by Logs.ingested_at_ms
-    |> limit batch
+    from Trace_parts.table
+      Q.Projection.(t2 (one Trace_parts.span_count) (one Trace_parts.dropped_span_count))
+    |> where Q.Expr.(eq Trace_parts.trace_id trace_id)
+    |> limit 1
     |> compile)
 
-let delete_log_batch runner ~batch cutoff =
-  let ids =
-    match cutoff with
-    | Some cutoff -> expired_log_ids_select ~batch cutoff
-    | None -> oldest_log_ids_select ~batch
-  in
-  let open Result.Syntax in
-  let* _ =
-    q_exec_pool runner
-      Q.Delete.(
-        from Log_attributes.table
-        |> where Q.Expr.(in_select Log_attributes.owner_id ids)
-        |> compile)
-  in
-  q_exec_pool runner
-    Q.Delete.(from Logs.table |> where Q.Expr.(in_select Logs.id ids) |> compile)
+type part = {
+  service_name : string;
+  root_operation_name : string;
+  has_root : bool;
+  started_at_ns : int;
+  ended_at_ns : int;
+  span_count : int;
+  error_count : int;
+  running_count : int;
+  root_count : int;
+  missing_parent_count : int;
+}
 
-let expired_metric_ids_select ~batch cutoff =
-  Q.Select.(
-    from Metric_points.table Q.Projection.(one Metric_points.id)
-    |> where Q.Expr.(lt Metric_points.ingested_at_ms cutoff)
-    |> order_by Metric_points.ingested_at_ms
-    |> limit batch
+let part_running span = span.part_end = 0 || span.part_end < span.part_start
+
+(* The first root in tree order: a span without a parent, else a span whose
+   parent is not in the segment, by start time and then span id, as in
+   [Trace_tree.assemble]. *)
+let part_of_spans spans =
+  let ids = Hashtbl.create (List.length spans) in
+  List.iter (fun span -> Hashtbl.replace ids span.part_span_id ()) spans;
+  let missing span =
+    match span.part_parent with
+    | Some parent -> not (Hashtbl.mem ids parent)
+    | None -> false
+  in
+  let order left right =
+    let by_start = compare left.part_start right.part_start in
+    if by_start <> 0 then by_start else String.compare left.part_span_id right.part_span_id
+  in
+  let roots = List.filter (fun span -> span.part_parent = None) spans in
+  let orphans = List.filter missing spans in
+  let first = function [] -> None | spans -> Some (List.hd (List.sort order spans)) in
+  let root =
+    match first (roots @ orphans) with
+    | Some span -> Some span
+    | None -> first spans
+  in
+  let count predicate = List.length (List.filter predicate spans) in
+  let started_at_ns =
+    List.fold_left (fun acc span -> min acc span.part_start) max_int spans
+  in
+  let ended_at_ns =
+    List.fold_left
+      (fun acc span ->
+        max acc (if part_running span then span.part_start else span.part_end))
+      started_at_ns spans
+  in
+  match root with
+  | None -> None
+  | Some root ->
+      Some
+        {
+          service_name = root.part_service;
+          root_operation_name = root.part_operation;
+          has_root = roots <> [];
+          started_at_ns;
+          ended_at_ns;
+          span_count = List.length spans;
+          error_count = count (fun span -> String.equal span.part_status "error");
+          running_count = count part_running;
+          root_count = List.length roots;
+          missing_parent_count = List.length orphans;
+        }
+
+let part_upsert ~now_ms trace_id ~dropped part =
+  Q.Insert.(
+    into Trace_parts.table
+    |> value Trace_parts.trace_id trace_id
+    |> value Trace_parts.service_name part.service_name
+    |> value Trace_parts.root_operation_name part.root_operation_name
+    |> value Trace_parts.has_root part.has_root
+    |> value Trace_parts.started_at_ns part.started_at_ns
+    |> value Trace_parts.ended_at_ns part.ended_at_ns
+    |> value Trace_parts.span_count part.span_count
+    |> value Trace_parts.error_count part.error_count
+    |> value Trace_parts.running_count part.running_count
+    |> value Trace_parts.root_count part.root_count
+    |> value Trace_parts.missing_parent_count part.missing_parent_count
+    |> value Trace_parts.dropped_span_count dropped
+    |> value Trace_parts.updated_at_ms now_ms
+    |> on_conflict_update [ Q.Column.any Trace_parts.trace_id ]
+         ~set:[ Q.Column.any Trace_parts.service_name;
+                Q.Column.any Trace_parts.root_operation_name;
+                Q.Column.any Trace_parts.has_root;
+                Q.Column.any Trace_parts.started_at_ns;
+                Q.Column.any Trace_parts.ended_at_ns;
+                Q.Column.any Trace_parts.span_count;
+                Q.Column.any Trace_parts.error_count;
+                Q.Column.any Trace_parts.running_count;
+                Q.Column.any Trace_parts.root_count;
+                Q.Column.any Trace_parts.missing_parent_count;
+                Q.Column.any Trace_parts.dropped_span_count;
+                Q.Column.any Trace_parts.updated_at_ms ]
     |> compile)
 
-let oldest_metric_ids_select ~batch =
-  Q.Select.(
-    from Metric_points.table Q.Projection.(one Metric_points.id)
-    |> order_by Metric_points.ingested_at_ms
-    |> limit batch
+let span_upsert ~now_ms (span : Model.span) =
+  Q.Insert.(
+    into Spans.table
+    |> value Spans.id (span_row_id span)
+    |> value Spans.trace_id span.trace_id
+    |> value Spans.span_id span.span_id
+    |> value Spans.parent_span_id span.parent_span_id
+    |> value Spans.service_name span.service_name
+    |> value Spans.scope_name span.scope_name
+    |> value Spans.operation_name span.operation_name
+    |> value Spans.kind (Option.map Model.span_kind_to_string span.kind)
+    |> value Spans.start_time_ns span.start_time_ns
+    |> value Spans.end_time_ns span.end_time_ns
+    |> value Spans.duration_ms span.duration_ms
+    |> value Spans.status (Model.span_status_to_string span.status)
+    |> value Spans.status_message span.status_message
+    |> value Spans.attributes_json (Model.attrs_json_string span.attributes)
+    |> value Spans.resource_json (Model.attrs_json_string span.resource)
+    |> value Spans.events_json (events_json span.events)
+    |> value Spans.links_json (links_json span.links)
+    |> value Spans.ingested_at_ms now_ms
+    |> on_conflict_update [ Q.Column.any Spans.id ]
+         ~set:[ Q.Column.any Spans.trace_id; Q.Column.any Spans.span_id;
+                Q.Column.any Spans.parent_span_id;
+                Q.Column.any Spans.service_name; Q.Column.any Spans.scope_name;
+                Q.Column.any Spans.operation_name; Q.Column.any Spans.kind;
+                Q.Column.any Spans.start_time_ns; Q.Column.any Spans.end_time_ns;
+                Q.Column.any Spans.duration_ms; Q.Column.any Spans.status;
+                Q.Column.any Spans.status_message;
+                Q.Column.any Spans.attributes_json; Q.Column.any Spans.resource_json;
+                Q.Column.any Spans.events_json; Q.Column.any Spans.links_json;
+                Q.Column.any Spans.ingested_at_ms ]
     |> compile)
 
-let delete_metric_batch runner ~batch cutoff =
-  let ids =
-    match cutoff with
-    | Some cutoff -> expired_metric_ids_select ~batch cutoff
-    | None -> oldest_metric_ids_select ~batch
-  in
-  let open Result.Syntax in
-  let* _ =
-    q_exec_pool runner
-      Q.Delete.(
-        from Metric_attributes.table
-        |> where Q.Expr.(in_select Metric_attributes.owner_id ids)
-        |> compile)
-  in
-  q_exec_pool runner
-    Q.Delete.(
-      from Metric_points.table
-      |> where Q.Expr.(in_select Metric_points.id ids)
-      |> compile)
-
-(* Trace expiry uses the summary's last-update time, so a trace is deleted only
-   when none of its spans was received inside the trace TTL (ret-4hhb). *)
-
-let expired_trace_ids_select ~batch cutoff =
-  Q.Select.(
-    from Trace_summaries.table Q.Projection.(one Trace_summaries.trace_id)
-    |> where Q.Expr.(lt Trace_summaries.updated_at_ms cutoff)
-    |> order_by Trace_summaries.updated_at_ms
-    |> limit batch
+let trace_service_insert (span : Model.span) =
+  Q.Insert.(
+    into Trace_services.table
+    |> value Trace_services.trace_id span.trace_id
+    |> value Trace_services.service_name span.service_name
+    |> on_conflict_do_nothing
+         [ Q.Column.any Trace_services.trace_id;
+           Q.Column.any Trace_services.service_name ]
     |> compile)
 
-let oldest_trace_ids_select ~batch =
-  Q.Select.(
-    from Trace_summaries.table Q.Projection.(one Trace_summaries.trace_id)
-    |> order_by Trace_summaries.updated_at_ms
-    |> limit batch
-    |> compile)
+(* Spans of one trace keep their batch order. *)
+let group_by_trace (spans : Model.span list) =
+  let order = ref [] in
+  let groups = Hashtbl.create 16 in
+  List.iter
+    (fun (span : Model.span) ->
+      match Hashtbl.find_opt groups span.trace_id with
+      | Some spans -> Hashtbl.replace groups span.trace_id (span :: spans)
+      | None ->
+          order := span.trace_id :: !order;
+          Hashtbl.replace groups span.trace_id [ span ])
+    spans;
+  List.rev_map (fun trace_id -> (trace_id, List.rev (Hashtbl.find groups trace_id))) !order
 
-let trace_span_ids_select trace_ids =
-  Q.Select.(
-    from Spans.table Q.Projection.(one Spans.id)
-    |> where Q.Expr.(in_select Spans.trace_id trace_ids)
-    |> compile)
+(* The statements of one trace: kept spans with their short attribute values
+   and services, before the trace part is computed. *)
+type trace_statements = {
+  trace_id : string;
+  spans : (Q.Compiled.change * Q.Compiled.change * Q.Compiled.change array * Q.Compiled.change) array;
+  received : int;
+}
 
-let delete_trace_batch runner ~batch cutoff =
-  let trace_ids =
-    match cutoff with
-    | Some cutoff -> expired_trace_ids_select ~batch cutoff
-    | None -> oldest_trace_ids_select ~batch
-  in
-  let open Result.Syntax in
-  let* _ =
-    q_exec_pool runner
-      Q.Delete.(
-        from Span_attributes.table
-        |> where
-             Q.Expr.(
-               in_select Span_attributes.owner_id
-                 (trace_span_ids_select trace_ids))
-        |> compile)
-  in
-  let* _ = q_exec_pool runner Q.Delete.(
-    from Trace_services.table
-    |> where Q.Expr.(in_select Trace_services.trace_id trace_ids)
-    |> compile) in
-  let* spans =
-    q_exec_pool runner
-      Q.Delete.(
-        from Spans.table
-        |> where Q.Expr.(in_select Spans.trace_id trace_ids)
-        |> compile)
-  in
-  let* traces =
-    q_exec_pool runner
-      Q.Delete.(
-        from Trace_summaries.table
-        |> where Q.Expr.(in_select Trace_summaries.trace_id trace_ids)
-        |> compile)
-  in
-  Ok (traces, spans)
-
-let in_batch t delete =
-  Q.Pool.with_transaction t.pool delete |> Result.map_error widen_pool_error
-
-let delete_log_batches t ?cutoff () =
-  let rec loop deleted =
-    let open Result.Syntax in
-    let* count =
-      in_batch t (fun tx -> delete_log_batch tx ~batch:prune_batch_size cutoff)
-    in
-    if count <= 0 then Ok deleted else loop (deleted + count)
-  in
-  loop 0
-
-let delete_metric_batches t ?cutoff () =
-  let rec loop deleted =
-    let open Result.Syntax in
-    let* count =
-      in_batch t (fun tx ->
-          delete_metric_batch tx ~batch:prune_batch_size cutoff)
-    in
-    if count <= 0 then Ok deleted else loop (deleted + count)
-  in
-  loop 0
-
-let delete_trace_batches t ?cutoff () =
-  let rec loop traces spans =
-    let open Result.Syntax in
-    let* batch =
-      in_batch t (fun tx -> delete_trace_batch tx ~batch:prune_batch_size cutoff)
-    in
-    let batch_traces, batch_spans = batch in
-    if batch_traces <= 0 then Ok (traces, spans)
-    else loop (traces + batch_traces) (spans + batch_spans)
-  in
-  loop 0 0
-
-let prune_time_retention t now_ms =
-  let hour_ms = 60 * 60 * 1000 in
-  let open Result.Syntax in
-  let* logs =
-    delete_log_batches t
-      ~cutoff:(now_ms - (t.config.Config.logs_retention_hours * hour_ms))
-      ()
-  in
-  let* metric_points =
-    delete_metric_batches t
-      ~cutoff:(now_ms - (t.config.Config.metrics_retention_hours * hour_ms))
-      ()
-  in
-  let* traces, spans =
-    delete_trace_batches t
-      ~cutoff:(now_ms - (t.config.Config.traces_retention_hours * hour_ms))
-      ()
-  in
-  Ok { traces; spans; logs; metric_points }
-
-(* The size cap acts on live data, not on the file size, and stops as soon as
-   live data is under the cap (ret-zjzs, ret-bizv). *)
-let prune_size_retention t =
-  let max_bytes = t.config.Config.max_db_size_mb * 1024 * 1024 in
-  let batch = size_pressure_batch_size in
-  let open Result.Syntax in
-  let* live = live_bytes t.pool in
-  if live <= max_bytes then Ok None
-  else
-    let rec loop counts =
-      let* live = live_bytes t.pool in
-      if live <= max_bytes then Ok counts
-      else
-        let* logs = in_batch t (fun tx -> delete_log_batch tx ~batch None) in
-        let counts = { counts with logs = counts.logs + logs } in
-        let* live = live_bytes t.pool in
-        if live <= max_bytes then Ok counts
-        else
-          let* metric_points =
-            in_batch t (fun tx -> delete_metric_batch tx ~batch None)
-          in
-          let counts =
-            { counts with metric_points = counts.metric_points + metric_points }
-          in
-          let* live = live_bytes t.pool in
-          if live <= max_bytes then Ok counts
-          else
-            let* traces, spans =
-              in_batch t (fun tx -> delete_trace_batch tx ~batch None)
-            in
-            let counts =
-              {
-                counts with
-                traces = counts.traces + traces;
-                spans = counts.spans + spans;
-              }
-            in
-            if logs + metric_points + traces = 0 then Ok counts
-            else loop counts
-    in
-    let* counts = loop zero_prune_counts in
-    Ok (Some counts)
-
-let add_prune_counts left right =
+let trace_statements ~now_ms (trace_id, (spans : Model.span list)) =
   {
-    traces = left.traces + right.traces;
-    spans = left.spans + right.spans;
-    logs = left.logs + right.logs;
-    metric_points = left.metric_points + right.metric_points;
+    trace_id;
+    received = List.length spans;
+    spans =
+      Array.of_list
+        (List.map
+           (fun (span : Model.span) ->
+             let owner_id = span_row_id span in
+             ( span_upsert ~now_ms span,
+               span_attrs_delete owner_id,
+               Array.of_list
+                 (List.map (span_attr_insert owner_id)
+                    (short_attr_values (span.resource @ span.attributes))),
+               trace_service_insert span ))
+           spans);
   }
 
-let prune ?now_ms t =
-  let now = match now_ms with Some value -> value | None -> t.now_ms () in
-  let open Result.Syntax in
-  let* time_counts = prune_time_retention t now in
-  let* size_counts = prune_size_retention t in
-  let counts =
-    match size_counts with
-    | None -> time_counts
-    | Some size_counts -> add_prune_counts time_counts size_counts
-  in
-  let deleted =
-    counts.traces + counts.spans + counts.logs + counts.metric_points
-  in
-  let* () =
-    if deleted > 0 then sqlite_pragma t.pool "incremental_vacuum"
-    else Ok ()
-  in
-  let report =
-    {
-      Model.pruned_at_ms = now;
-      traces = counts.traces;
-      spans = counts.spans;
-      logs = counts.logs;
-      metric_points = counts.metric_points;
-      size_cap_triggered = Option.is_some size_counts;
-    }
-  in
-  t.last_prune <- Some report;
-  Ok report
-
-let last_prune t = t.last_prune
-
 let ingest_traces t spans =
-  let open Result.Syntax in
+  let spans = List.map Ingest_limits.span spans in
   let now_ms = t.now_ms () in
-  let touched = Hashtbl.create 16 in
-  let insert_span runner (span : Model.span) =
-    let id = span_row_id span in
-    let insert =
-      Q.Insert.(
-        into Spans.table
-        |> value Spans.id id
-        |> value Spans.trace_id span.trace_id
-        |> value Spans.span_id span.span_id
-        |> value Spans.parent_span_id span.parent_span_id
-        |> value Spans.service_name span.service_name
-        |> value Spans.scope_name span.scope_name
-        |> value Spans.operation_name span.operation_name
-        |> value Spans.kind (Option.map Model.span_kind_to_string span.kind)
-        |> value Spans.start_time_ns span.start_time_ns
-        |> value Spans.end_time_ns span.end_time_ns
-        |> value Spans.duration_ms span.duration_ms
-        |> value Spans.status (Model.span_status_to_string span.status)
-        |> value Spans.status_message span.status_message
-        |> value Spans.attributes_json (Model.attrs_json_string span.attributes)
-        |> value Spans.resource_json (Model.attrs_json_string span.resource)
-        |> value Spans.events_json (events_json span.events)
-        |> value Spans.links_json (links_json span.links)
-        |> value Spans.ingested_at_ms now_ms
-        |> on_conflict_update [ Q.Column.any Spans.id ]
-             ~set:[ Q.Column.any Spans.trace_id; Q.Column.any Spans.span_id;
-                    Q.Column.any Spans.parent_span_id;
-                    Q.Column.any Spans.service_name; Q.Column.any Spans.scope_name;
-                    Q.Column.any Spans.operation_name; Q.Column.any Spans.kind;
-                    Q.Column.any Spans.start_time_ns; Q.Column.any Spans.end_time_ns;
-                    Q.Column.any Spans.duration_ms; Q.Column.any Spans.status;
-                    Q.Column.any Spans.status_message;
-                    Q.Column.any Spans.attributes_json; Q.Column.any Spans.resource_json;
-                    Q.Column.any Spans.events_json; Q.Column.any Spans.links_json;
-                    Q.Column.any Spans.ingested_at_ms ]
-        |> compile)
-    in
-    let* _ = q_exec_pool runner insert in
-    let* () = insert_span_attrs runner id (span.resource @ span.attributes) in
-    Hashtbl.replace touched span.trace_id ();
-    Ok ()
-  in
-  let* () =
-    Q.Pool.with_transaction t.pool (fun tx ->
-        let* () = result_iter spans (insert_span tx) in
-        let trace_ids = List.of_seq (Hashtbl.to_seq_keys touched) in
-        result_iter trace_ids (refresh_trace ~now_ms tx))
-    |> Result.map_error widen_pool_error
-  in
-  Ok (List.length spans)
+  let traces = Array.of_list (List.map (trace_statements ~now_ms) (group_by_trace spans)) in
+  write t (fun writer ->
+      Q.Pool.with_transaction writer (fun tx ->
+          let failure = ref None in
+          let accepted = ref 0 in
+          let run statement =
+            match !failure with
+            | Some _ -> ()
+            | None -> (
+                match Q.Pool.Typed.execute_compiled tx statement with
+                | Ok _ -> ()
+                | Error error -> failure := Some error)
+          in
+          let ingest trace =
+            match Q.Pool.Typed.select tx (stored_part_select trace.trace_id) with
+            | Error error -> failure := Some error
+            | Ok stored -> (
+                let stored_count, stored_dropped =
+                  match stored with row :: _ -> row | [] -> (0, 0)
+                in
+                let kept =
+                  min (Array.length trace.spans)
+                    (max 0 (max_trace_spans_per_segment - stored_count))
+                in
+                for index = 0 to kept - 1 do
+                  let span, delete_attrs, attrs, service = trace.spans.(index) in
+                  run span;
+                  run delete_attrs;
+                  for attr = 0 to Array.length attrs - 1 do
+                    run attrs.(attr)
+                  done;
+                  run service
+                done;
+                accepted := !accepted + kept;
+                match !failure with
+                | Some _ -> ()
+                | None -> (
+                    match Q.Pool.Typed.select tx (part_spans_select trace.trace_id) with
+                    | Error error -> failure := Some error
+                    | Ok part_spans -> (
+                        match part_of_spans part_spans with
+                        | None -> ()
+                        | Some part ->
+                            run
+                              (part_upsert ~now_ms trace.trace_id
+                                 ~dropped:(stored_dropped + trace.received - kept)
+                                 part))))
+          in
+          for index = 0 to Array.length traces - 1 do
+            if Option.is_none !failure then ingest traces.(index)
+          done;
+          match !failure with Some error -> Error error | None -> Ok !accepted)
+      |> Result.map_error widen_pool_error)
+
+let log_insert ~now_ms id (log : Model.log_record) =
+  let timestamp_ns = if log.timestamp_ns = 0 then now_ms * 1_000_000 else log.timestamp_ns in
+  Q.Insert.(
+    into Logs.table
+    |> value Logs.id id
+    |> value Logs.trace_id log.trace_id
+    |> value Logs.span_id log.span_id
+    |> value Logs.service_name log.service_name
+    |> value Logs.scope_name log.scope_name
+    |> value Logs.severity_text log.severity_text
+    |> value Logs.severity_normalized (String.uppercase_ascii log.severity_text)
+    |> value Logs.severity_number log.severity_number
+    |> value Logs.timestamp_ns timestamp_ns
+    |> value Logs.observed_timestamp_ns log.observed_timestamp_ns
+    |> value Logs.body log.body
+    |> value Logs.attributes_json (Model.attrs_json_string log.attributes)
+    |> value Logs.resource_json (Model.attrs_json_string log.resource)
+    |> value Logs.ingested_at_ms now_ms
+    |> compile)
+
+let metric_insert ~now_ms id (point : Model.metric_point) =
+  Q.Insert.(
+    into Metric_points.table
+    |> value Metric_points.id id
+    |> value Metric_points.service_name point.service_name
+    |> value Metric_points.scope_name point.scope_name
+    |> value Metric_points.name point.name
+    |> value Metric_points.description point.description
+    |> value Metric_points.unit_ point.unit_
+    |> value Metric_points.kind point.kind
+    |> value Metric_points.start_time_ns point.start_time_ns
+    |> value Metric_points.timestamp_ns point.timestamp_ns
+    |> value Metric_points.value point.value
+    |> value Metric_points.attributes_json
+         (Model.attrs_json_string point.attributes)
+    |> value Metric_points.resource_json (Model.attrs_json_string point.resource)
+    |> value Metric_points.raw_json (Yojson.Safe.to_string point.raw_json)
+    |> value Metric_points.ingested_at_ms now_ms
+    |> compile)
+
+(* Run a list of independent statements in one transaction. *)
+let write_statements t statements =
+  let statements = Array.of_list statements in
+  write t (fun writer ->
+      Q.Pool.with_transaction writer (fun tx ->
+          let failure = ref None in
+          for index = 0 to Array.length statements - 1 do
+            if Option.is_none !failure then
+              match Q.Pool.Typed.execute_compiled tx statements.(index) with
+              | Ok _ -> ()
+              | Error error -> failure := Some error
+          done;
+          match !failure with Some error -> Error error | None -> Ok ())
+      |> Result.map_error widen_pool_error)
 
 let ingest_logs t logs =
-  let open Result.Syntax in
+  let logs = List.map Ingest_limits.log logs in
   let now_ms = t.now_ms () in
-  let insert_log runner (log : Model.log_record) =
-    let id = fresh_id t.wall_now "log" in
-    let timestamp_ns = if log.timestamp_ns = 0 then now_ms * 1_000_000 else log.timestamp_ns in
-    let query =
-      Q.Insert.(
-        into Logs.table
-        |> value Logs.id id
-        |> value Logs.trace_id log.trace_id
-        |> value Logs.span_id log.span_id
-        |> value Logs.service_name log.service_name
-        |> value Logs.scope_name log.scope_name
-        |> value Logs.severity_text log.severity_text
-        |> value Logs.severity_normalized (String.uppercase_ascii log.severity_text)
-        |> value Logs.severity_number log.severity_number
-        |> value Logs.timestamp_ns timestamp_ns
-        |> value Logs.observed_timestamp_ns log.observed_timestamp_ns
-        |> value Logs.body log.body
-        |> value Logs.attributes_json (Model.attrs_json_string log.attributes)
-        |> value Logs.resource_json (Model.attrs_json_string log.resource)
-        |> value Logs.ingested_at_ms now_ms
-        |> compile)
-    in
-    let* _ = q_exec_pool runner query in
-    insert_log_attrs runner id (log.resource @ log.attributes)
+  let statements =
+    List.concat_map
+      (fun (log : Model.log_record) ->
+        let id = fresh_id t.wall_now "log" in
+        log_insert ~now_ms id log
+        :: List.map (log_attr_insert id) (short_attr_values (log.resource @ log.attributes)))
+      logs
   in
-  let* () =
-    Q.Pool.with_transaction t.pool (fun tx ->
-        result_iter logs (insert_log tx))
-    |> Result.map_error widen_pool_error
-  in
-  Ok (List.length logs)
+  write_statements t statements |> Result.map (fun () -> List.length logs)
 
 let ingest_metrics t points =
-  let open Result.Syntax in
+  let points = List.map Ingest_limits.metric_point points in
   let now_ms = t.now_ms () in
-  let insert_point runner (point : Model.metric_point) =
-    let id = fresh_id t.wall_now "metric" in
-    let query =
-      Q.Insert.(
-        into Metric_points.table
-        |> value Metric_points.id id
-        |> value Metric_points.service_name point.service_name
-        |> value Metric_points.scope_name point.scope_name
-        |> value Metric_points.name point.name
-        |> value Metric_points.description point.description
-        |> value Metric_points.unit_ point.unit_
-        |> value Metric_points.kind point.kind
-        |> value Metric_points.start_time_ns point.start_time_ns
-        |> value Metric_points.timestamp_ns point.timestamp_ns
-        |> value Metric_points.value point.value
-        |> value Metric_points.attributes_json
-             (Model.attrs_json_string point.attributes)
-        |> value Metric_points.resource_json (Model.attrs_json_string point.resource)
-        |> value Metric_points.raw_json (Yojson.Safe.to_string point.raw_json)
-        |> value Metric_points.ingested_at_ms now_ms
-        |> compile)
-    in
-    let* _ = q_exec_pool runner query in
-    insert_metric_attrs runner id (point.resource @ point.attributes)
+  let statements =
+    List.concat_map
+      (fun (point : Model.metric_point) ->
+        let id = fresh_id t.wall_now "metric" in
+        metric_insert ~now_ms id point
+        :: List.map (metric_attr_insert id)
+             (short_attr_values (point.resource @ point.attributes)))
+      points
   in
-  let* () =
-    Q.Pool.with_transaction t.pool (fun tx ->
-        result_iter points (insert_point tx))
-    |> Result.map_error widen_pool_error
-  in
-  Ok (List.length points)
+  write_statements t statements |> Result.map (fun () -> List.length points)
 
 let trace_service_predicate trace_id service =
   let participating = Q.Select.(
@@ -1779,9 +1898,10 @@ let list_services_runner ?window ?(include_metrics = false) runner =
        (span_services @ log_services @ metric_services))
 
 let list_services ?window ?include_metrics t =
-  list_services_runner ?window ?include_metrics t.pool
+  read t (list_services_runner ?window ?include_metrics)
 
 let list_trace_summaries ?service ~window ?cursor ~limit t =
+  read t @@ fun runner ->
   let predicate =
     match service with
     | None -> Q.Expr.true_
@@ -1805,7 +1925,7 @@ let list_trace_summaries ?service ~window ?cursor ~limit t =
       |> order_by ~desc:true Trace_summaries.trace_id
       |> limit max_rows)
   in
-  q_select t.pool query
+  q_select runner query
   |> Result.map (page_of_rows ~limit ~position:trace_position)
 
 let summary_of_tree trace_id (tree : Trace_tree.t) : Model.trace_summary =
@@ -1820,32 +1940,36 @@ let summary_of_tree trace_id (tree : Trace_tree.t) : Model.trace_summary =
     error_count = tree.error_count;
     is_running = tree.is_running;
     warning_count = List.length tree.warnings;
+    dropped_span_count = 0;
   }
 
-(* A trace is served whenever it has spans, even if its summary row is missing
-   (tree-ddll): the tree is the source of truth for the response, and the
-   summary is only the stored projection of it. *)
+(* A trace is served whenever it has spans (tree-ddll). The detail computes
+   its summary from the complete span tree; only the dropped span count comes
+   from the stored trace parts (bcache-s5kc). *)
 let get_trace t trace_id =
+  read t @@ fun runner ->
   let open Result.Syntax in
   let* summaries =
-    q_select t.pool
+    q_select runner
       Q.Select.(
         from Trace_summaries.table trace_summary_projection
         |> where Q.Expr.(eq Trace_summaries.trace_id trace_id)
         |> limit 1)
   in
-  let* summary = one_or_none "trace summary lookup" summaries in
-  let* spans = select_spans_for_trace t.pool trace_id in
-  match (summary, spans) with
-  | None, [] -> Ok None
-  | summary, spans ->
+  let* stored = one_or_none "trace summary lookup" summaries in
+  let* spans = select_spans_for_trace runner trace_id in
+  match spans with
+  | [] -> Ok None
+  | spans ->
       let tree = Trace_tree.assemble spans in
+      let summary = summary_of_tree trace_id tree in
       let summary =
-        match summary with
-        | Some summary -> summary
-        | None -> summary_of_tree trace_id tree
+        match stored with
+        | Some (stored : Model.trace_summary) ->
+            { summary with dropped_span_count = stored.dropped_span_count }
+        | None -> summary
       in
-      let* logs = q_select t.pool (logs_for_trace_query trace_id) in
+      let* logs = q_select runner (logs_for_trace_query trace_id) in
       Ok
         (Some
            {
@@ -1856,19 +1980,21 @@ let get_trace t trace_id =
            })
 
 let get_span t span_id =
+  read t @@ fun runner ->
   let open Result.Syntax in
-  let* spans = q_select t.pool (span_id_query span_id) in
+  let* spans = q_select runner (span_id_query span_id) in
   one_or_none "span lookup" spans
 
 (* The span detail carries the same tree context as the trace it belongs to, so
    one lookup is enough to place a span (tree-o79f). *)
 let get_span_node t span_id =
+  read t @@ fun runner ->
   let open Result.Syntax in
-  let* spans = q_select t.pool (span_id_query span_id) in
+  let* spans = q_select runner (span_id_query span_id) in
   match spans with
   | [] -> Ok None
   | span :: _ ->
-      let* siblings = select_spans_for_trace t.pool span.Model.trace_id in
+      let* siblings = select_spans_for_trace runner span.Model.trace_id in
       let tree = Trace_tree.assemble siblings in
       let node =
         List.find_opt
@@ -1904,8 +2030,9 @@ let select_spans_for_trace_in_window trace_id window =
    (tree-uv04). A trace is small, so the page is sliced from the assembled
    tree; the cursor carries the position in that tree order. *)
 let list_trace_spans t ~window ?cursor ~limit trace_id =
+  read t @@ fun runner ->
   let open Result.Syntax in
-  let* spans = q_select t.pool (select_spans_for_trace_in_window trace_id window) in
+  let* spans = q_select runner (select_spans_for_trace_in_window trace_id window) in
   let tree = Trace_tree.assemble spans in
   let nodes = tree.nodes in
   let start = match cursor with
@@ -1928,11 +2055,13 @@ let list_trace_spans t ~window ?cursor ~limit trace_id =
   Ok { items; next }
 
 let list_trace_logs t ~window ?cursor ~limit trace_id =
-  q_select t.pool (logs_for_trace_page_query ~window ~cursor ~limit trace_id)
+  read t @@ fun runner ->
+  q_select runner (logs_for_trace_page_query ~window ~cursor ~limit trace_id)
   |> Result.map (page_of_rows ~limit ~position:log_position)
 
 let list_span_logs t ~window ?cursor ~limit span_id =
-  q_select t.pool (logs_for_span_page_query ~window ~cursor ~limit span_id)
+  read t @@ fun runner ->
+  q_select runner (logs_for_span_page_query ~window ~cursor ~limit span_id)
   |> Result.map (page_of_rows ~limit ~position:log_position)
 
 (* The self-join tests both span and trace IDs; an unrelated trace's matching
@@ -1975,7 +2104,8 @@ let span_search_predicate ?(attr_contains = []) ?min_duration_ms
   Q.Expr.and_ p (keyset_predicate ~sort_key:Spans.start_time_ns ~tie_breaker:Spans.id filter.cursor)
 
 let search_spans ?(attr_contains = []) ?min_duration_ms (filter : span_search_filter) t =
-  q_select t.pool Q.Select.(
+  read t @@ fun runner ->
+  q_select runner Q.Select.(
     from Spans.table span_projection
     |> where (span_search_predicate ~attr_contains ?min_duration_ms filter)
     |> order_by ~desc:true Spans.start_time_ns
@@ -2015,7 +2145,8 @@ let trace_summary_search_query ?(attr_contains = []) ?min_duration_ms
 
 let search_traces ?(attr_contains = []) ?min_duration_ms
     (filter : trace_search_filter) t =
-  q_select t.pool (trace_summary_search_query ~attr_contains ?min_duration_ms filter)
+  read t @@ fun runner ->
+  q_select runner (trace_summary_search_query ~attr_contains ?min_duration_ms filter)
   |> Result.map (page_of_rows ~limit:filter.limit ~position:trace_position)
 
 let severity_predicate ?min_severity severity =
@@ -2066,7 +2197,8 @@ let log_predicate ?min_severity (filter : log_filter) =
        filter.cursor)
 
 let list_logs ?min_severity (filter : log_filter) t =
-  q_select t.pool
+  read t @@ fun runner ->
+  q_select runner
     Q.Select.(
       from Logs.table log_projection
       |> where (log_predicate ?min_severity filter)
@@ -2087,7 +2219,8 @@ let log_search_predicate ?(attr_contains = []) ?min_severity
   Q.Expr.and_ p (keyset_predicate ~sort_key:Logs.timestamp_ns ~tie_breaker:Logs.id filter.cursor)
 
 let search_logs ?(attr_contains = []) ?min_severity (filter : log_search_filter) t =
-  q_select t.pool Q.Select.(from Logs.table log_projection
+  read t @@ fun runner ->
+  q_select runner Q.Select.(from Logs.table log_projection
     |> where (log_search_predicate ~attr_contains ?min_severity filter)
     |> order_by ~desc:true Logs.timestamp_ns
     |> order_by ~desc:true Logs.id
@@ -2117,6 +2250,7 @@ module Trace_stat_rows = struct
 end
 
 let trace_stats ?(attr_contains = []) ?min_duration_ms (filter : trace_stats_filter) t =
+  read t @@ fun runner ->
   let open Result.Syntax in
   let search_filter : trace_search_filter = {
     service = filter.service; operation = filter.operation;
@@ -2141,19 +2275,19 @@ let trace_stats ?(attr_contains = []) ?min_duration_ms (filter : trace_stats_fil
           |> where Q.Expr.(and_ predicate (group_pred ()))
           |> compile) in
         let wanted = int_of_float (ceil (0.95 *. float_of_int count)) in
-        let* durations = q_select t.pool Q.Select.(
+        let* durations = q_select runner Q.Select.(
           from Ranked_trace_duration.table Q.Projection.(one Ranked_trace_duration.duration_ms)
           |> with_cte ~name:"ranked_trace_duration" ranked
           |> where Q.Expr.(eq Ranked_trace_duration.rank wanted)) in
         Ok ((match durations with duration :: _ -> duration | [] -> 0.)) in
     Ok { Model.group; value; count } in
   let summaries col =
-    q_select t.pool Q.Select.(
+    q_select runner Q.Select.(
       from Trace_summaries.table Q.Projection.(t3
         (one col) (count ()) (avg Q.Numeric.float Trace_summaries.duration_ms))
       |> where predicate |> group_by col) in
   let errors col =
-    q_select t.pool Q.Select.(
+    q_select runner Q.Select.(
       from Trace_summaries.table Q.Projection.(t2 (one col) (count ()))
       |> where Q.Expr.(and_ predicate (gt Trace_summaries.error_count 0))
       |> group_by col) in
@@ -2179,7 +2313,7 @@ let trace_stats ?(attr_contains = []) ?min_duration_ms (filter : trace_stats_fil
   | "status" ->
       let per_status group status_pred =
         let group_pred = Q.Expr.and_ predicate status_pred in
-        let* counts = q_select t.pool Q.Select.(
+        let* counts = q_select runner Q.Select.(
           from Trace_summaries.table Q.Projection.(t2
             (count ()) (avg Q.Numeric.float Trace_summaries.duration_ms))
           |> where group_pred) in
@@ -2228,7 +2362,7 @@ let trace_stats ?(attr_contains = []) ?min_duration_ms (filter : trace_stats_fil
                  [gt (summary_right Trace_summaries.error_count) 0, int_lit 1]
                  ~default:(int_lit 0))))
              |> with_cte ~name:"trace_stat_pairs" pairs |> compile) in
-           let* groups = q_select t.pool Q.Select.(
+           let* groups = q_select runner Q.Select.(
              from Trace_stat_rows.table Q.Projection.(t4
                (one Trace_stat_rows.value) (count ())
                (avg Q.Numeric.float Trace_stat_rows.duration_ms)
@@ -2255,6 +2389,7 @@ let trace_stats ?(attr_contains = []) ?min_duration_ms (filter : trace_stats_fil
 
 let log_stats ?(attr_contains = []) ?min_severity
     (filter : log_stats_filter) t =
+  read t @@ fun runner ->
   let open Result.Syntax in
   let search_filter : log_search_filter = {
     service = filter.service; trace_id = filter.trace_id;
@@ -2268,7 +2403,7 @@ let log_stats ?(attr_contains = []) ?min_severity
       { Model.group; count; value = float_of_int count })
     |> sort_stat_items filter.limit in
   let by_column col =
-    let* groups = q_select t.pool Q.Select.(
+    let* groups = q_select runner Q.Select.(
       from Logs.table Q.Projection.(t2 (one col) (count ()))
       |> where predicate |> group_by col) in
     Ok (as_items groups) in
@@ -2276,7 +2411,7 @@ let log_stats ?(attr_contains = []) ?min_severity
   | "service" -> by_column Logs.service_name
   | "severity" -> by_column Logs.severity_text
   | "scope" ->
-      let* groups = q_select t.pool Q.Select.(
+      let* groups = q_select runner Q.Select.(
         from Logs.table Q.Projection.(t2 (one Logs.scope_name) (count ()))
         |> where predicate |> group_by Logs.scope_name) in
       Ok (as_items (List.map (fun (name,count) ->
@@ -2284,7 +2419,7 @@ let log_stats ?(attr_contains = []) ?min_severity
   | group_by ->
       (match attr_group_key group_by with
       | None ->
-          let* count = q_select t.pool Q.Select.(
+          let* count = q_select runner Q.Select.(
             from Logs.table Q.Projection.(count ()) |> where predicate) in
           Ok (as_items ["unknown", List.hd count])
       | Some key ->
@@ -2296,7 +2431,7 @@ let log_stats ?(attr_contains = []) ?min_severity
           let source = Q.Source.(join Logs.table
             ~on:Q.Expr.(eq_col (left Log_attributes.owner_id) (right Logs.id))
             (from Log_attributes.table)) in
-          let* groups = q_select t.pool Q.Select.(
+          let* groups = q_select runner Q.Select.(
             from_source source Q.Projection.(t2
               (one (left Log_attributes.value)) (count ()))
             |> where Q.Expr.(and_ (eq (left Log_attributes.key) key)
@@ -2312,6 +2447,7 @@ module Facet_pairs = struct
 end
 
 let facets (filter : facet_filter) t =
+  read t @@ fun runner ->
   let open Result.Syntax in
   let to_items ?(short_values = false) rows =
     rows
@@ -2330,14 +2466,14 @@ let facets (filter : facet_filter) t =
     let p = window_predicate Logs.timestamp_ns filter.window in
     match filter.service with None -> p | Some service ->
       Q.Expr.and_ p (Q.Expr.eq Logs.service_name service) in
-  let trace_col col = q_select t.pool Q.Select.(
+  let trace_col col = q_select runner Q.Select.(
     from Trace_summaries.table Q.Projection.(t2 (one col) (count ()))
     |> where trace_predicate |> group_by col) in
-  let log_col col = q_select t.pool Q.Select.(
+  let log_col col = q_select runner Q.Select.(
     from Logs.table Q.Projection.(t2 (one col) (count ()))
     |> where log_predicate |> group_by col) in
   let grouped_pairs pairs =
-    q_select t.pool Q.Select.(
+    q_select runner Q.Select.(
       from Facet_pairs.table Q.Projection.(t2 (one Facet_pairs.value) (count ()))
       |> with_cte ~name:"facet_pairs" pairs
       |> group_by Facet_pairs.value) in
@@ -2390,7 +2526,7 @@ let facets (filter : facet_filter) t =
       let* rows = trace_col Trace_summaries.root_operation_name in
       Ok (to_items rows)
   | "traces", "status" ->
-      let count pred = q_select t.pool Q.Select.(
+      let count pred = q_select runner Q.Select.(
         from Trace_summaries.table Q.Projection.(count ())
         |> where Q.Expr.(and_ trace_predicate pred)) in
       let* ok = count Q.Expr.(eq Trace_summaries.error_count 0) in
@@ -2434,7 +2570,8 @@ let metric_predicate (filter : metric_filter) =
        ~tie_breaker:Metric_points.id filter.cursor)
 
 let list_metric_points (filter : metric_filter) t =
-  q_select t.pool
+  read t @@ fun runner ->
+  q_select runner
     Q.Select.(
       from Metric_points.table
         (Q.Projection.t2 (Q.Projection.one Metric_points.id) metric_projection)
@@ -2469,20 +2606,49 @@ let count_windowed_rows runner table sort_key window =
   in
   scalar "count" rows
 
-let stats ?window t =
-  let window = Option.value window ~default:Model.window_all in
+let storage t =
   let open Result.Syntax in
-  let* spans = count_windowed_rows t.pool Spans.table Spans.start_time_ns window in
-  let* logs = count_windowed_rows t.pool Logs.table Logs.timestamp_ns window in
+  let* bytes = database_bytes t.writer in
+  t.segments.(t.active).bytes <- bytes;
+  let segments =
+    Array.to_list t.segments
+    |> List.filter (fun segment -> segment.sequence > 0)
+    |> List.sort (fun left right -> compare left.sequence right.sequence)
+    |> List.map (fun segment ->
+           {
+             Model.slot = segment.slot;
+             sequence = segment.sequence;
+             bytes = segment.bytes;
+             started_at_ms = segment.started_at_ms;
+             active = segment.slot = t.active;
+           })
+  in
+  Ok
+    {
+      Model.max_bytes = t.config.Config.max_db_size_mb * 1024 * 1024;
+      segment_bytes = segment_bytes t.config;
+      used_bytes =
+        Array.fold_left (fun total segment -> total + segment.bytes) 0 t.segments;
+      segments;
+      ingest_failures = t.ingest_failures;
+      last_ingest_failure = t.last_ingest_failure;
+    }
+
+let stats ?window t =
+  let open Result.Syntax in
+  let* storage = storage t in
+  read t @@ fun runner ->
+  let window = Option.value window ~default:Model.window_all in
+  let* spans = count_windowed_rows runner Spans.table Spans.start_time_ns window in
+  let* logs = count_windowed_rows runner Logs.table Logs.timestamp_ns window in
   let* metric_points =
-    count_windowed_rows t.pool Metric_points.table Metric_points.timestamp_ns window
+    count_windowed_rows runner Metric_points.table Metric_points.timestamp_ns window
   in
   let* traces =
-    count_windowed_rows t.pool Trace_summaries.table Trace_summaries.started_at_ns
+    count_windowed_rows runner Trace_summaries.table Trace_summaries.started_at_ns
       window
   in
-  let* services = list_services_runner ~window t.pool in
-  let* live_bytes = live_bytes t.pool in
+  let* services = list_services_runner ~window runner in
   Ok
     {
       Model.spans;
@@ -2490,14 +2656,5 @@ let stats ?window t =
       metric_points;
       traces;
       services = List.length services;
-      retention =
-        {
-          Model.traces_ttl_hours = t.config.Config.traces_retention_hours;
-          logs_ttl_hours = t.config.logs_retention_hours;
-          metrics_ttl_hours = t.config.metrics_retention_hours;
-          prune_interval_seconds = t.config.prune_interval_seconds;
-          max_db_size_mb = t.config.max_db_size_mb;
-          live_bytes;
-          last_prune = t.last_prune;
-        };
+      storage;
     }

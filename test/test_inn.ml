@@ -8,8 +8,6 @@ let hour_ms = 60 * 60 * 1000
    test depends on wall-clock time. *)
 let base_time = 1_700_000_000_000
 
-let wall_now_ms ~(caps : < Ox_caps.Cap.time ; .. >) () = int_of_float (Ox_caps.Cap_unix.gettimeofday ~caps () *. 1000.)
-
 let contains haystack needle =
   let haystack = String.lowercase_ascii haystack in
   let needle = String.lowercase_ascii needle in
@@ -31,19 +29,10 @@ let test_config_defaults_are_user_level ~(caps : < Ox_caps.Cap.env ; .. >) () =
       Alcotest.(check string)
         "state dir" "/home/alice/.local/state/inn" config.state_dir;
       Alcotest.(check string)
-        "db path" "/home/alice/.local/state/inn/telemetry.sqlite"
-        config.db_path;
+        "data dir" "/home/alice/.local/state/inn/segments" config.data_dir;
       Alcotest.(check string) "host" "127.0.0.1" config.host;
       Alcotest.(check int) "port" 27687 config.port;
-      Alcotest.(check int)
-        "logs ttl (ret-mvsc)" 24 config.logs_retention_hours;
-      Alcotest.(check int)
-        "traces ttl (ret-57b8)" 48 config.traces_retention_hours;
-      Alcotest.(check int)
-        "metrics ttl (ret-ggir)" 48 config.metrics_retention_hours;
-      Alcotest.(check int)
-        "prune interval (ret-qd9f)" 300 config.prune_interval_seconds;
-      Alcotest.(check int) "max db size" 1024 config.max_db_size_mb
+      Alcotest.(check int) "budget (bcache-c4p7)" 1024 config.max_db_size_mb
 
 let test_config_env_overrides ~(caps : < Ox_caps.Cap.env ; .. >) () =
   let env =
@@ -51,14 +40,9 @@ let test_config_env_overrides ~(caps : < Ox_caps.Cap.env ; .. >) () =
       [
         ("XDG_STATE_HOME", "/state");
         ("INN_STATE_DIR", "/custom/state");
-        ("INN_DB_PATH", "/custom/inn.sqlite");
         ("INN_HOST", "0.0.0.0");
         ("INN_PORT", "39000");
         ("INN_BASE_URL", "http://127.0.0.1:39000");
-        ("INN_TRACES_RETENTION_HOURS", "72");
-        ("INN_LOGS_RETENTION_HOURS", "6");
-        ("INN_METRICS_RETENTION_HOURS", "12");
-        ("INN_PRUNE_INTERVAL_SECONDS", "45");
         ("INN_MAX_DB_SIZE_MB", "2048");
       ]
   in
@@ -66,35 +50,32 @@ let test_config_env_overrides ~(caps : < Ox_caps.Cap.env ; .. >) () =
   | Error message -> Alcotest.fail message
   | Ok config ->
       Alcotest.(check string) "state dir" "/custom/state" config.state_dir;
-      Alcotest.(check string) "db path" "/custom/inn.sqlite" config.db_path;
+      Alcotest.(check string) "data dir" "/custom/state/segments" config.data_dir;
       Alcotest.(check string) "host" "0.0.0.0" config.host;
       Alcotest.(check int) "port" 39000 config.port;
       Alcotest.(check string)
         "base url" "http://127.0.0.1:39000" config.base_url;
-      Alcotest.(check int)
-        "traces ttl override (ret-6pix)" 72 config.traces_retention_hours;
-      Alcotest.(check int)
-        "logs ttl override (ret-6pix)" 6 config.logs_retention_hours;
-      Alcotest.(check int)
-        "metrics ttl override (ret-6pix)" 12 config.metrics_retention_hours;
-      Alcotest.(check int)
-        "prune interval override (ret-qd9f)" 45 config.prune_interval_seconds;
-      Alcotest.(check int) "max db" 2048 config.max_db_size_mb
+      Alcotest.(check int) "budget" 2048 config.max_db_size_mb
 
-let test_config_rejects_legacy_retention ~(caps : < Ox_caps.Cap.env ; .. >) () =
-  let env = env [ ("INN_RETENTION_HOURS", "72") ] in
-  match Config.resolve ~caps ~env ~home:"/home/alice" () with
-  | Ok _ -> Alcotest.fail "INN_RETENTION_HOURS must be rejected"
-  | Error message ->
-      Alcotest.(check bool)
-        "names the traces setting (ret-f1oo)" true
-        (contains message "INN_TRACES_RETENTION_HOURS");
-      Alcotest.(check bool)
-        "names the logs setting (ret-f1oo)" true
-        (contains message "INN_LOGS_RETENTION_HOURS");
-      Alcotest.(check bool)
-        "names the metrics setting (ret-f1oo)" true
-        (contains message "INN_METRICS_RETENTION_HOURS")
+let test_config_rejects_removed_settings ~(caps : < Ox_caps.Cap.env ; .. >) () =
+  (* bcache-c4p7: a removed setting is refused by name, never ignored. *)
+  List.iter
+    (fun name ->
+      match Config.resolve ~caps ~env:(env [ (name, "72") ]) ~home:"/home/alice" () with
+      | Ok _ -> Alcotest.failf "%s must be rejected" name
+      | Error message ->
+          Alcotest.(check bool) (name ^ " is named") true (contains message name);
+          Alcotest.(check bool)
+            (name ^ " points at the budget") true
+            (contains message "INN_MAX_DB_SIZE_MB"))
+    [
+      "INN_DB_PATH";
+      "INN_RETENTION_HOURS";
+      "INN_TRACES_RETENTION_HOURS";
+      "INN_LOGS_RETENTION_HOURS";
+      "INN_METRICS_RETENTION_HOURS";
+      "INN_PRUNE_INTERVAL_SECONDS";
+    ]
 
 let test_config_rejects_invalid_values ~(caps : < Ox_caps.Cap.env ; .. >) () =
   let check_invalid name value =
@@ -106,11 +87,9 @@ let test_config_rejects_invalid_values ~(caps : < Ox_caps.Cap.env ; .. >) () =
           (Printf.sprintf "%s is named in the error" name)
           true (contains message name)
   in
-  check_invalid "INN_LOGS_RETENTION_HOURS" "0";
-  check_invalid "INN_TRACES_RETENTION_HOURS" "-3";
-  check_invalid "INN_METRICS_RETENTION_HOURS" "many";
-  check_invalid "INN_PRUNE_INTERVAL_SECONDS" "0";
-  check_invalid "INN_MAX_DB_SIZE_MB" "huge"
+  check_invalid "INN_PORT" "0";
+  check_invalid "INN_MAX_DB_SIZE_MB" "huge";
+  check_invalid "INN_MAX_DB_SIZE_MB" "-1"
 
 (* Fixtures -------------------------------------------------------------- *)
 
@@ -216,46 +195,63 @@ let test_metric ?(service_name = "svc") ?(name = "requests.total")
 
 (* Store helpers --------------------------------------------------------- *)
 
-let temp_db_path ~(caps : < Ox_caps.Cap.fs_write ; Ox_caps.Cap.tmp ; .. >) () =
-  let db_path = Ox_caps.Cap_stdlib.Filename.temp_file ~caps "inn-test-" ".sqlite" in
-  Ox_caps.Cap_sys.remove ~caps db_path;
-  db_path
+let temp_state_dir ~(caps : < Ox_caps.Cap.tmp ; .. >) () =
+  Ox_caps.Cap_stdlib.Filename.temp_dir ~caps "inn-test-" ""
 
-let test_config ?(port = Config.default_port) ?(traces_retention_hours = 48)
-    ?(logs_retention_hours = 24) ?(metrics_retention_hours = 48)
-    ?(prune_interval_seconds = 300) ?(max_db_size_mb = 1024) db_path =
+let test_config ?(port = Config.default_port) ?(max_db_size_mb = 1024) state_dir =
   {
-    Config.state_dir = Filename.dirname db_path;
-    db_path;
+    Config.state_dir;
+    data_dir = Filename.concat state_dir "segments";
     host = "127.0.0.1";
     port;
     base_url = Printf.sprintf "http://127.0.0.1:%d" port;
-    traces_retention_hours;
-    logs_retention_hours;
-    metrics_retention_hours;
-    prune_interval_seconds;
     max_db_size_mb;
   }
 
-let temp_config ~(caps : < Ox_caps.Cap.fs_write ; Ox_caps.Cap.tmp ; .. >) ?port ?traces_retention_hours ?logs_retention_hours
-    ?metrics_retention_hours ?prune_interval_seconds ?max_db_size_mb () =
-  test_config ?port ?traces_retention_hours ?logs_retention_hours
-    ?metrics_retention_hours ?prune_interval_seconds ?max_db_size_mb
-    ((temp_db_path ~caps) ())
+let temp_config ~(caps : < Ox_caps.Cap.tmp ; .. >) ?port ?max_db_size_mb () =
+  test_config ?port ?max_db_size_mb ((temp_state_dir ~caps) ())
 
-let cleanup_config ~(caps : < Ox_caps.Cap.fs_write ; .. >) config =
-  List.iter
-    (fun path -> if Sys.file_exists path then Ox_caps.Cap_sys.remove ~caps path)
-    [ config.Config.db_path; config.db_path ^ "-wal"; config.db_path ^ "-shm" ]
+let segment_file config slot =
+  Filename.concat config.Config.data_dir (Printf.sprintf "segment-%d.sqlite" slot)
+
+let rec remove_tree ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; .. >) path =
+  if Sys.is_directory path then (
+    Array.iter
+      (fun name -> remove_tree ~caps (Filename.concat path name))
+      (Ox_caps.Cap_sys.readdir ~caps path);
+    Ox_caps.Cap_sys.rmdir ~caps path)
+  else Ox_caps.Cap_sys.remove ~caps path
+
+let cleanup_config ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; .. >) config =
+  if Sys.file_exists config.Config.state_dir then remove_tree ~caps config.Config.state_dir
 
 let active_store_switch = ref None
+let active_mono_clock = ref None
 
 let run_store_scope f =
-  Eio_main.run @@ fun _env ->
+  Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
   let previous = !active_store_switch in
+  let previous_clock = !active_mono_clock in
   active_store_switch := Some sw;
-  Fun.protect ~finally:(fun () -> active_store_switch := previous) f
+  active_mono_clock := Some (Eio.Stdenv.mono_clock env);
+  Fun.protect
+    ~finally:(fun () ->
+      active_store_switch := previous;
+      active_mono_clock := previous_clock)
+    f
+
+(* Seconds since [started] on the monotonic clock of the current store scope. *)
+let elapsed_seconds started =
+  match !active_mono_clock with
+  | Some clock ->
+      Mtime.Span.to_float_ns (Mtime.span started (Eio.Time.Mono.now clock)) /. 1e9
+  | None -> Alcotest.fail "no store scope"
+
+let mono_now () =
+  match !active_mono_clock with
+  | Some clock -> Eio.Time.Mono.now clock
+  | None -> Alcotest.fail "no store scope"
 
 let run_store program =
   let run sw =
@@ -303,76 +299,6 @@ module Test_meta = struct
   let value = column "value" Ox_sql.text
 end
 
-module Test_foreign = struct
-  module T = Ox_sql.Table.Make (struct
-    let name = "other_app"
-  end)
-
-  include T
-
-  let id = column "id" Ox_sql.text
-end
-
-module Test_spans = struct
-  module T = Ox_sql.Table.Make (struct
-    let name = "spans"
-  end)
-
-  include T
-
-  let id = column "id" Ox_sql.text
-end
-
-module Test_span_attributes = struct
-  module T = Ox_sql.Table.Make (struct
-    let name = "span_attributes"
-  end)
-
-  include T
-
-  let owner_id = column "owner_id" Ox_sql.text
-end
-
-module Test_logs = struct
-  module T = Ox_sql.Table.Make (struct
-    let name = "logs"
-  end)
-
-  include T
-
-  let id = column "id" Ox_sql.text
-end
-
-module Test_log_attributes = struct
-  module T = Ox_sql.Table.Make (struct
-    let name = "log_attributes"
-  end)
-
-  include T
-
-  let owner_id = column "owner_id" Ox_sql.text
-end
-
-module Test_metric_points = struct
-  module T = Ox_sql.Table.Make (struct
-    let name = "metric_points"
-  end)
-
-  include T
-
-  let id = column "id" Ox_sql.text
-end
-
-module Test_metric_attributes = struct
-  module T = Ox_sql.Table.Make (struct
-    let name = "metric_attributes"
-  end)
-
-  include T
-
-  let owner_id = column "owner_id" Ox_sql.text
-end
-
 let run_test_db ~(caps : < Ox_caps.Cap.time ; .. >) path program =
   Eio_main.run @@ fun _env ->
   Eio.Switch.run @@ fun sw ->
@@ -403,64 +329,6 @@ let write_schema_version ~(caps : < Ox_caps.Cap.time ; .. >) path version =
       in
       let* _ = Ox_sql.Pool.Typed.execute_compiled pool update in
       Result.ok ())
-
-let create_foreign_database ~(caps : < Ox_caps.Cap.time ; .. >) path =
-  (run_test_db ~caps) path (fun pool ->
-      let ( let* ) = Result.bind in
-      let schema =
-        Ox_sql.Ox_schema.(
-          compile
-            (create_table Test_foreign.table
-               [ column ~primary_key:true Test_foreign.id ]))
-      in
-      let* () = Ox_sql.Pool.Typed.run_schema pool schema in
-      let insert =
-        Ox_sql.Insert.(
-          into Test_foreign.table
-          |> value Test_foreign.id "row-1"
-          |> compile)
-      in
-      let* _ = Ox_sql.Pool.Typed.execute_compiled pool insert in
-      Result.ok ())
-
-let foreign_rows ~(caps : < Ox_caps.Cap.time ; .. >) path =
-  (run_test_db ~caps) path (fun pool ->
-      Ox_sql.Pool.Typed.select pool
-        (Ox_sql.Select.compile
-           Ox_sql.Select.(
-             from Test_foreign.table (Ox_sql.Projection.one Test_foreign.id))))
-
-(* Attribute rows whose owner row is gone (ret-hy7e). *)
-let orphan_attribute_rows ~(caps : < Ox_caps.Cap.time ; .. >) path =
-  (run_test_db ~caps) path (fun pool ->
-      let ( let* ) = Result.bind in
-      let owners table owner_id =
-        Ox_sql.Pool.Typed.select pool
-          (Ox_sql.Select.compile
-             Ox_sql.Select.(from table (Ox_sql.Projection.one owner_id)))
-      in
-      let ids table id =
-        Ox_sql.Pool.Typed.select pool
-          (Ox_sql.Select.compile
-             Ox_sql.Select.(from table (Ox_sql.Projection.one id)))
-      in
-      let count_orphans owners ids =
-        let ids = List.sort_uniq String.compare ids in
-        List.fold_left
-          (fun total owner -> if List.mem owner ids then total else total + 1)
-          0 owners
-      in
-      let* span_owners = owners Test_span_attributes.table Test_span_attributes.owner_id in
-      let* span_ids = ids Test_spans.table Test_spans.id in
-      let* log_owners = owners Test_log_attributes.table Test_log_attributes.owner_id in
-      let* log_ids = ids Test_logs.table Test_logs.id in
-      let* metric_owners =
-        owners Test_metric_attributes.table Test_metric_attributes.owner_id
-      in
-      let* metric_ids = ids Test_metric_points.table Test_metric_points.id in
-      Result.ok
-        (count_orphans span_owners span_ids + count_orphans log_owners log_ids
-       + count_orphans metric_owners metric_ids))
 
 (* Server helpers -------------------------------------------------------- *)
 
@@ -525,48 +393,14 @@ let json_list_length field = function
       | _ -> Alcotest.failf "expected JSON list field %s" field)
   | _ -> Alcotest.fail "expected JSON object"
 
-let free_port ~(caps : < Ox_caps.Cap.network ; .. >) () =
-  let socket = Ox_caps.Cap_unix.socket ~caps Unix.PF_INET Unix.SOCK_STREAM 0 in
-  Fun.protect
-    ~finally:(fun () -> Unix.close socket)
-    (fun () ->
-      Unix.bind socket (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
-      match Unix.getsockname socket with
-      | Unix.ADDR_INET (_, port) -> port
-      | Unix.ADDR_UNIX _ -> Alcotest.fail "expected an inet socket")
-
-let http_get_opt ~sw:_ ~net:_ ~clock:_ client url =
-  match Ox_http.Client.request client ~method_:"GET" ~url () with
-  | Ok response -> (
-      match response.body with
-      | `Read bytes -> Some (response.status, Bytes.to_string bytes)
-      | `Skipped -> None)
-  | Error _ -> None
-
-let http_get ~sw ~net ~clock client url =
-  match http_get_opt ~sw ~net ~clock client url with
-  | Some value -> value
-  | None -> Alcotest.failf "GET %s failed" url
-
-let wait_until ~(caps : < Ox_caps.Cap.time ; .. >) ~clock ~timeout_seconds predicate =
-  let deadline = Ox_caps.Cap_unix.gettimeofday ~caps () +. timeout_seconds in
-  let rec loop () =
-    if predicate () then true
-    else if Ox_caps.Cap_unix.gettimeofday ~caps () > deadline then false
-    else (
-      Eio.Time.sleep clock 0.05;
-      loop ())
-  in
-  loop ()
-
 (* Schema ---------------------------------------------------------------- *)
 
 (* Recorded together with [Store.schema_version]: change one and you must
    change the other (schm-hnis). *)
-let recorded_schema_fingerprint = "6db846310eeba5e6ff63a91df6fcad33"
+let recorded_schema_fingerprint = "639aa55284b5bcc1b16037fa9e6391d1"
 
 let test_schema_fingerprint_matches_version () =
-  Alcotest.(check int) "schema version" 6 Store.schema_version;
+  Alcotest.(check int) "schema version" 7 Store.schema_version;
   Alcotest.(check string)
     "schema fingerprint (schm-hnis)" recorded_schema_fingerprint
     Store.schema_fingerprint
@@ -597,7 +431,11 @@ let test_schema_mismatch_recreates_database ~(caps : < Ox_caps.Cap.fs_read ; Ox_
       let ( let* ) = Result.bind in
       let* _ = Store.ingest_logs store [ test_log () ] in
       Result.ok ());
-  (write_schema_version ~caps) config.Config.db_path "0";
+  (write_schema_version ~caps) (segment_file config 0) "0";
+  (* A file that is not SQLite at all is replaced the same way. *)
+  let channel = Ox_caps.Cap_stdlib.open_out_bin ~caps (segment_file config 1) in
+  output_string channel "not a database\n";
+  close_out channel;
   let messages = ref [] in
   let stats, ingested =
     (with_store ~caps)
@@ -611,56 +449,22 @@ let test_schema_mismatch_recreates_database ~(caps : < Ox_caps.Cap.fs_read ; Ox_
   in
   Alcotest.(check int) "old data is gone (schm-s13e)" 0 stats.Model.logs;
   Alcotest.(check int) "store works after recreate (schm-s13e)" 1 ingested;
-  (match List.rev !messages with
-  | [ message ] ->
+  match List.rev !messages with
+  | [ stale; foreign ] ->
       Alcotest.(check bool)
         "warning names the old version (schm-s52b)" true
-        (contains message "schema version 0");
+        (contains stale "schema version 0");
       Alcotest.(check bool)
         "warning names the new version (schm-s52b)" true
-        (contains message (string_of_int Store.schema_version));
+        (contains stale (string_of_int Store.schema_version));
       Alcotest.(check bool)
-        "warning names the database path (schm-s52b)" true
-        (contains message config.Config.db_path)
+        "warning names the segment path (schm-s52b)" true
+        (contains stale (segment_file config 0));
+      Alcotest.(check bool)
+        "the non-SQLite segment is replaced (bcache-f1le)" true
+        (contains foreign (segment_file config 1))
   | messages ->
-      Alcotest.failf "expected one schema warning, got %d" (List.length messages))
-
-let test_schema_refuses_foreign_database ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
-  let config = (temp_config ~caps) () in
-  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
-  (create_foreign_database ~caps) config.Config.db_path;
-  (match run_store_error (fun sw -> Store.open_ ~caps ~sw config) with
-  | Some message ->
-      Alcotest.(check bool)
-        "error names the missing metadata table (schm-xkk2)" true
-        (contains message "inn_meta")
-  | None -> Alcotest.fail "expected the store to refuse a foreign database");
-  Alcotest.(check bool)
-    "the foreign file is still there (schm-xkk2)" true
-    (Sys.file_exists config.db_path);
-  Alcotest.(check (list string))
-    "the foreign file still holds its data (schm-xkk2)" [ "row-1" ]
-    ((foreign_rows ~caps) config.Config.db_path);
-  (* A file that is not SQLite at all is refused for the same reason. *)
-  let other = test_config ((temp_db_path ~caps) ()) in
-  Fun.protect
-    ~finally:(fun () -> (cleanup_config ~caps) other)
-    (fun () ->
-      let contents = "not a database\n" in
-      let channel = Ox_caps.Cap_stdlib.open_out_bin ~caps other.Config.db_path in
-      output_string channel contents;
-      close_out channel;
-      (match run_store_error (fun sw -> Store.open_ ~caps ~sw other) with
-      | Some message ->
-          Alcotest.(check bool)
-            "error says the file is not a database (schm-xkk2)" true
-            (contains message "not an SQLite database")
-      | None -> Alcotest.fail "expected the store to refuse a non-SQLite file");
-      let channel = Ox_caps.Cap_stdlib.open_in_bin ~caps other.Config.db_path in
-      let read = really_input_string channel (in_channel_length channel) in
-      close_in channel;
-      Alcotest.(check string)
-        "the non-SQLite file is untouched (schm-xkk2)" contents read)
+      Alcotest.failf "expected two segment warnings, got %d" (List.length messages)
 
 (* Store ----------------------------------------------------------------- *)
 
@@ -908,355 +712,235 @@ let test_store_ingests_and_queries_all_signals ~(caps : < Ox_caps.Cap.fs_read ; 
   Alcotest.(check int) "stats traces" 1 stats.traces;
   Alcotest.(check int) "stats services" 1 stats.services;
   Alcotest.(check int)
-    "stats expose the configured log ttl (ret-eeb1)" 24
-    stats.retention.logs_ttl_hours;
-  Alcotest.(check int)
-    "stats expose the configured trace ttl (ret-eeb1)" 48
-    stats.retention.traces_ttl_hours;
-  Alcotest.(check int)
-    "stats expose the configured metric ttl (ret-eeb1)" 48
-    stats.retention.metrics_ttl_hours;
-  Alcotest.(check int)
-    "stats expose the prune interval (ret-eeb1)" 300
-    stats.retention.prune_interval_seconds;
-  Alcotest.(check int)
-    "stats expose the size cap (ret-eeb1)" 1024 stats.retention.max_db_size_mb;
+    "stats expose the budget (bcache-s7at)" (1024 * 1024 * 1024)
+    stats.storage.max_bytes;
   Alcotest.(check bool)
-    "stats expose live bytes (ret-eeb1)" true (stats.retention.live_bytes > 0);
-  Alcotest.(check bool)
-    "no prune report before the first prune (ret-eeb1)" true
-    (Option.is_none stats.retention.last_prune)
+    "stats expose the bytes in use (bcache-s7at)" true
+    (stats.storage.used_bytes > 0);
+  Alcotest.(check int)
+    "one segment holds data (bcache-s7at)" 1
+    (List.length stats.storage.segments);
+  Alcotest.(check int)
+    "no failed ingest batch (bcache-s7at)" 0 stats.storage.ingest_failures
 
-(* Retention ------------------------------------------------------------- *)
+(* Segments -------------------------------------------------------------- *)
 
-let test_prune_per_signal_ttl ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
-  let config = (temp_config ~caps) () in
-  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
-  let clock = ref base_time in
-  let after_logs, after_traces, stats_after_logs, stats_after_traces =
-    (with_store ~caps) ~now_ms:(fun () -> !clock) config (fun store ->
-        let ( let* ) = Result.bind in
-        let* _ = Store.ingest_traces store [ test_span () ] in
-        let* _ = Store.ingest_logs store [ test_log () ] in
-        let* _ = Store.ingest_metrics store [ test_metric () ] in
-        let* after_logs = Store.prune ~now_ms:(base_time + (25 * hour_ms)) store in
-        let* stats_after_logs = Store.stats store in
-        let* after_traces =
-          Store.prune ~now_ms:(base_time + (49 * hour_ms)) store
-        in
-        let* stats_after_traces = Store.stats store in
-        Result.ok
-          (after_logs, after_traces, stats_after_logs, stats_after_traces))
+let log_search ?body () : Store.log_search_filter =
+  {
+    service = None;
+    trace_id = None;
+    span_id = None;
+    severity = None;
+    body;
+    attrs = [];
+    window = all_window;
+    cursor = None;
+    limit = 10;
+  }
+
+let numbered_body index = Printf.sprintf "log %06d " index ^ String.make 6000 'x'
+
+let ingest_numbered_logs store ~first ~count =
+  let ( let* ) = Result.bind in
+  let rec loop index =
+    if index >= first + count then Ok ()
+    else
+      let batch =
+        List.init 10 (fun k ->
+            test_log ~body:(numbered_body (index + k))
+              ~timestamp_ms:(base_time + index + k) ())
+      in
+      let* _ = Store.ingest_logs store batch in
+      loop (index + 10)
   in
-  Alcotest.(check int)
-    "logs expire after 24h (ret-mvsc)" 1 after_logs.Model.logs;
-  Alcotest.(check int)
-    "traces survive 24h (ret-57b8)" 0 after_logs.Model.traces;
-  Alcotest.(check int)
-    "metrics survive 24h (ret-ggir)" 0 after_logs.Model.metric_points;
-  Alcotest.(check int) "logs left after 24h" 0 stats_after_logs.Model.logs;
-  Alcotest.(check int) "traces left after 24h" 1 stats_after_logs.Model.traces;
-  Alcotest.(check int)
-    "metrics left after 24h" 1 stats_after_logs.Model.metric_points;
-  Alcotest.(check int)
-    "traces expire after 48h (ret-57b8)" 1 after_traces.Model.traces;
-  Alcotest.(check int) "spans go with their trace" 1 after_traces.Model.spans;
-  Alcotest.(check int)
-    "metrics expire after 48h (ret-ggir)" 1 after_traces.Model.metric_points;
-  Alcotest.(check int) "traces left after 48h" 0 stats_after_traces.Model.traces;
-  Alcotest.(check int) "spans left after 48h" 0 stats_after_traces.Model.spans;
-  Alcotest.(check int)
-    "metrics left after 48h" 0 stats_after_traces.Model.metric_points
+  loop first
 
-let test_prune_uses_ingestion_time ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
-  let config = (temp_config ~caps) () in
+let test_segments_keep_the_newest ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  (* bcache-r1ng, bcache-c4p7, bcache-f1le: an 8 MB budget gives 1 MiB
+     segments; 3000 logs of about 6 KB fill the ring more than twice. *)
+  let config = (temp_config ~caps) ~max_db_size_mb:8 () in
   Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
-  let clock = ref base_time in
-  let early, late, left =
-    (with_store ~caps) ~now_ms:(fun () -> !clock) config (fun store ->
+  let total = 3000 in
+  let storage, newest, oldest, kept =
+    (with_store ~caps) config (fun store ->
         let ( let* ) = Result.bind in
-        let* _ =
-          Store.ingest_logs store
-            [
-              test_log ~timestamp_ms:0 ~body:"client epoch" ();
-              test_log
-                ~timestamp_ms:(base_time + (1000 * hour_ms))
-                ~body:"client future" ();
-            ]
+        let* () = ingest_numbered_logs store ~first:0 ~count:total in
+        let* storage = Store.storage store in
+        let search text =
+          Store.search_logs (log_search ~body:text ()) store |> Result.map page_items
         in
-        let* early = Store.prune ~now_ms:(base_time + (1 * hour_ms)) store in
-        let* late = Store.prune ~now_ms:(base_time + (25 * hour_ms)) store in
-        let* left = Store.stats store in
-        Result.ok (early, late, left))
-  in
-  Alcotest.(check int)
-    "client timestamps do not expire data early (ret-ovry)" 0 early.Model.logs;
-  Alcotest.(check int)
-    "both rows expire on ingestion time (ret-ovry)" 2 late.Model.logs;
-  Alcotest.(check int) "no logs left (ret-ovry)" 0 left.Model.logs
-
-let test_prune_keeps_trace_with_fresh_span ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
-  let config = (temp_config ~caps) () in
-  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
-  let clock = ref base_time in
-  let kept_trace = "cccccccccccccccccccccccccccccccc" in
-  let stale_trace = "dddddddddddddddddddddddddddddddd" in
-  let report, stats, kept, gone, attr_spans, attr_traces =
-    (with_store ~caps) ~now_ms:(fun () -> !clock) config (fun store ->
-        let ( let* ) = Result.bind in
-        let* _ =
-          Store.ingest_traces store
-            [
-              test_span ~trace_id:kept_trace ~span_id:"1111111111111111"
-                ~attributes:[ ("route", "/kept") ] ();
-            ]
-        in
-        let* _ =
-          Store.ingest_traces store
-            [
-              test_span ~trace_id:stale_trace ~span_id:"2222222222222222"
-                ~attributes:[ ("route", "/gone") ] ();
-            ]
-        in
-        clock := base_time + (47 * hour_ms);
-        let* _ =
-          Store.ingest_traces store
-            [
-              test_span ~trace_id:kept_trace ~span_id:"3333333333333333"
-                ~attributes:[ ("route", "/kept") ] ();
-            ]
-        in
-        let* report = Store.prune ~now_ms:(base_time + (49 * hour_ms)) store in
+        let* newest = search (Printf.sprintf "log %06d " (total - 1)) in
+        let* oldest = search "log 000000 " in
         let* stats = Store.stats store in
-        let* kept = Store.get_trace store kept_trace in
-        let* gone = Store.get_trace store stale_trace in
-        let* attr_spans =
+        Result.ok (storage, newest, oldest, stats.Model.logs))
+  in
+  Alcotest.(check int) "the newest log is kept (bcache-r1ng)" 1 (List.length newest);
+  Alcotest.(check int) "the oldest log is gone (bcache-r1ng)" 0 (List.length oldest);
+  Alcotest.(check bool) "some logs went with whole segments (bcache-f1le)" true
+    (kept > 0 && kept < total);
+  Alcotest.(check int) "every slot holds data after the ring wrapped"
+    Store.segment_count (List.length storage.Model.segments);
+  Alcotest.(check bool)
+    (Printf.sprintf "the store stays near its budget (bcache-c4p7): %d of %d bytes"
+       storage.used_bytes storage.max_bytes)
+    true
+    (storage.used_bytes <= storage.max_bytes + (storage.max_bytes / 10));
+  Alcotest.(check int) "no failed batch" 0 storage.ingest_failures;
+  (* The data survives a restart, and the ring continues where it stopped. *)
+  let reopened, newest_after_reopen =
+    (with_store ~caps) config (fun store ->
+        let ( let* ) = Result.bind in
+        let* () = ingest_numbered_logs store ~first:total ~count:10 in
+        let* storage = Store.storage store in
+        let* newest =
+          Store.search_logs
+            (log_search ~body:(Printf.sprintf "log %06d " (total + 9)) ())
+            store
+          |> Result.map page_items
+        in
+        Result.ok (storage, newest))
+  in
+  Alcotest.(check int) "a write after reopen is found" 1
+    (List.length newest_after_reopen);
+  let max_sequence segments =
+    List.fold_left
+      (fun acc (segment : Model.segment_stats) -> max acc segment.sequence)
+      0 segments
+  in
+  Alcotest.(check bool) "the ring keeps its order across a restart" true
+    (max_sequence reopened.Model.segments >= max_sequence storage.segments)
+
+let test_trace_across_segments ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  (* bcache-f1le: the reader combines the parts of one trace from two
+     segments into one summary and one tree. *)
+  let config = (temp_config ~caps) ~max_db_size_mb:8 () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
+  let trace_id = "abababababababababababababababab" in
+  let root = test_span ~trace_id ~span_id:"1000000000000001" ~operation_name:"root" () in
+  let child =
+    test_span ~trace_id ~span_id:"1000000000000002"
+      ~parent_span_id:(Some "1000000000000001") ~service_name:"worker"
+      ~operation_name:"child" ~status:"error" ~timestamp_ms:(base_time + 5) ()
+  in
+  let summary, trace, before, after, by_service =
+    (with_store ~caps) config (fun store ->
+        let ( let* ) = Result.bind in
+        let* _ = Store.ingest_traces store [ root ] in
+        let* before = Store.storage store in
+        let* () = ingest_numbered_logs store ~first:0 ~count:300 in
+        let* after = Store.storage store in
+        let* _ = Store.ingest_traces store [ child ] in
+        let* page = Store.list_trace_summaries ~window:all_window ~limit:10 store in
+        let* by_service =
+          Store.list_trace_summaries ~service:"worker" ~window:all_window ~limit:10 store
+        in
+        let* trace = Store.get_trace store trace_id in
+        Result.ok (page_items page, trace, before, after, page_items by_service))
+  in
+  let active (storage : Model.storage_stats) =
+    List.find (fun (segment : Model.segment_stats) -> segment.active) storage.segments
+  in
+  Alcotest.(check bool) "the logs moved the writer to another segment" true
+    ((active before).slot <> (active after).slot);
+  (match summary with
+  | [ summary ] ->
+      Alcotest.(check int) "one summary counts both parts" 2 summary.Model.span_count;
+      Alcotest.(check int) "errors from the second part" 1 summary.error_count;
+      Alcotest.(check string) "the root comes from the first part" "root"
+        summary.root_operation_name
+  | summaries -> Alcotest.failf "expected one trace summary, got %d" (List.length summaries));
+  Alcotest.(check int) "a child service finds the trace" 1 (List.length by_service);
+  match trace with
+  | Some trace ->
+      Alcotest.(check (list string)) "the tree joins both segments"
+        [ "root"; "child" ]
+        (List.map (fun (node : Model.span_node) -> node.span.operation_name) trace.spans);
+      Alcotest.(check (list string)) "the detail has no warning" [] trace.warnings
+  | None -> Alcotest.fail "the trace was not found"
+
+let test_ingest_limits ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
+  (* bcache-t8nc, bcache-a1x1, bcache-s5kc. *)
+  let config = (temp_config ~caps) () in
+  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
+  let large = String.make 5000 'u' in
+  let span =
+    test_span ~trace_id:"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd" ~span_id:"2000000000000001"
+      ~attributes:[ ("universe", large); ("session", "s-1") ] ()
+  in
+  let log = test_log ~body:(String.make 20_000 'b') () in
+  let busy_trace = "efefefefefefefefefefefefefefefef" in
+  let busy_spans =
+    List.init (Store.max_trace_spans_per_segment + 10) (fun index ->
+        test_span ~trace_id:busy_trace ~span_id:(Printf.sprintf "%016x" (index + 1))
+          ~timestamp_ms:(base_time + index) ())
+  in
+  let rec batches = function
+    | [] -> []
+    | spans ->
+        let rec take count acc = function
+          | rest when count = 0 -> (List.rev acc, rest)
+          | [] -> (List.rev acc, [])
+          | span :: rest -> take (count - 1) (span :: acc) rest
+        in
+        let batch, rest = take 1000 [] spans in
+        batch :: batches rest
+  in
+  let stored_span, stored_log, by_short, by_long, busy, kept =
+    (with_store ~caps) config (fun store ->
+        let ( let* ) = Result.bind in
+        let* _ = Store.ingest_traces store [ span ] in
+        let* _ = Store.ingest_logs store [ log ] in
+        let* kept =
+          List.fold_left
+            (fun total batch ->
+              let* total = total in
+              let* count = Store.ingest_traces store batch in
+              Result.ok (total + count))
+            (Result.ok 0) (batches busy_spans)
+        in
+        let* stored_span = Store.get_span store span.span_id in
+        let* logs = Store.search_logs (log_search ()) store in
+        let search attrs : Store.span_search_filter =
+          { service = None; trace_id = None; operation = None; parent_operation = None;
+            status = None; attrs; window = all_window; cursor = None; limit = 10 }
+        in
+        let* by_short = Store.search_spans (search [ ("session", "s-1") ]) store in
+        let* by_long =
           Store.search_spans
-            {
-              service = None;
-              trace_id = None;
-              operation = None;
-              parent_operation = None;
-              status = None;
-              attrs = [ ("route", "/gone") ];
-              window = all_window;
-              cursor = None;
-              limit = 10;
-            }
+            (search [ ("universe", String.make Ingest_limits.max_attribute_bytes 'u') ])
             store
-          |> Result.map page_items
         in
-        let* attr_traces =
-          Store.search_traces
-            {
-              service = None;
-              operation = None;
-              status = None;
-              attrs = [ ("route", "/gone") ];
-              window = all_window;
-              cursor = None;
-              limit = 10;
-            }
-            store
-          |> Result.map page_items
-        in
-        Result.ok (report, stats, kept, gone, attr_spans, attr_traces))
+        let* busy = Store.get_trace store busy_trace in
+        Result.ok (stored_span, page_items logs, page_items by_short, page_items by_long, busy, kept))
   in
-  Alcotest.(check int)
-    "only the stale trace is deleted (ret-4hhb)" 1 report.Model.traces;
-  Alcotest.(check int) "stale spans are deleted" 1 report.Model.spans;
-  Alcotest.(check int) "the fresh-span trace survives" 1 stats.Model.traces;
-  Alcotest.(check int) "its spans survive" 2 stats.Model.spans;
-  Alcotest.(check bool) "fresh-span trace is readable" true (Option.is_some kept);
-  Alcotest.(check bool) "stale trace is gone" true (Option.is_none gone);
-  Alcotest.(check int)
-    "attribute search does not return the deleted trace (ret-hy7e)" 0
-    (List.length attr_spans);
-  Alcotest.(check int)
-    "trace search does not return the deleted trace (ret-hy7e)" 0
-    (List.length attr_traces);
-  Alcotest.(check int)
-    "no orphaned attribute rows (ret-hy7e)" 0
-    ((orphan_attribute_rows ~caps) config.Config.db_path)
-
-let test_prune_batches_large_backlog ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
-  let config = (temp_config ~caps) () in
-  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
-  let clock = ref base_time in
-  let bulk_logs = 5_000 in
-  let report, stats =
-    (with_store ~caps) ~now_ms:(fun () -> !clock) config (fun store ->
-        let ( let* ) = Result.bind in
-        let logs =
-          List.init bulk_logs (fun index ->
-              test_log ~body:(Printf.sprintf "bulk-%d" index) ~attributes:[]
-                ~resource:[] ())
-        in
-        let* _ = Store.ingest_logs store logs in
-        let* report = Store.prune ~now_ms:(base_time + (25 * hour_ms)) store in
-        let* stats = Store.stats store in
-        Result.ok (report, stats))
-  in
-  Alcotest.(check int)
-    "a multi-batch backlog is fully pruned (ret-xbij)" bulk_logs
-    report.Model.logs;
-  Alcotest.(check int) "no logs left (ret-xbij)" 0 stats.Model.logs
-
-let test_ingest_does_not_prune ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
-  let config = (temp_config ~caps) () in
-  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
-  let clock = ref base_time in
-  let after_ingest, report, after_prune =
-    (with_store ~caps) ~now_ms:(fun () -> !clock) config (fun store ->
-        let ( let* ) = Result.bind in
-        let* _ = Store.ingest_logs store [ test_log ~body:"first" () ] in
-        clock := base_time + (25 * hour_ms);
-        let* _ = Store.ingest_logs store [ test_log ~body:"second" () ] in
-        let* after_ingest = Store.stats store in
-        let* report = Store.prune ~now_ms:(base_time + (25 * hour_ms)) store in
-        let* after_prune = Store.stats store in
-        Result.ok (after_ingest, report, after_prune))
-  in
-  Alcotest.(check int)
-    "expired data stays until the pruner runs (ret-rkrf)" 2
-    after_ingest.Model.logs;
-  Alcotest.(check int)
-    "the pruner deletes the expired row (ret-rkrf)" 1 report.Model.logs;
-  Alcotest.(check int) "the fresh row stays (ret-rkrf)" 1 after_prune.Model.logs
-
-let test_prune_size_cap_removes_only_oldest ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
-  let max_db_size_mb = 1 in
-  let config = (temp_config ~caps) ~max_db_size_mb () in
-  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
-  let clock = ref base_time in
-  let old_logs = 150 and new_logs = 20 in
-  let body = String.make (8 * 1024) 'x' in
-  let report, second_report, stats, new_left, old_left =
-    (with_store ~caps) ~now_ms:(fun () -> !clock) config (fun store ->
-        let ( let* ) = Result.bind in
-        let old =
-          List.init old_logs (fun index ->
-              test_log ~service_name:"old"
-                ~body:(Printf.sprintf "old-%d-%s" index body)
-                ~attributes:[] ~resource:[] ())
-        in
-        let* _ = Store.ingest_logs store old in
-        clock := base_time + (1 * hour_ms);
-        let fresh =
-          List.init new_logs (fun index ->
-              test_log ~service_name:"new"
-                ~body:(Printf.sprintf "new-%d-%s" index body)
-                ~attributes:[] ~resource:[] ())
-        in
-        let* _ = Store.ingest_logs store fresh in
-        let* before = Store.stats store in
-        if before.Model.retention.live_bytes <= max_db_size_mb * 1024 * 1024 then
-          Alcotest.failf
-            "test setup: live bytes %d are not over the cap"
-            before.retention.live_bytes;
-        let* report = Store.prune ~now_ms:(base_time + (1 * hour_ms)) store in
-        let* second_report =
-          Store.prune ~now_ms:(base_time + (1 * hour_ms)) store
-        in
-        let* stats = Store.stats store in
-        let* new_left =
-          Store.list_logs
-            {
-              service = Some "new";
-              severity = None;
-              contains = None;
-              window = all_window;
-              cursor = None;
-              limit = 1000;
-            }
-            store
-          |> Result.map page_items
-        in
-        let* old_left =
-          Store.list_logs
-            {
-              service = Some "old";
-              severity = None;
-              contains = None;
-              window = all_window;
-              cursor = None;
-              limit = 1000;
-            }
-            store
-          |> Result.map page_items
-        in
-        Result.ok (report, second_report, stats, new_left, old_left))
-  in
-  Alcotest.(check bool)
-    "the size cap triggers (ret-zjzs)" true report.Model.size_cap_triggered;
-  Alcotest.(check bool)
-    "the size cap deletes rows (ret-bizv)" true (report.Model.logs > 0);
-  Alcotest.(check bool)
-    "the size cap does not delete everything (ret-bizv)" true
-    (report.Model.logs < old_logs + new_logs);
-  Alcotest.(check int)
-    "the newest logs survive (ret-bizv)" new_logs (List.length new_left);
-  Alcotest.(check bool)
-    "the oldest logs are the ones deleted (ret-bizv)" true
-    (List.length old_left < old_logs);
-  Alcotest.(check bool)
-    "live data is under the cap (ret-zjzs)" true
-    (stats.Model.retention.live_bytes <= max_db_size_mb * 1024 * 1024);
-  Alcotest.(check int)
-    "a second prune with nothing to do deletes nothing (ret-zjzs)" 0
-    (second_report.Model.logs + second_report.traces
-   + second_report.metric_points + second_report.spans);
-  Alcotest.(check bool)
-    "a second prune does not trigger the size cap (ret-zjzs)" false
-    second_report.Model.size_cap_triggered
-
-let test_stats_reports_retention ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
-  let config =
-    (temp_config ~caps) ~traces_retention_hours:12 ~logs_retention_hours:6
-      ~metrics_retention_hours:18 ~prune_interval_seconds:60
-      ~max_db_size_mb:512 ()
-  in
-  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
-  let clock = ref base_time in
-  let stats =
-    (with_store ~caps) ~now_ms:(fun () -> !clock) config (fun store ->
-        let ( let* ) = Result.bind in
-        let* _ = Store.ingest_logs store [ test_log () ] in
-        let* _ = Store.prune ~now_ms:(base_time + (7 * hour_ms)) store in
-        Store.stats store)
-  in
-  let retention = stats.Model.retention in
-  Alcotest.(check int)
-    "stats ttl traces (ret-eeb1)" 12 retention.Model.traces_ttl_hours;
-  Alcotest.(check int)
-    "stats ttl logs (ret-eeb1)" 6 retention.Model.logs_ttl_hours;
-  Alcotest.(check int)
-    "stats ttl metrics (ret-eeb1)" 18 retention.Model.metrics_ttl_hours;
-  Alcotest.(check int)
-    "stats prune interval (ret-eeb1)" 60 retention.Model.prune_interval_seconds;
-  Alcotest.(check int)
-    "stats size cap (ret-eeb1)" 512 retention.Model.max_db_size_mb;
-  Alcotest.(check bool)
-    "stats live bytes (ret-eeb1)" true (retention.Model.live_bytes > 0);
-  (match retention.Model.last_prune with
-  | None -> Alcotest.fail "expected a last prune report (ret-eeb1)"
-  | Some report ->
-      Alcotest.(check int)
-        "report time (ret-eeb1)" (base_time + (7 * hour_ms))
-        report.Model.pruned_at_ms;
-      Alcotest.(check int) "report log rows (ret-eeb1)" 1 report.Model.logs;
-      Alcotest.(check bool)
-        "report size cap flag (ret-eeb1)" false report.Model.size_cap_triggered);
-  let json = Model.stats_to_json stats in
-  let retention_json = Yojson.Safe.Util.member "retention" json in
-  Alcotest.(check int)
-    "json log ttl (ret-eeb1)" 6
-    Yojson.Safe.Util.(member "logsTtlHours" retention_json |> to_int);
-  Alcotest.(check bool)
-    "json last prune (ret-eeb1)" true
-    (Yojson.Safe.Util.member "lastPrune" retention_json <> `Null)
-
-(* Server ---------------------------------------------------------------- *)
+  (match stored_span with
+  | Some stored ->
+      Alcotest.(check (option int)) "a long attribute is cut to 1 KB (bcache-t8nc)"
+        (Some Ingest_limits.max_attribute_bytes)
+        (match List.assoc_opt "universe" stored.Model.attributes with
+        | Some (`String value) -> Some (String.length value)
+        | _ -> None);
+      Alcotest.(check bool) "the span is marked (bcache-t8nc)" true
+        (List.assoc_opt Ingest_limits.truncated_key stored.attributes = Some (`Bool true))
+  | None -> Alcotest.fail "the span was not stored");
+  (match stored_log with
+  | [ log ] ->
+      Alcotest.(check int) "a long body is cut to 8 KB (bcache-t8nc)"
+        Ingest_limits.max_text_bytes (String.length log.Model.body);
+      Alcotest.(check bool) "the log is marked (bcache-t8nc)" true
+        (List.assoc_opt Ingest_limits.truncated_key log.attributes = Some (`Bool true))
+  | logs -> Alcotest.failf "expected one log, got %d" (List.length logs));
+  Alcotest.(check int) "a short value is searchable (bcache-a1x1)" 1 (List.length by_short);
+  Alcotest.(check int) "a long value is not indexed (bcache-a1x1)" 0 (List.length by_long);
+  Alcotest.(check int) "the span cap keeps 5000 spans of one trace (bcache-s5kc)"
+    Store.max_trace_spans_per_segment kept;
+  match busy with
+  | Some trace ->
+      Alcotest.(check int) "the summary counts the kept spans"
+        Store.max_trace_spans_per_segment trace.Model.summary.span_count;
+      Alcotest.(check int) "the summary counts the dropped spans (bcache-s5kc)" 10
+        trace.summary.dropped_span_count
+  | None -> Alcotest.fail "the busy trace was not found"
 
 let test_server_handler_ingests_and_queries_services ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   let config = (temp_config ~caps) () in
@@ -1438,8 +1122,17 @@ let test_server_handler_ingests_and_queries_services ~(caps : < Ox_caps.Cap.fs_r
       Alcotest.(check int)
         "stats status" 200 (Ox_http.Server.Response.status stats);
       Alcotest.(check bool)
-        "stats body carries the retention section (ret-eeb1)" true
-        (Yojson.Safe.Util.member "retention" (response_json stats) <> `Null);
+        "stats body carries the storage section (bcache-s7at)" true
+        (Yojson.Safe.Util.member "storage" (response_json stats) <> `Null);
+      let status =
+        run_server_effect
+          (Inn.Server.handler config store (request ~target:"/status" ()))
+      in
+      Alcotest.(check int)
+        "status status" 200 (Ox_http.Server.Response.status status);
+      Alcotest.(check bool)
+        "status carries the storage section (bcache-s7at)" true
+        (Yojson.Safe.Util.member "storage" (response_json status) <> `Null);
       let instructions =
         run_server_effect
           (Inn.Server.handler config store (request ~target:"/instructions" ()))
@@ -1459,77 +1152,6 @@ let test_server_handler_ingests_and_queries_services ~(caps : < Ox_caps.Cap.fs_r
       Alcotest.(check string)
         "openapi version" "3.1.0"
         (openapi |> response_json |> json_string_field "openapi"))
-
-let test_server_pruner_prunes_without_ingest ~(caps : < Ox_caps.Cap.env ; Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.network ; Ox_caps.Cap.signal ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
-  let port = (free_port ~caps) () in
-  let config =
-    (temp_config ~caps) ~port ~traces_retention_hours:1 ~logs_retention_hours:1
-      ~metrics_retention_hours:1 ~prune_interval_seconds:1 ()
-  in
-  Fun.protect ~finally:(fun () -> (cleanup_config ~caps) config) @@ fun () ->
-  (* Telemetry that expired while the server was not running (ret-sbgj). *)
-  (with_store ~caps)
-    ~now_ms:(fun () -> (wall_now_ms ~caps) () - (2 * hour_ms))
-    config
-    (fun store ->
-      let ( let* ) = Result.bind in
-      let* _ =
-        Store.ingest_logs store [ test_log ~body:"expired while stopped" () ]
-      in
-      Result.ok ());
-  Eio_main.run @@ fun env ->
-  Eio.Switch.run @@ fun sw ->
-  let net = Eio.Stdenv.net env in
-  let clock = Eio.Stdenv.clock env in
-  Eio.Fiber.first
-    (fun () -> Inn.Server.run ~caps ~sw ~env config)
-    (fun () ->
-      let client = Ox_http.Client.create ~sw ~net ~clock () in
-      let base_url = Printf.sprintf "http://127.0.0.1:%d" port in
-      let stats_json () =
-        let status, body = http_get ~sw ~net ~clock client (base_url ^ "/stats") in
-        Alcotest.(check int) "stats status" 200 status;
-        Yojson.Safe.from_string body
-      in
-      let log_count () =
-        Yojson.Safe.Util.(member "logs" (stats_json ()) |> to_int)
-      in
-      Alcotest.(check bool)
-        "server is up" true
-        ((wait_until ~caps) ~clock ~timeout_seconds:10.0 (fun () ->
-             match http_get_opt ~sw ~net ~clock client (base_url ^ "/health") with
-             | Some (status, _) -> status = 200
-             | None -> false));
-      Alcotest.(check bool)
-        "the startup pass prunes without ingest (ret-sj15, ret-sbgj)" true
-        ((wait_until ~caps) ~clock ~timeout_seconds:10.0 (fun () -> log_count () = 0));
-      let retention =
-        Yojson.Safe.Util.member "retention" (stats_json ())
-      in
-      Alcotest.(check int)
-        "stats expose the active log ttl (ret-eeb1)" 1
-        Yojson.Safe.Util.(member "logsTtlHours" retention |> to_int);
-      Alcotest.(check bool)
-        "stats expose the last prune (ret-eeb1)" true
-        (Yojson.Safe.Util.member "lastPrune" retention <> `Null);
-      (* A later interval pass prunes data that arrives while the server keeps
-         running without any ingest request (ret-sj15). *)
-      run_store_in ~sw ~clock
-        (fun sw -> Store.with_db ~caps ~sw
-           ~now_ms:(fun () -> (wall_now_ms ~caps) () - (2 * hour_ms))
-           config
-           (fun store ->
-             let ( let* ) = Result.bind in
-             let* _ =
-               Store.ingest_logs store [ test_log ~body:"expired later" () ]
-             in
-             Result.ok ()));
-      Alcotest.(check bool)
-        "the expired row becomes visible" true
-        ((wait_until ~caps) ~clock ~timeout_seconds:5.0 (fun () -> log_count () = 1));
-      Alcotest.(check bool)
-        "the interval pass prunes it (ret-sj15)" true
-        ((wait_until ~caps) ~clock ~timeout_seconds:10.0 (fun () -> log_count () = 0)))
 
 (* OTLP/HTTP JSON conformance regression cases. *)
 let member field = function
@@ -2257,7 +1879,7 @@ let test_exact_queries_above_old_caps ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.C
         && json_member "count" row = `Int expected) rows) in
   (* acc-1ccu: 200,075 rows. Time bounded SQL queries, not fixture ingest.
      Thirty seconds leaves ample room for slower CI hosts. *)
-  let query_started = Ox_caps.Cap_unix.gettimeofday ~caps () in
+  let query_started = mono_now () in
   Alcotest.(check int) "acc-879n old trace beyond 10k spans" 1
     (List.length (response
       "/traces/search?lookback=all&attr.ai.prompt=needle-old-call&attr.http.method=GET"
@@ -2285,7 +1907,7 @@ let test_exact_queries_above_old_caps ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.C
     "/facets?lookback=all&type=logs&field=attribute_values&key=http.method"
     "facets") "GET" log_count;
   Alcotest.(check bool) "acc-1ccu 200k-row queries finish within 30 seconds"
-    true (Ox_caps.Cap_unix.gettimeofday ~caps () -. query_started < 30.)
+    true (elapsed_seconds query_started < 30.)
 
 let test_search_filters_and_exact_stats ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ; Ox_caps.Cap.stderr ; Ox_caps.Cap.time ; Ox_caps.Cap.tmp ; .. >) () =
   (* sf-*, acc-*: literal filters, typed joins, complete aggregates. *)
@@ -2624,11 +2246,11 @@ let test_trace_tree_warnings () =
   Alcotest.(check bool) "tree-ffmn the cycle is reported" true
     (List.exists (fun warning -> contains warning "cycle") cycle.warnings)
 
-(* Test-only probe: the store never leaves a trace without its summary row, so
+(* Test-only probe: the store never leaves a trace without its trace part, so
    the 404 rule needs one deleted by hand (tree-ddll). *)
 module Test_trace_summaries = struct
   module T = Ox_sql.Table.Make (struct
-    let name = "trace_summaries"
+    let name = "trace_parts"
   end)
 
   include T
@@ -2753,7 +2375,7 @@ let test_trace_tree_handlers ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_wri
             (match json_member "warningCount" listed_summary with
             | `Int _ -> true
             | _ -> false);
-          (delete_trace_summary ~caps) config.Config.db_path trace_id;
+          (delete_trace_summary ~caps) (segment_file config 0) trace_id;
           let still = server_get config store ("/traces/" ^ trace_id) in
           Alcotest.(check int)
             "tree-ddll a trace without its summary row still answers" 200
@@ -3279,6 +2901,7 @@ let test_health_identity ~(caps : < Ox_caps.Cap.fs_read ; Ox_caps.Cap.fs_write ;
   run_store_scope @@ fun () ->
   let store = run_store (fun sw -> Store.open_ ~caps ~sw config) in
   Fun.protect ~finally:(fun () -> run_store (fun _sw -> Store.close store)) @@ fun () ->
+  Inn.Server.mark_started ~caps ();
   let health = server_json config store "/health" in
   let healthz = server_json config store "/healthz" in
   let started_at = json_string_field "startedAt" health in
@@ -3364,9 +2987,9 @@ let () =
             (test_config_defaults_are_user_level ~caps);
           Alcotest.test_case "environment overrides are explicit" `Quick
             (test_config_env_overrides ~caps);
-          Alcotest.test_case "INN_RETENTION_HOURS is rejected (ret-f1oo)" `Quick
-            (test_config_rejects_legacy_retention ~caps);
-          Alcotest.test_case "invalid values are rejected (ret-6pix)" `Quick
+          Alcotest.test_case "removed settings are refused (bcache-c4p7)" `Quick
+            (test_config_rejects_removed_settings ~caps);
+          Alcotest.test_case "invalid values are rejected" `Quick
             (test_config_rejects_invalid_values ~caps);
         ] );
       ( "schema",
@@ -3375,10 +2998,8 @@ let () =
             `Quick test_schema_fingerprint_matches_version;
           Alcotest.test_case "reopen keeps data (schm-ld81)" `Quick
             (test_schema_reopen_keeps_data ~caps);
-          Alcotest.test_case "version mismatch recreates (schm-s13e, schm-s52b)"
+          Alcotest.test_case "an unusable segment is recreated (schm-s13e, schm-s52b, bcache-f1le)"
             `Quick (test_schema_mismatch_recreates_database ~caps);
-          Alcotest.test_case "foreign database is refused (schm-xkk2)" `Quick
-            (test_schema_refuses_foreign_database ~caps);
         ] );
       ( "otlp",
         [
@@ -3394,22 +3015,14 @@ let () =
           Alcotest.test_case "ingests and queries all signals" `Quick
             (test_store_ingests_and_queries_all_signals ~caps);
         ] );
-      ( "retention",
+      ( "segments",
         [
-          Alcotest.test_case "per-signal ttl (ret-mvsc, ret-57b8, ret-ggir)"
-            `Quick (test_prune_per_signal_ttl ~caps);
-          Alcotest.test_case "ingestion time decides expiry (ret-ovry)" `Quick
-            (test_prune_uses_ingestion_time ~caps);
-          Alcotest.test_case "fresh span keeps its trace (ret-4hhb, ret-hy7e)"
-            `Quick (test_prune_keeps_trace_with_fresh_span ~caps);
-          Alcotest.test_case "bounded batches clear a backlog (ret-xbij)" `Quick
-            (test_prune_batches_large_backlog ~caps);
-          Alcotest.test_case "ingest does not prune (ret-rkrf)" `Quick
-            (test_ingest_does_not_prune ~caps);
-          Alcotest.test_case "size cap deletes oldest first (ret-zjzs, ret-bizv)"
-            `Quick (test_prune_size_cap_removes_only_oldest ~caps);
-          Alcotest.test_case "stats carry the retention section (ret-eeb1)"
-            `Quick (test_stats_reports_retention ~caps);
+          Alcotest.test_case "the newest data fits the budget (bcache-r1ng, bcache-c4p7, bcache-f1le)"
+            `Quick (test_segments_keep_the_newest ~caps);
+          Alcotest.test_case "a trace across two segments (bcache-f1le)" `Quick
+            (test_trace_across_segments ~caps);
+          Alcotest.test_case "ingest limits (bcache-t8nc, bcache-a1x1, bcache-s5kc)"
+            `Quick (test_ingest_limits ~caps);
         ] );
       ( "windows",
         [
@@ -3438,8 +3051,6 @@ let () =
         [
           Alcotest.test_case "handler ingests and queries services" `Quick
             (test_server_handler_ingests_and_queries_services ~caps);
-          Alcotest.test_case "pruner runs without ingest (ret-sj15, ret-sbgj)"
-            `Slow (test_server_pruner_prunes_without_ingest ~caps);
         ] );
       ( "tree",
         [

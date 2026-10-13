@@ -73,6 +73,7 @@ type trace_summary = {
   error_count : int;
   is_running : bool;
   warning_count : int;
+  dropped_span_count : int;
 }
 (** [is_running] and [warning_count] are maintained with the summary, so a
     broken or in-flight trace is visible from the trace list (tree-6vac). *)
@@ -109,24 +110,28 @@ val window_all : window
 val window_lookback : now_ms:int -> ms:int -> window
 (** A window that starts [ms] milliseconds before [now_ms]. *)
 
-type prune_report = {
-  pruned_at_ms : int;
-  traces : int;
-  spans : int;
-  logs : int;
-  metric_points : int;
-  size_cap_triggered : bool;
+type segment_stats = {
+  slot : int;
+  sequence : int;
+  bytes : int;
+  started_at_ms : int;
+  active : bool;
 }
+(** One segment file that holds data. [sequence] grows by one at each rotation;
+    the segment with the lowest sequence holds the oldest data. *)
 
-type retention_stats = {
-  traces_ttl_hours : int;
-  logs_ttl_hours : int;
-  metrics_ttl_hours : int;
-  prune_interval_seconds : int;
-  max_db_size_mb : int;
-  live_bytes : int;
-  last_prune : prune_report option;
+type ingest_failure = { failed_at_ms : int; message : string }
+
+type storage_stats = {
+  max_bytes : int;
+  segment_bytes : int;
+  used_bytes : int;
+  segments : segment_stats list;
+  ingest_failures : int;
+  last_ingest_failure : ingest_failure option;
 }
+(** The budget, the bytes in use, the segments, and the failed ingest batches
+    since the server started (bcache-s7at). *)
 
 type stats = {
   spans : int;
@@ -134,7 +139,7 @@ type stats = {
   metric_points : int;
   traces : int;
   services : int;
-  retention : retention_stats;
+  storage : storage_stats;
 }
 
 type stat_item = {
@@ -166,7 +171,7 @@ val log_to_json : log_record -> Yojson.Safe.t
 val metric_point_to_json : metric_point -> Yojson.Safe.t
 val trace_summary_to_json : trace_summary -> Yojson.Safe.t
 val trace_to_json : trace -> Yojson.Safe.t
-val prune_report_to_json : prune_report -> Yojson.Safe.t
+val storage_stats_to_json : storage_stats -> Yojson.Safe.t
 val stats_to_json : stats -> Yojson.Safe.t
 val stat_item_to_json : stat_item -> Yojson.Safe.t
 val facet_item_to_json : facet_item -> Yojson.Safe.t
