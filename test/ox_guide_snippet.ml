@@ -76,7 +76,8 @@ let run ~(caps : < Ox_caps.Cap.env ; Ox_caps.Cap.random ; .. >) () =
   let http_client = Ox_http.Client.create ~sw ~net ~clock () in
   let exporter =
     match
-      Ox_otel.create ~caps ~sw ~clock ~http_client ~endpoint
+      Ox_otel.create ~caps ~sw ~clock ~mono_clock:stdenv#mono_clock
+        ~http_client ~endpoint
         ~service_name:"my-app" ~ending_budget:(Ox.Duration.seconds 5)
         ~resource:[ ("service.version", "0.1.0") ] ()
     with
