@@ -22,6 +22,10 @@ uncommitted work is effectively lost work.
   work around it, stash it, or treat it as someone else's change.
 - When subagents implement slices, the coordinating session reviews each result
   and commits it before starting dependent work.
+- After a commit that changes the server, the CLI, or the store, install it into
+  the running service with `./scripts/install-inn-service.sh` and confirm that
+  it reports healthy. The service runs the installed binary, so a change that is
+  committed but not installed is not finished. ^bcache-i9st
 - Push only when the user asks.
 
 ## Gates (before any commit)

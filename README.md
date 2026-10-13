@@ -156,9 +156,8 @@ service in one step after any Inn change:
 ./scripts/install-inn-service.sh
 ```
 
-The script builds Inn against the local Ox checkout, exactly as
-`./scripts/test-local-ox.sh` does (set `OX_PATH=/path/to/Ox` when the
-checkout is elsewhere), and installs only the `inn` executable into the shared
+The script builds Inn exactly as the gates do (`nix develop` over the shared
+OxCaml switch) and installs only the `inn` executable into the shared
 OxCaml switch at `$OPAMROOT/5.4.0+ox/bin/inn` (`OPAMROOT` defaults to
 `~/.cache/opam`). It copies the binary to a temporary file in that same
 directory and renames it into place, so the service never observes a half
@@ -166,7 +165,11 @@ written executable. It then restarts `inn.service` when the unit exists and
 waits for `$INN_BASE_URL/health` (default `http://127.0.0.1:27687`) to answer.
 It never runs `opam install`, `opam upgrade`, or `opam pin`, so the Ox
 installed in the shared switch is left exactly as it is and pie and grip keep
-building against it.
+building against it. Every change that lands on `master` is installed this way
+(see `AGENTS.md`), so the service never runs older code than the repository.
+
+The unit restarts Inn after every exit (`Restart=always` in the home-manager
+module), except exit status 127, which means the binary is missing.
 
 ```sh
 systemctl --user status inn

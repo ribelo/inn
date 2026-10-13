@@ -1,11 +1,11 @@
 """svc-k4u6: one documented, repeatable command reinstalls Inn into the shared
 switch: scripts/install-inn-service.sh, as documented in the README.
 svc-is5q: that command never upgrades the Ox installed in the shared switch --
-it builds against the local Ox checkout and installs only the inn executable,
-so pie and grip keep building against the Ox they were built with.
+it builds Inn as the gates do and installs only the inn executable, so pie and
+grip keep building against the Ox they were built with.
 
 The first half checks the README and the script text. The second half runs the
-real script with stubbed nix/opam/pkg-config/dune/ocamlfind/systemctl/curl on
+real script with stubbed nix/opam/dune/systemctl/curl on
 PATH, against a throwaway root, and checks what it did: the executable landed in
 $OPAMROOT/<switch>/bin/inn by rename with no staged file left behind, the unit
 was restarted, health was polled, no opam package operation ran, and nothing
@@ -51,13 +51,6 @@ try:
     os.makedirs(os.path.join(root, "scripts"))
     shutil.copy2(script, os.path.join(root, "scripts", "install-inn-service.sh"))
 
-    ox = os.path.join(root, "ox")
-    os.makedirs(os.path.join(ox, "lib", "ox"))
-    with open(os.path.join(ox, "lib", "ox", "ox.ml"), "w") as handle:
-        handle.write("(* stub *)\n")
-    with open(os.path.join(ox, "dune-project"), "w") as handle:
-        handle.write("(lang dune 3.21)\n")
-
     opamroot = os.path.join(root, "opam")
     switch_lib = os.path.join(opamroot, "5.4.0+ox", "lib")
     bindir = os.path.join(opamroot, "5.4.0+ox", "bin")
@@ -87,12 +80,6 @@ try:
         "exit 9\n",
     )
     stub(
-        "pkg-config",
-        "#!/usr/bin/env bash\n"
-        'echo "pkg-config $*" >> "$FAKE_LOG"\n'
-        "exit 0\n",
-    )
-    stub(
         "dune",
         "#!/usr/bin/env bash\n"
         'echo "dune $*" >> "$FAKE_LOG"\n'
@@ -109,16 +96,6 @@ try:
         "exit 0\n",
     )
     stub(
-        "ocamlfind",
-        "#!/usr/bin/env bash\n"
-        'echo "ocamlfind $*" >> "$FAKE_LOG"\n'
-        'if [ "$1" = query ] && [ "$2" = ox_sql ]; then\n'
-        '  echo "$FAKE_INN_ROOT/_dev/ox-install/lib/ox_sql"\n'
-        "  exit 0\n"
-        "fi\n"
-        "exit 1\n",
-    )
-    stub(
         "systemctl",
         "#!/usr/bin/env bash\n"
         'echo "systemctl $*" >> "$FAKE_LOG"\n'
@@ -131,7 +108,6 @@ try:
 
     env = dict(os.environ)
     env["PATH"] = fakebin + os.pathsep + env["PATH"]
-    env["OX_PATH"] = ox
     env["OPAMROOT"] = opamroot
     env["FAKE_LOG"] = calls_path
     env["FAKE_INN_ROOT"] = root
@@ -148,8 +124,8 @@ try:
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr, calls)
 
     opam_calls = [call for call in calls if call.startswith("opam ")]
-    assert opam_calls, calls
     assert all(call.startswith("opam env ") for call in opam_calls), opam_calls
+    assert any(call.startswith("nix develop ") for call in calls), calls
     assert any(
         call.startswith("systemctl --user restart inn.service") for call in calls
     ), calls
