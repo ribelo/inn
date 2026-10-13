@@ -5,9 +5,6 @@ module Serve = Ox_http.Service.Serve
 
 let max_body_bytes = 32 * 1024 * 1024
 
-let daemon_instance_id = Atomic.make None
-let set_instance_id value = Atomic.set daemon_instance_id (Some value)
-
 let text_headers =
   H.Header.unsafe_of_list [ ("content-type", "text/plain; charset=utf-8") ]
 
@@ -71,11 +68,6 @@ let mark_started ~caps () =
   Atomic.set started_at_ms (wall_now_ms ());
   Atomic.set draining false
 
-let adopt_instance_id ~caps =
-  match Ox_caps.Cap_sys.getenv_opt ~caps "INN_INSTANCE_ID" with
-  | Some value when String.trim value <> "" -> set_instance_id (String.trim value)
-  | _ -> ()
-
 let iso8601_of_ms ms =
   let seconds = ms / 1000 in
   let millis = ms mod 1000 in
@@ -89,15 +81,9 @@ let uptime_seconds () =
 
 let store_error_message error = Format.asprintf "%a" Store.pp_error error
 
-(* One identity body for /health, /healthz, and /ready: the daemon handshake
-   reads pid and instanceId, an agent reads version, startedAt, and
-   uptimeSeconds. *)
+(* One identity body for /health, /healthz, and /ready: an agent reads pid,
+   version, startedAt, and uptimeSeconds. *)
 let health_fields config =
-  let instance_id =
-    match Atomic.get daemon_instance_id with
-    | Some value -> [ ("instanceId", `String value) ]
-    | None -> []
-  in
   [
     ("ok", `Bool true);
     ("pid", `Int (Unix.getpid ()));
@@ -108,7 +94,6 @@ let health_fields config =
     ("startedAt", `String (iso8601_of_ms (Atomic.get started_at_ms)));
     ("uptimeSeconds", `Float (uptime_seconds ()));
   ]
-  @ instance_id
 
 let health config = json_response (`Assoc (health_fields config))
 
@@ -948,7 +933,6 @@ let with_shutdown_signals ~caps ~sw f =
           f stop))
 
 let run ~caps ~sw ~env config =
-  adopt_instance_id ~caps;
   check_bind_available ~caps config;
   mark_started ~caps ();
   let net = Eio.Stdenv.net env in

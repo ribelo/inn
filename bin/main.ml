@@ -243,7 +243,7 @@ let friendly_http_error config message =
     || contains_substring ~needle:"ECONNREFUSED" message
   then
     Printf.sprintf
-      "could not connect to Inn server at %s\nStart it with `systemctl --user start inn` (the systemd user service), `inn daemon`, or `inn server`; use `--base-url URL` to query a different server."
+      "could not connect to Inn server at %s\nInn runs as the systemd user service; restart it with `systemctl --user restart inn`. Use `--base-url URL` to query a different server."
       config.Inn.Config.base_url
   else message
 
@@ -264,293 +264,10 @@ let server ~caps ~runtime config =
       Inn.Server.run ~caps ~sw ~env:runtime.base config;
       0)
 
-let rec mkdir_p ~caps path =
-  if path = "" || path = "." || Sys.file_exists path then ()
-  else (
-    mkdir_p ~caps (Filename.dirname path);
-    Ox_caps.Cap_unix.mkdir ~caps path 0o700)
-
-let runtime_path config name = Filename.concat config.Inn.Config.state_dir name
-let pid_path config = runtime_path config "server.pid"
-let registry_path config = runtime_path config "server.json"
-let log_path config = runtime_path config "server.log"
-
-let process_alive ~caps pid =
-  try
-    Ox_caps.Cap_unix.kill ~caps pid 0;
-    true
-  with
-  | Unix.Unix_error (Unix.ESRCH, _, _) -> false
-  | Unix.Unix_error (Unix.EPERM, _, _) -> true
-  | Unix.Unix_error _ -> false
-
-let read_file ~caps path =
-  try
-    let channel = Ox_caps.Cap_stdlib.open_in_bin ~caps path in
-    Fun.protect
-      ~finally:(fun () -> close_in_noerr channel)
-      (fun () ->
-        Some (really_input_string channel (in_channel_length channel)))
-  with Sys_error _ -> None
-
-let write_file ~caps path contents =
-  mkdir_p ~caps (Filename.dirname path);
-  let channel = Ox_caps.Cap_stdlib.open_out_bin ~caps path in
-  Fun.protect
-    ~finally:(fun () -> close_out_noerr channel)
-    (fun () -> output_string channel contents)
-
-let read_pid ~caps config =
-  match read_file ~caps (pid_path config) with
-  | None -> None
-  | Some contents -> int_of_string_opt (String.trim contents)
-
-let daemon_instance_id ~caps () =
-  Ox_caps.Cap_stdlib.Random.self_init ~caps ();
-  Printf.sprintf "%d-%.0f-%d" (Unix.getpid ())
-    (Ox_caps.Cap_unix.gettimeofday ~caps () *. 1000.)
-    (Random.bits ())
-
-let write_daemon_registry ~caps config pid instance_id =
-  let json =
-    `Assoc
-      [
-        ("pid", `Int pid);
-        ("instanceId", `String instance_id);
-        ("baseUrl", `String config.Inn.Config.base_url);
-        ("dbPath", `String config.db_path);
-        ("stateDir", `String config.state_dir);
-        ("logPath", `String (log_path config));
-        ("startedAtMs", `Int (int_of_float (Ox_caps.Cap_unix.gettimeofday ~caps () *. 1000.)));
-      ]
-  in
-  write_file ~caps (pid_path config) (string_of_int pid ^ "\n");
-  write_file ~caps (registry_path config) (Yojson.Safe.pretty_to_string json ^ "\n")
-
-let remove_daemon_registry ~caps config =
-  List.iter
-    (fun path ->
-      if Sys.file_exists path then
-        try Ox_caps.Cap_sys.remove ~caps path with Sys_error _ -> ())
-    [ pid_path config; registry_path config ]
-
-let registry_instance_id ~caps config =
-  match read_file ~caps (registry_path config) with
-  | None -> None
-  | Some contents -> (
-      match Yojson.Safe.from_string contents with
-      | `Assoc fields -> (
-          match List.assoc_opt "instanceId" fields with
-          | Some (`String value) -> Some value
-          | _ -> None)
-      | _ -> None
-      | exception Yojson.Json_error _ -> None)
-
-let json_bool name value = (name, `Bool value)
-let json_string name value = (name, `String value)
-let json_int_opt name = function None -> [] | Some value -> [ (name, `Int value) ]
-let json_string_opt name = function None -> [] | Some value -> [ (name, `String value) ]
-
-let health_identity ~runtime config =
-  match http_request ~runtime config "GET" "/health" with
-  | Error message -> Error (friendly_http_error config message)
-  | Ok (status, body) when status >= 200 && status < 300 -> (
-      match Yojson.Safe.from_string body with
-      | `Assoc fields ->
-          let pid =
-            match List.assoc_opt "pid" fields with
-            | Some (`Int value) -> Some value
-            | _ -> None
-          in
-          let instance_id =
-            match List.assoc_opt "instanceId" fields with
-            | Some (`String value) -> Some value
-            | _ -> None
-          in
-          Ok (pid, instance_id)
-      | _ -> Error "health response was not a JSON object"
-      | exception (Yojson.Json_error _ as exn) -> Error (Printexc.to_string exn))
-  | Ok (status, body) ->
-      Error (Printf.sprintf "health returned HTTP %d: %s" status body)
-
-let daemon_identity_matches ~runtime config pid instance_id =
-  match health_identity ~runtime config with
-  | Ok (Some health_pid, Some health_instance_id) ->
-      health_pid = pid && String.equal health_instance_id instance_id
-  | _ -> false
-
-let daemon_status_json ~caps ~runtime config =
-  let pid = read_pid ~caps config in
-  let instance_id = registry_instance_id ~caps config in
-  let alive = Option.value (Option.map (process_alive ~caps) pid) ~default:false in
-  let health =
-    match health_identity ~runtime config with
-    | Ok (health_pid, health_instance_id) -> (true, None, health_pid, health_instance_id)
-    | Error message -> (false, Some message, None, None)
-  in
-  let healthy, reason, health_pid, health_instance_id = health in
-  let managed =
-    match (pid, instance_id) with
-    | Some pid, Some instance_id when alive ->
-        daemon_identity_matches ~runtime config pid instance_id
-    | _ -> false
-  in
-  `Assoc
-    ([
-       json_bool "running" (alive && healthy);
-       json_bool "alive" alive;
-       json_bool "healthy" healthy;
-       json_bool "managed" managed;
-       json_string "baseUrl" config.Inn.Config.base_url;
-       json_string "stateDir" config.state_dir;
-       json_string "dbPath" config.db_path;
-       json_string "pidPath" (pid_path config);
-       json_string "logPath" (log_path config);
-     ]
-    @ json_int_opt "pid" pid
-    @ json_string_opt "instanceId" instance_id
-    @ json_int_opt "healthPid" health_pid
-    @ json_string_opt "healthInstanceId" health_instance_id
-    @ json_string_opt "reason" reason)
-
-let print_json ~caps json =
-  Ox_caps.Cap_stdlib.print_endline ~caps (Yojson.Safe.pretty_to_string json)
-
-let status ~caps ~runtime config =
-  let json = daemon_status_json ~caps ~runtime config in
-  print_json ~caps json;
-  match json with
-  | `Assoc fields -> (
-      match List.assoc_opt "running" fields with
-      | Some (`Bool true) -> 0
-      | _ -> 1)
-  | _ -> 1
-
-let wait_for_health ~caps ~runtime config pid instance_id =
-  let deadline = Ox_caps.Cap_unix.gettimeofday ~caps () +. 10.0 in
-  let rec loop last_error =
-    match health_identity ~runtime config with
-    | Ok (Some health_pid, Some health_instance_id)
-      when health_pid = pid && String.equal health_instance_id instance_id ->
-        Ok ()
-    | Ok _ as result ->
-        if Ox_caps.Cap_unix.gettimeofday ~caps () >= deadline then
-          Error
-            (Printf.sprintf "daemon did not report expected identity: %s"
-               (match result with
-               | Ok (pid, instance) ->
-                   Yojson.Safe.to_string
-                     (`Assoc
-                       (json_int_opt "pid" pid
-                       @ json_string_opt "instanceId" instance))
-               | Error message -> message))
-        else (
-          Unix.sleepf 0.1;
-          loop last_error)
-    | Error message ->
-        if Ox_caps.Cap_unix.gettimeofday ~caps () >= deadline then Error message
-        else if process_alive ~caps pid then (
-          Unix.sleepf 0.1;
-          loop (Some message))
-        else
-          Error
-            (Option.value last_error
-               ~default:
-                 (Printf.sprintf "daemon process %d exited during startup" pid))
-  in
-  loop None
-
-let exec_server ~caps instance_id =
-  let argv = Array.copy Sys.argv in
-  if Array.length argv > 1 && String.equal argv.(1) "daemon" then argv.(1) <- "server";
-  let env = Ox_caps.Cap_unix.environment ~caps () in
-  let env = Array.append env [| "INN_INSTANCE_ID=" ^ instance_id |] in
-  try Ox_caps.Cap_unix.execve ~caps argv.(0) argv env
-  with Unix.Unix_error _ -> Ox_caps.Cap_unix._exit ~caps 127
-
-let daemon
-    ~caps:(caps : < Cap.fork; Cap.exec; Cap.exit; Cap.env; Cap.signal; Cap.time;
-                    Cap.random; Cap.stdout; Cap.stderr; Cap.fs_read; Cap.fs_write; .. >)
-    ~runtime config =
-  mkdir_p ~caps config.Inn.Config.state_dir;
-  match (read_pid ~caps config, registry_instance_id ~caps config) with
-  | Some pid, Some instance_id
-    when process_alive ~caps pid && daemon_identity_matches ~runtime config pid instance_id ->
-      print_json ~caps (daemon_status_json ~caps ~runtime config);
-      0
-  | _ ->
-      let instance_id = daemon_instance_id ~caps () in
-      match Ox_caps.Cap_unix.fork ~caps () with
-      | 0 ->
-          ignore (Unix.setsid ());
-          let fd =
-            Ox_caps.Cap_unix.openfile_write ~caps (log_path config)
-              [ Unix.O_CREAT; Unix.O_WRONLY; Unix.O_APPEND ]
-              0o600
-          in
-          Unix.dup2 fd Unix.stdout;
-          Unix.dup2 fd Unix.stderr;
-          Unix.close fd;
-          exec_server ~caps instance_id
-      | pid -> (
-          write_daemon_registry ~caps config pid instance_id;
-          match wait_for_health ~caps ~runtime config pid instance_id with
-          | Ok () ->
-              print_json ~caps (daemon_status_json ~caps ~runtime config);
-              0
-          | Error message ->
-              Ox_caps.Cap_stdlib.prerr_endline ~caps message;
-              print_json ~caps (daemon_status_json ~caps ~runtime config);
-              1)
-
-let stop
-    ~caps:(caps : < Cap.signal; Cap.time; Cap.stdout; Cap.stderr; Cap.fs_read;
-                    Cap.fs_write; .. >)
-    ~runtime config =
-  match (read_pid ~caps config, registry_instance_id ~caps config) with
-  | None, _ ->
-      remove_daemon_registry ~caps config;
-      print_json ~caps (daemon_status_json ~caps ~runtime config);
-      0
-  | Some pid, Some instance_id ->
-      if not (process_alive ~caps pid) then (
-        remove_daemon_registry ~caps config;
-        print_json ~caps (daemon_status_json ~caps ~runtime config);
-        0)
-      else if not (daemon_identity_matches ~runtime config pid instance_id) then (
-        Ox_caps.Cap_stdlib.prerr_endline ~caps
-          (Printf.sprintf
-             "refusing to stop pid %d because it is not an identity-verified Inn daemon"
-             pid);
-        print_json ~caps (daemon_status_json ~caps ~runtime config);
-        1)
-      else (
-        Ox_caps.Cap_unix.kill ~caps pid Sys.sigterm;
-        let deadline = Ox_caps.Cap_unix.gettimeofday ~caps () +. 5.0 in
-        while process_alive ~caps pid && Ox_caps.Cap_unix.gettimeofday ~caps () < deadline do
-          Unix.sleepf 0.1
-        done;
-        if process_alive ~caps pid then Ox_caps.Cap_unix.kill ~caps pid Sys.sigkill;
-        remove_daemon_registry ~caps config;
-        print_json ~caps (daemon_status_json ~caps ~runtime config);
-        0)
-  | Some pid, None ->
-      Ox_caps.Cap_stdlib.prerr_endline ~caps
-        (Printf.sprintf
-           "refusing to stop pid %d because %s has no instance id" pid
-           (registry_path config));
-      print_json ~caps (daemon_status_json ~caps ~runtime config);
-      1
-
-let restart ~caps ~runtime config =
-  let stopped = stop ~caps ~runtime config in
-  if stopped <> 0 then stopped else daemon ~caps ~runtime config
-
 let mcp ~caps ~runtime config =
   let tool_call =
     Inn.Mcp.tool_call
       ~request:(fun path -> http_request ~runtime config "GET" path)
-      ~status:(fun () -> daemon_status_json ~caps ~runtime config)
       ~base_url:config.Inn.Config.base_url
   in
   Inn.Mcp.run ~caps ~tool_call ()
@@ -558,6 +275,7 @@ let mcp ~caps ~runtime config =
 let get ~caps ~runtime path config = run_http ~caps ~runtime config "GET" path
 
 let health ~caps ~runtime config = get ~caps ~runtime "/health" config
+let status ~caps ~runtime config = get ~caps ~runtime "/health" config
 let services ~caps ~runtime lookback config =
   get ~caps ~runtime ("/services" ^ query [ ("lookback", lookback) ]) config
 let stats ~caps ~runtime lookback config =
@@ -974,36 +692,12 @@ let commands ~caps ~runtime =
            ~runtime) config_t)
   in
 
-  let daemon_cmd =
-    cmd "daemon" "Run the Inn server as a managed background daemon."
-      (later1 ~caps:stderr_caps (daemon
-           ~caps:(caps :> < Cap.fork; Cap.exec; Cap.exit; Cap.env; Cap.signal;
-                            Cap.time; Cap.random; Cap.stdout; Cap.stderr;
-                            Cap.fs_read; Cap.fs_write >)
-           ~runtime) config_t)
-  in
-
   let status_cmd =
-    cmd "status" "Show managed daemon status." (later1 ~caps:stderr_caps (status ~caps:(caps :> < Cap.fs_read; Cap.signal; Cap.stdout >) ~runtime) config_t)
+    cmd "status" "Show the state of the Inn server." (later1 ~caps:stderr_caps (status ~caps:output_caps ~runtime) config_t)
   in
 
   let health_cmd =
     cmd "health" "Check the configured Inn server." (later1 ~caps:stderr_caps (health ~caps:output_caps ~runtime) config_t)
-  in
-
-  let stop_cmd =
-    cmd "stop" "Stop the managed Inn daemon." (later1 ~caps:stderr_caps (stop
-           ~caps:(caps :> < Cap.signal; Cap.time; Cap.stdout; Cap.stderr;
-                            Cap.fs_read; Cap.fs_write >)
-           ~runtime) config_t)
-  in
-
-  let restart_cmd =
-    cmd "restart" "Restart the managed Inn daemon." (later1 ~caps:stderr_caps (restart
-           ~caps:(caps :> < Cap.fork; Cap.exec; Cap.exit; Cap.env; Cap.signal;
-                            Cap.time; Cap.random; Cap.stdout; Cap.stderr;
-                            Cap.fs_read; Cap.fs_write >)
-           ~runtime) config_t)
   in
 
   let services_cmd =
@@ -1124,16 +818,13 @@ let commands ~caps ~runtime =
   in
 
   let mcp_cmd =
-    cmd "mcp" "Run the Inn MCP stdio server." (later_unit1 ~caps:stderr_caps (mcp ~caps:(caps :> < Cap.fs_read; Cap.signal; Cap.stdin; Cap.stdout >) ~runtime) config_t)
+    cmd "mcp" "Run the Inn MCP stdio server." (later_unit1 ~caps:stderr_caps (mcp ~caps:(caps :> < Cap.stdin; Cap.stdout >) ~runtime) config_t)
   in
 
   [
         server_cmd;
-        daemon_cmd;
         status_cmd;
         health_cmd;
-        stop_cmd;
-        restart_cmd;
         services_cmd;
         traces_cmd;
         trace_cmd;
@@ -1162,7 +853,7 @@ let friendly_unix_error error operation arg =
   | Unix.EADDRINUSE, "bind" ->
       "could not start Inn server: address is already in use\n\
        Another process is already bound to the configured host/port.\n\
-       Stop an existing Inn daemon with `inn stop`, or choose another port with `--port PORT`."
+       Check `systemctl --user status inn`, or choose another port with `--port PORT`."
   | Unix.EADDRNOTAVAIL, "bind" ->
       "could not start Inn server: bind host is not available on this machine\n\
        Use `--host 127.0.0.1` for local-only access, or choose an address assigned to this host."

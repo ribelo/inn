@@ -1,6 +1,6 @@
-"""svc-xd4x: the "cannot connect" hint in the CLI and in the MCP server names the
-systemd user service (systemctl --user start inn) as well as "inn server", so
-the hint matches how Inn actually runs.
+"""svc-xd4x, bcache-d0nd: the "cannot connect" hint in the CLI and in the MCP
+server names the systemd user service (systemctl --user restart inn), the only
+way Inn runs.
 
 Both probes point at a port nothing listens on: the CLI health command and an
 MCP inn_stats tool call, which proxies the same HTTP API.
@@ -23,7 +23,7 @@ def closed_port():
 
 
 base_url = "http://127.0.0.1:%d" % closed_port()
-required = ("systemctl --user start inn", "inn server")
+required = ("systemctl --user restart inn",)
 
 cli = subprocess.run(
     [exe, "health", "--base-url", base_url],
@@ -58,6 +58,6 @@ for fragment in required:
     assert fragment in text, "%r missing from %r" % (fragment, text)
 
 print(
-    "svc-xd4x: the CLI and MCP connect hints name "
-    "systemctl --user start inn and inn server"
+    "svc-xd4x bcache-d0nd: the CLI and MCP connect hints name "
+    "systemctl --user restart inn"
 )

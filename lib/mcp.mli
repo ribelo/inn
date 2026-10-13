@@ -2,7 +2,6 @@
 
 val tool_call :
   request:(string -> (int * string, string) result) ->
-  status:(unit -> Yojson.Safe.t) ->
   base_url:string ->
   string ->
   Yojson.Safe.t ->

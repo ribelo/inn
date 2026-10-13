@@ -21,7 +21,7 @@ Each spec's frontmatter carries its status (completed = implemented and accepted
 | 14 | [caps](caps/01-caps.md) | done (uncommitted; ox row 52) |
 | 15 | [caps-on-ox-lint](caps-on-ox-lint/01-caps-on-ox-lint.md) | done |
 | 16 | [thread-door-capabilities](thread-door-capabilities/01-thread-door-capabilities.md) | done (uncommitted for review) |
-| 17 | [restart-daemon-exec](restart-daemon-exec/01-restart-daemon-exec.md) | ready-for-agent |
+| 17 | [restart-daemon-exec](restart-daemon-exec/01-restart-daemon-exec.md) | wontfix (daemon removed, ^bcache-d0nd) |
 | 18 | [delayed-command-cancellation](delayed-command-cancellation/01-classify-delayed-command-cancellation.md) | ready-for-agent |
 | 19 | [bounded-cache](bounded-cache/01-bounded-cache.md) | in progress |
 

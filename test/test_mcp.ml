@@ -134,7 +134,7 @@ let test_window_arguments_reach_http () =
     if contains path "/stats" then Ok (200, stats_body) else Ok (200, "{}")
   in
   let tool_call =
-    Mcp.tool_call ~request ~status:(fun () -> `Assoc [])
+    Mcp.tool_call ~request 
       ~base_url:"http://127.0.0.1:27687"
   in
   let call name args =
@@ -199,7 +199,7 @@ let test_docs_tools () =
     Ok (200, {|{"guides":[{"name":"debug","title":"Debugging with Inn","path":"/docs/debug"}]}|})
   in
   let tool_call =
-    Mcp.tool_call ~request ~status:(fun () -> `Assoc [])
+    Mcp.tool_call ~request 
       ~base_url:"http://127.0.0.1:27687"
   in
   (match tool_call "inn_docs_index" (`Assoc []) with
@@ -223,7 +223,7 @@ let test_down_server () =
   let tool_call =
     Mcp.tool_call
       ~request:(fun _ -> Error "connection refused")
-      ~status:(fun () -> `Assoc [])
+      
       ~base_url:"http://127.0.0.1:27687"
   in
   let json =
@@ -241,7 +241,7 @@ let test_down_server () =
       | `String message ->
           Alcotest.(check bool)
             "startup hint" true
-            (let needle = "inn daemon" in
+            (let needle = "systemctl --user restart inn" in
              let n = String.length needle in
              let rec search i =
                i + n <= String.length message

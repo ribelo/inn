@@ -26,8 +26,8 @@ Environment overrides:
 - `INN_PRUNE_INTERVAL_SECONDS` (default 300)
 - `INN_MAX_DB_SIZE_MB` (default 1024)
 
-The caller's current working directory is never used to select the database,
-daemon identity, lock path, or query target.
+The caller's current working directory is never used to select the database
+or the query target.
 
 Each signal has its own time-to-live, measured from the time Inn received the
 data, not from the client's timestamp. A background pruner runs once at server
@@ -88,17 +88,15 @@ the installed lint evidence; updating it is separate work.
 
 ## Run
 
-```sh
-inn server
-```
+Inn runs only as the `inn` systemd user service (see below). The service runs
+`inn server`; start `inn server` by hand only for an isolated instance with
+its own `--state-dir` and `--port`. There is no other way to start Inn, so a
+stale copy cannot take the port from the service.
 
-Managed background daemon:
-
 ```sh
-inn daemon
+systemctl --user status inn
+systemctl --user restart inn
 inn status
-inn stop
-inn restart
 ```
 
 `inn server` logs its listen address, its database path, and its retention
@@ -232,8 +230,7 @@ supported ones.
 guides, `/endpoints`, and `/openapi.json`.
 
 `GET /health` and `GET /healthz` report `version`, `startedAt` (ISO 8601
-UTC), and `uptimeSeconds`, plus the pid, the configured state paths, and the
-managed daemon `instanceId` when one is set. `GET /ready` returns `200` with
+UTC), and `uptimeSeconds`, plus the pid and the configured state paths. `GET /ready` returns `200` with
 `ready:true` while the store answers a query, and `503` with the store error
 when it does not (or `503` with `store:"draining"` during shutdown). `inn --version`, the MCP `serverInfo.version`, `/health`,
 and `info.version` in `/openapi.json` all report the same build version.

@@ -384,7 +384,6 @@ let health_properties =
     ("version", schema_string);
     ("startedAt", schema_string);
     ("uptimeSeconds", schema_number);
-    ("instanceId", schema_nullable schema_string);
   ]
 
 let ready_properties =
@@ -562,8 +561,7 @@ let all =
     query_endpoint ~group:"discovery" "health" "/health"
       "Liveness and build identity"
       "Reports ok, the process id, the configured state paths, the build \
-       version, the ISO 8601 start time, and the uptime. The managed daemon \
-       handshake also compares pid and instanceId."
+       version, the ISO 8601 start time, and the uptime."
       []
       [ json_body (schema_object ~required:[ "ok"; "version" ] health_properties) ];
     query_endpoint ~group:"discovery" "healthz" "/healthz" "Liveness probe"

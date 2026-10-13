@@ -1,5 +1,5 @@
 ---
-status: ready-for-agent
+status: wontfix
 category: bug
 package: inn CLI entry point
 consumer: Inn managed daemon
@@ -33,3 +33,9 @@ capability-plumbing change deliberately preserves this pre-existing behavior.
   restart, verify a new healthy managed identity and exit 0, then stop.
 - Preserve identity-verification refusals, stdout/stderr conventions and the
   nonzero-stop short circuit. Run all repository gates.
+
+## Comments
+
+2026-10-13: `inn restart`, `inn daemon` and `inn stop` were removed by
+[bounded-cache](../bounded-cache/01-bounded-cache.md) (^bcache-d0nd). The
+systemd user service is the only way to run Inn.

@@ -82,7 +82,7 @@ let mcp_tool ?required name description properties =
 
 let mcp_tools =
   [
-    mcp_tool "inn_status" "Check configured Inn daemon/server status." [];
+    mcp_tool "inn_status" "Check the state of the Inn server." [];
     mcp_tool "inn_services"
       "List services that have emitted telemetry."
       [ ("lookback", mcp_lookback_property) ];
@@ -285,15 +285,15 @@ let http_tool ~request ~base_url path =
       Error
         (Printf.sprintf
            "could not connect to Inn server at %s\n\
-            Start it with `systemctl --user start inn` (the systemd user \
-            service), `inn daemon`, or `inn server`; use `--base-url URL` to \
-            query a different server.\n\
+            Inn runs as the systemd user service; restart it with \
+            `systemctl --user restart inn`. Use `--base-url URL` to query a \
+            different server.\n\
             Details: %s"
            base_url message)
 
-let tool_call ~request ~status ~base_url name args =
+let tool_call ~request ~base_url name args =
   match name with
-  | "inn_status" -> Ok (Yojson.Safe.pretty_to_string (status ()))
+  | "inn_status" -> http_tool ~request ~base_url "/health"
   | "inn_services" ->
       http_tool ~request ~base_url
         ("/services"

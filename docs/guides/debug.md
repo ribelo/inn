@@ -23,13 +23,13 @@ endpoint at Inn. Otherwise see `GET /docs/effect` for an Effect app and
 ### 1. Verify Inn is running
 
 ```sh
-inn status            # managed daemon status as JSON
+inn status            # server state as JSON
 inn health            # raw /health response
 curl -fsS http://127.0.0.1:27687/health
 ```
 
-If Inn is not running, start the managed daemon with `inn daemon` (it exits
-immediately) or run `inn server` in the foreground. `/health` reports `version`,
+If Inn is not running, restart its service: `systemctl --user restart inn`.
+Do not start another copy of Inn. `/health` reports `version`,
 `startedAt`, and `uptimeSeconds`, so you can tell whether the running build
 changed or the server restarted. `/ready` answers 200 while the store accepts
 queries and 503 when it does not.
