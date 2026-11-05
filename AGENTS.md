@@ -26,7 +26,8 @@ uncommitted work is effectively lost work.
   the running service with `./scripts/install-inn-service.sh` and confirm that
   it reports healthy. The service runs the installed binary, so a change that is
   committed but not installed is not finished. ^bcache-i9st
-- Push only when the user asks.
+- Push each landed commit to `origin master` right after it lands (the owner's
+  rule for his private repositories, 2026-11-02).
 
 ## Gates (before any commit)
 

@@ -40,11 +40,11 @@ change, not as part of installing the lint tool.
 
 | Site | Current authority use | Required change |
 | --- | --- | --- |
-| [main.ml:23](../../../bin/main.ml#L23) | `delay`'s anonymous error closure obtains `(door ()).caps` and writes stderr. | Pass capabilities into `delay` and let its closure capture that argument. |
-| [main.ml:233](../../../bin/main.ml#L233) | `run_http` reads the global Door and writes stdout/stderr. | Take capabilities as an argument from the command callback; thread the Door context through HTTP helpers too. |
-| [main.ml:457](../../../bin/main.ml#L457) | `daemon` reads global capabilities for fork, exec, filesystem operations and output. | Receive the Door's authority as an argument and pass it into daemon helpers. |
-| [main.ml:490](../../../bin/main.ml#L490) | `stop` reads global capabilities for process checks, kills and output. | Receive and forward argument capabilities to process-control helpers. |
-| [main.ml:620](../../../bin/main.ml#L620) | `trace` prints through capabilities obtained from the global Door. | Receive capabilities through its command term and use that argument for output. |
+| [main.ml:23](../../../../bin/main.ml#L23) | `delay`'s anonymous error closure obtains `(door ()).caps` and writes stderr. | Pass capabilities into `delay` and let its closure capture that argument. |
+| [main.ml:233](../../../../bin/main.ml#L233) | `run_http` reads the global Door and writes stdout/stderr. | Take capabilities as an argument from the command callback; thread the Door context through HTTP helpers too. |
+| [main.ml:457](../../../../bin/main.ml#L457) | `daemon` reads global capabilities for fork, exec, filesystem operations and output. | Receive the Door's authority as an argument and pass it into daemon helpers. |
+| [main.ml:490](../../../../bin/main.ml#L490) | `stop` reads global capabilities for process checks, kills and output. | Receive and forward argument capabilities to process-control helpers. |
+| [main.ml:620](../../../../bin/main.ml#L620) | `trace` prints through capabilities obtained from the global Door. | Receive capabilities through its command term and use that argument for output. |
 
 ## Implementation Decisions
 

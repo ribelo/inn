@@ -14,7 +14,7 @@ the original executable and the capability-threaded executable. Each run stopped
 the managed daemon, printed stopped status and then failed startup with a
 connection error. Ordinary `inn daemon` and `inn stop` succeeded.
 
-`exec_server` in [main.ml](../../../bin/main.ml) copies `Sys.argv` and rewrites
+`exec_server` in [main.ml](../../../../bin/main.ml) copies `Sys.argv` and rewrites
 `argv[1]` from `daemon` to `server` only. When called by `restart`, it leaves
 `restart` unchanged and execs that command again instead of the server. The
 capability-plumbing change deliberately preserves this pre-existing behavior.
